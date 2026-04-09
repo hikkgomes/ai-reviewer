@@ -1,0 +1,46 @@
+review_categories:
+  - hallucinated_api
+  - runtime_breakage
+  - logic_error
+  - overengineering
+  - duplication
+  - error_handling
+  - async_concurrency
+  - security
+  - performance
+  - testing
+  - dependency_environment
+  - constraint_violation
+  - input_validation
+  - maintainability
+  - external_system_assumption
+  - integration_mismatch
+  - incomplete_behaviour
+  - observability
+  - data_correctness
+  - locale_unicode
+  - resource_management
+  - regression_refactor
+  - licensing_policy
+
+severity_order:
+  - critical
+  - high
+  - medium
+  - low
+
+critical_risks:
+  - auth
+  - payments
+  - secrets
+  - migrations
+  - data_deletion
+  - public_api
+  - infra
+  - shell_execution
+
+review_defaults:
+  review_scope: changed
+  run_changed_script_first: true
+  prefer_evidence_over_guessing: true
+  state_uncertainty_explicitly: true

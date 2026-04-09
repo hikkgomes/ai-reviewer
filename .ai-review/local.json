@@ -1,0 +1,79 @@
+{
+  "bootstrap": {
+    "codex_done": false,
+    "claude_done": false,
+    "bootstrapped_at": "",
+    "last_bootstrapped_by": ""
+  },
+  "project": {
+    "stack": [],
+    "package_managers": [],
+    "monorepo": false
+  },
+  "review_options": {
+    "run_install_on_review": false
+  },
+  "commands": {
+    "install": "",
+    "lint": "",
+    "typecheck": "",
+    "test": "",
+    "build": "",
+    "format": ""
+  },
+  "paths": {
+    "generated": [],
+    "ignore": [
+      ".git/",
+      "node_modules/",
+      ".next/",
+      "dist/",
+      "build/",
+      "coverage/",
+      ".turbo/",
+      ".vercel/",
+      ".cache/",
+      "vendor/",
+      "target/"
+    ],
+    "critical": []
+  },
+  "risk": {
+    "auth_sensitive": [],
+    "payment_sensitive": [],
+    "migration_sensitive": [],
+    "infra_sensitive": [],
+    "pii_sensitive": [],
+    "destructive_sensitive": []
+  },
+  "architecture": {
+    "patterns": [],
+    "key_libraries": {
+      "framework": [],
+      "database": [],
+      "testing": [],
+      "http": [],
+      "state_management": [],
+      "styling": [],
+      "auth": [],
+      "payments": [],
+      "validation": []
+    },
+    "naming": {
+      "files": "",
+      "variables": "",
+      "components": "",
+      "tests": ""
+    },
+    "folder_structure": {},
+    "config_files": [],
+    "entry_points": [],
+    "project_description": "",
+    "env_keys": [],
+    "docker_services": [],
+    "ai_refinement_needed": []
+  },
+  "workspaces": {},
+  "notes": [],
+  "uncertain": []
+}

@@ -1,0 +1,82 @@
+Quick start
+
+1. Drop this folder into the repo root or workspace root.
+2. Run one bootstrap prompt in each tool. Order does not matter.
+
+In Claude Code:
+Bootstrap this repo reviewer by following `<folder-name>/.ai-review/bootstrap/CLAUDE.md` exactly.
+
+In Codex:
+Bootstrap this repo reviewer by following `<folder-name>/.ai-review/bootstrap/CODEX.md` exactly.
+
+Replace `<folder-name>` with the actual name of this folder, for example `ai-reviewer-template`.
+
+What bootstrap does
+
+- inspects the repo layout
+- detects commands and workspaces
+- detects architecture and naming conventions
+- writes or refines `.ai-review/local.json`
+- merges reviewer instructions into `CLAUDE.md` and `AGENTS.md` using sentinel markers
+- merges reviewer tasks into `.vscode/tasks.json`
+- keeps additive Claude command and agent files
+- runs safe verification commands
+- removes bootstrap-only files when both tools are done
+
+What stays after bootstrap
+
+- `.ai-review/SKILL.md`
+- `.ai-review/local.json`
+- `.ai-review/rules.yaml`
+- `.ai-review/templates/review-report.md`
+- `.ai-review/scripts/review.sh`
+- `.ai-review/scripts/review_changed.sh`
+- `.ai-review/scripts/detect_commands.py`
+- `.ai-review/scripts/detect_architecture.py`
+- `.ai-review/scripts/scan_ai_gotchas.py`
+- `.claude/commands/ai-review.md`
+- `.claude/commands/ai-review-staged.md`
+- `.claude/agents/universal-code-reviewer.md`
+- `.claude/settings.json`
+- `.vscode/tasks.json`
+- sentinel-managed reviewer sections inside `CLAUDE.md` and `AGENTS.md`
+
+What gets merged
+
+- `CLAUDE.md` and `AGENTS.md` receive reviewer sections wrapped in:
+  `<!-- AI-REVIEWER-START -->`
+  `<!-- AI-REVIEWER-END -->`
+- running bootstrap again replaces only the content inside those markers
+- `.claude/settings.json` is deep-merged without overwriting existing user keys
+- `.vscode/tasks.json` appends reviewer tasks by label and skips duplicates
+
+What gets removed
+
+- `.ai-review/bootstrap/COMMON.md`
+- `.ai-review/bootstrap/cleanup.py`
+- `.ai-review/bootstrap/claude-instructions.md`
+- `.ai-review/bootstrap/codex-instructions.md`
+- `.ai-review/scripts/install_config.py`
+- `FIRST_RUN.txt`
+- tool-specific bootstrap file after that tool finishes
+
+How to update
+
+- re-run the bootstrap prompts
+- the sentinel markers let the reviewer instructions update in place without duplicating sections
+
+.gitignore
+
+The `.ai-review/` directory and related config should be committed to version control so the reviewer is available to all contributors.
+
+You may want to add this generated file to `.gitignore`:
+
+- `.ai-review/.detected.json`
+
+How to remove
+
+- delete `.ai-review/`
+- delete `.claude/commands/ai-review.md`
+- delete `.claude/commands/ai-review-staged.md`
+- delete `.claude/agents/universal-code-reviewer.md`
+- remove the reviewer sentinel blocks from `CLAUDE.md` and `AGENTS.md`

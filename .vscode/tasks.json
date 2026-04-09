@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "AI Review: Changed",
+      "type": "shell",
+      "command": "bash .ai-review/scripts/review_changed.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "AI Review: Full",
+      "type": "shell",
+      "command": "bash .ai-review/scripts/review.sh",
+      "problemMatcher": []
+    }
+  ]
+}
