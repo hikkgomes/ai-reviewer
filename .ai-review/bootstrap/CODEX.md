@@ -10,10 +10,11 @@
 4. Set:
    - `bootstrap.codex_done = true`
    - `bootstrap.last_bootstrapped_by = "codex"`
-5. Set `bootstrap.bootstrapped_at` to an ISO-like timestamp if you can; otherwise leave it blank.
-6. Run the selected safe verification commands.
-7. Run:
+5. Ask the user: "Will this repo be used with both Claude and Codex, or just one of them?" If the answer is one tool only, set `bootstrap.single_tool = true` in `.ai-review/local.json`.
+6. Set `bootstrap.bootstrapped_at` to an ISO-like timestamp if you can; otherwise leave it blank.
+7. Run the selected safe verification commands.
+8. Run:
    ```bash
    python3 .ai-review/bootstrap/cleanup.py codex
    ```
-8. End with a short summary only.
+9. End with a short summary only.

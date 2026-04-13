@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import shutil
+import subprocess
+import sys
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +93,22 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def is_empty_value(value) -> bool:
+    return value == "" or value == [] or value == {} or value is False
+
+
+def fill_if_empty(existing, detected):
+    if isinstance(existing, dict) and isinstance(detected, dict):
+        result = dict(existing)
+        for key, value in detected.items():
+            if key not in result or is_empty_value(result[key]):
+                result[key] = value
+            elif isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = fill_if_empty(result[key], value)
+        return result
+    return detected if is_empty_value(existing) else existing
+
+
 def deep_merge_missing(existing: dict, template: dict) -> dict:
     result = dict(existing)
     for key, value in template.items():
@@ -143,6 +161,56 @@ def install_reviewer_files(template_root: Path, target_root: Path) -> list[str]:
         bootstrap["template_folder"] = template_root.as_posix()
     write_json(local_path, local_data)
     return messages
+
+
+def run_json_script(args: list[str], cwd: Path) -> dict:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except Exception:
+        return {}
+
+
+def run_auto_detection(target: Path) -> dict:
+    detected: dict = {}
+    scripts_dir = target / ".ai-review" / "scripts"
+
+    commands = run_json_script([sys.executable, str(scripts_dir / "detect_commands.py")], target)
+    if commands:
+        detected = fill_if_empty(detected, commands)
+
+    architecture = run_json_script(
+        [sys.executable, str(scripts_dir / "detect_architecture.py"), "--dir", "."],
+        target,
+    )
+    if architecture:
+        detected = fill_if_empty(detected, architecture)
+
+    return detected
+
+
+def populate_local_json(target: Path, detected: dict) -> str:
+    if not detected:
+        return "skipped"
+
+    local_path = target / ".ai-review" / "local.json"
+    local_data = read_json(local_path)
+    if not local_data:
+        local_data = {}
+
+    write_json(local_path, fill_if_empty(local_data, detected))
+    return "populated"
 
 
 def merge_text_file(target: Path, source_text: str) -> str:
@@ -212,6 +280,8 @@ def main() -> None:
     target = find_target_root()
     for message in install_reviewer_files(SCRIPT_ROOT, target):
         print(message)
+    detected = run_auto_detection(target)
+    print(f".ai-review/local.json: {populate_local_json(target, detected)} from auto-detection")
 
     claude_source = read_text(ROOT / ".ai-review" / "bootstrap" / "claude-instructions.md")
     codex_source = read_text(ROOT / ".ai-review" / "bootstrap" / "codex-instructions.md")
