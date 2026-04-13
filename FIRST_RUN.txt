@@ -21,7 +21,11 @@ What bootstrap does
 - merges reviewer tasks into `.vscode/tasks.json`
 - keeps additive Claude command and agent files
 - runs safe verification commands
-- removes bootstrap-only files when both tools are done
+- removes bootstrap-only files when both tools are done, or after one tool when `bootstrap.single_tool` is true
+
+Multi-root workspace note
+
+Workspace detection finds packages inside the same repository root. For a VS Code multi-root workspace where backend and frontend are separate git repositories, install and bootstrap this template in each repository separately. The scripts do not cross repository boundaries.
 
 What stays after bootstrap
 

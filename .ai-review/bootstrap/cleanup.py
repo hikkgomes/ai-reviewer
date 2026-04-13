@@ -41,9 +41,13 @@ def load_flags():
     try:
         data = json.loads(LOCAL.read_text(encoding="utf-8"))
         bootstrap = data.get("bootstrap") or {}
-        return bool(bootstrap.get("codex_done")), bool(bootstrap.get("claude_done"))
+        return (
+            bool(bootstrap.get("codex_done")),
+            bool(bootstrap.get("claude_done")),
+            bool(bootstrap.get("single_tool")),
+        )
     except Exception:
-        return False, False
+        return False, False, False
 
 if MODE not in TO_DELETE:
     print("Usage: python3 .ai-review/bootstrap/cleanup.py [codex|claude|final]")
@@ -52,9 +56,9 @@ if MODE not in TO_DELETE:
 for p in TO_DELETE[MODE]:
     rm(p)
 
-codex_done, claude_done = load_flags()
+codex_done, claude_done, single_tool = load_flags()
 
-if codex_done and claude_done:
+if (codex_done and claude_done) or (single_tool and (codex_done or claude_done)):
     for p in TO_DELETE["final"]:
         rm(p)
     try:

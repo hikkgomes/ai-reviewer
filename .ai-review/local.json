@@ -2,6 +2,7 @@
   "bootstrap": {
     "codex_done": false,
     "claude_done": false,
+    "single_tool": false,
     "bootstrapped_at": "",
     "last_bootstrapped_by": ""
   },
