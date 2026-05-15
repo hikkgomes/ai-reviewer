@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Reviewer — Adversarial Code Review for AI-Assisted Development</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0a0a0f;
+      --surface: #12121a;
+      --border: #1e1e2e;
+      --text: #e0e0e8;
+      --text-dim: #8888a0;
+      --accent: #7c5cfc;
+      --accent-glow: #7c5cfc40;
+      --green: #34d399;
+      --red: #f87171;
+      --yellow: #fbbf24;
+      --blue: #60a5fa;
+    }
+
+    body {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+      overflow-x: hidden;
+    }
+
+    .grain {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 9999;
+      opacity: 0.03;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+
+    /* ─── Hero ─── */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 2rem;
+      position: relative;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -40%;
+      left: 50%;
+      translate: -50% 0;
+      width: 800px;
+      height: 800px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 1rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      margin-bottom: 2rem;
+      background: var(--surface);
+    }
+
+    .badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 6vw, 4.5rem);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      margin-bottom: 1.5rem;
+      position: relative;
+    }
+
+    h1 .highlight {
+      background: linear-gradient(135deg, var(--accent), #a78bfa, var(--blue));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .tagline {
+      font-size: clamp(1rem, 2vw, 1.2rem);
+      color: var(--text-dim);
+      max-width: 600px;
+      margin-bottom: 2.5rem;
+    }
+
+    .cta-group {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .btn {
+      padding: 0.75rem 1.75rem;
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      box-shadow: 0 0 24px var(--accent-glow);
+    }
+
+    .btn-primary:hover {
+      background: #6b4ce6;
+      box-shadow: 0 0 40px var(--accent-glow);
+      translate: 0 -1px;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-ghost:hover {
+      border-color: var(--accent);
+      background: #7c5cfc10;
+    }
+
+    .scroll-hint {
+      position: absolute;
+      bottom: 2rem;
+      color: var(--text-dim);
+      font-size: 0.75rem;
+      animation: bob 2s ease-in-out infinite;
+    }
+
+    @keyframes bob {
+      0%, 100% { translate: 0 0; }
+      50% { translate: 0 6px; }
+    }
+
+    /* ─── Terminal ─── */
+    .terminal-section {
+      padding: 4rem 2rem;
+      display: flex;
+      justify-content: center;
+    }
+
+    .terminal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 720px;
+      overflow: hidden;
+    }
+
+    .terminal-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .terminal-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+
+    .terminal-dot:nth-child(1) { background: var(--red); }
+    .terminal-dot:nth-child(2) { background: var(--yellow); }
+    .terminal-dot:nth-child(3) { background: var(--green); }
+
+    .terminal-body {
+      padding: 1.25rem;
+      font-size: 0.85rem;
+      line-height: 1.8;
+    }
+
+    .terminal-body .prompt { color: var(--green); }
+    .terminal-body .cmd { color: var(--text); }
+    .terminal-body .comment { color: var(--text-dim); }
+    .terminal-body .output { color: var(--blue); }
+
+    /* ─── Layers ─── */
+    .section {
+      padding: 5rem 2rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    .section-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      color: var(--accent);
+      margin-bottom: 0.75rem;
+    }
+
+    .section h2 {
+      font-size: clamp(1.6rem, 4vw, 2.4rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+
+    .section .desc {
+      color: var(--text-dim);
+      max-width: 560px;
+      margin-bottom: 3rem;
+      font-size: 0.95rem;
+    }
+
+    .layers-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .layer-card {
+      background: var(--surface);
+      padding: 1.75rem;
+      transition: background 0.2s;
+    }
+
+    .layer-card:hover { background: #161620; }
+
+    .layer-num {
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 0.5rem;
+    }
+
+    .layer-card h3 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+    }
+
+    .layer-card p {
+      font-size: 0.82rem;
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+
+    /* ─── Features ─── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+    }
+
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.75rem;
+      transition: border-color 0.2s, translate 0.2s;
+    }
+
+    .feature-card:hover {
+      border-color: #2e2e4e;
+      translate: 0 -2px;
+    }
+
+    .feature-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      margin-bottom: 1rem;
+      background: #7c5cfc15;
+      border: 1px solid #7c5cfc30;
+    }
+
+    .feature-card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+    }
+
+    .feature-card p {
+      font-size: 0.82rem;
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+
+    /* ─── Editors ─── */
+    .editors {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .editor-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.6rem 1.25rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      background: var(--surface);
+      transition: border-color 0.2s;
+    }
+
+    .editor-tag:hover { border-color: var(--accent); }
+
+    /* ─── Languages ─── */
+    .lang-list {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .lang-pill {
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+    }
+
+    /* ─── Install ─── */
+    .install-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .install-block code {
+      display: block;
+      font-size: 0.85rem;
+      color: var(--green);
+      padding: 0.25rem 0;
+    }
+
+    .install-block .label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-dim);
+      margin-top: 1rem;
+      margin-bottom: 0.25rem;
+    }
+
+    .install-block .label:first-child { margin-top: 0; }
+
+    /* ─── Footer ─── */
+    footer {
+      padding: 3rem 2rem;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 0.75rem;
+      border-top: 1px solid var(--border);
+      margin-top: 4rem;
+    }
+
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    /* ─── Responsive ─── */
+    @media (max-width: 600px) {
+      .layers-grid { grid-template-columns: 1fr; }
+      .features-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="grain"></div>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="badge">
+      <span class="dot"></span>
+      Open Source
+    </div>
+    <h1>
+      <span class="highlight">AI Reviewer</span><br>
+      Catch What AI Missed
+    </h1>
+    <p class="tagline">
+      A six-layer adversarial review framework that finds the bugs AI writes —
+      hallucinated APIs, logic drift, slopsquatted packages, and silent failures.
+    </p>
+    <div class="cta-group">
+      <a href="#install" class="btn btn-primary">Get Started</a>
+      <a href="#how-it-works" class="btn btn-ghost">How It Works</a>
+    </div>
+    <div class="scroll-hint">scroll down</div>
+  </section>
+
+  <!-- Terminal Demo -->
+  <section class="terminal-section">
+    <div class="terminal">
+      <div class="terminal-bar">
+        <span class="terminal-dot"></span>
+        <span class="terminal-dot"></span>
+        <span class="terminal-dot"></span>
+      </div>
+      <div class="terminal-body">
+        <span class="comment"># install machine-level skills</span><br>
+        <span class="prompt">$</span> <span class="cmd">python3 scripts/install.py</span><br>
+        <span class="output">detected Claude Code and Codex</span><br>
+        <span class="output">select skills with arrow keys, Space, Enter</span><br><br>
+        <span class="comment"># review your current changes</span><br>
+        <span class="prompt">$</span> <span class="cmd">/ai-review</span><br>
+        <span class="output">scanning 12 changed files across 3 languages...</span><br>
+        <span class="output">layer 1/6 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ requirement fidelity</span><br>
+        <span class="output">layer 2/6 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ logic & edge cases</span><br>
+        <span class="output">layer 3/6 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ API & dependency integrity</span><br>
+        <span class="output">layer 4/6 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ security patterns</span><br>
+        <span class="output">layer 5/6 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ system awareness</span><br>
+        <span class="output">layer 6/6 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ test quality</span><br><br>
+        <span class="output">found 3 issues: 1 critical, 1 warning, 1 note</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Six Layers -->
+  <section class="section" id="how-it-works">
+    <div class="section-label">Methodology</div>
+    <h2>Six Adversarial Layers</h2>
+    <p class="desc">
+      Every review passes through six targeted layers, each calibrated with
+      empirical risk weights derived from real AI-generated code failures.
+    </p>
+    <div class="layers-grid">
+      <div class="layer-card">
+        <div class="layer-num">Layer 01</div>
+        <h3>Requirement Fidelity</h3>
+        <p>Detects prompt-mirroring where names match the task but behavior is generic. Catches business-rule drift in defaults, thresholds, and permissions.</p>
+      </div>
+      <div class="layer-card">
+        <div class="layer-num">Layer 02</div>
+        <h3>Logic & Edge Cases</h3>
+        <p>Traces code through normal, boundary, and failure paths. Off-by-one, null handling, race conditions, stale values, and inverted predicates.</p>
+      </div>
+      <div class="layer-card">
+        <div class="layer-num">Layer 03</div>
+        <h3>API & Dependency Integrity</h3>
+        <p>Catches hallucinated packages, made-up method signatures, wrong API versions, and slopsquatted imports before they ship.</p>
+      </div>
+      <div class="layer-card">
+        <div class="layer-num">Layer 04</div>
+        <h3>Security Patterns</h3>
+        <p>Scans for injection vectors, broken auth, exposed secrets, insecure defaults, and OWASP patterns that AI loves to introduce.</p>
+      </div>
+      <div class="layer-card">
+        <div class="layer-num">Layer 05</div>
+        <h3>System Awareness</h3>
+        <p>Validates against the broader system: migrations, config, infrastructure, CI pipelines, and cross-service contracts.</p>
+      </div>
+      <div class="layer-card">
+        <div class="layer-num">Layer 06</div>
+        <h3>Test Quality</h3>
+        <p>Ensures tests verify actual behavior, not just that the code runs. Catches tautological assertions and missing edge case coverage.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="section">
+    <div class="section-label">Capabilities</div>
+    <h2>Built for Real Workflows</h2>
+    <p class="desc">
+      Installs as a machine-level skill for Claude Code and Codex,
+      available across repositories on your machine.
+    </p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">/</div>
+        <h3>Slash Commands</h3>
+        <p>Run <code>/ai-review</code> for branch/PR diff review or <code>/ai-review-universal</code> for whole-repo and prompt-scoped audits.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">~</div>
+        <h3>AI Gotcha Scanner</h3>
+        <p>Heuristic scanner flags common AI code smells: placeholder TODOs, hallucinated imports, suspicious patterns, and incomplete implementations.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">{}</div>
+        <h3>Repo-Local Config</h3>
+        <p>Optional <code>.ai-review/local.json</code> stores project-specific commands, rules, critical paths, generated paths, and risk notes.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">+</div>
+        <h3>Multi-Editor Support</h3>
+        <p>Native machine-level skills for Claude Code and Codex.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">#</div>
+        <h3>10 Language Modules</h3>
+        <p>Specialized review rules for TypeScript, JavaScript, Python, SQL, Java, C#, Go, Rust, C++, and PHP.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&gt;</div>
+        <h3>Team Sharing</h3>
+        <p>Install once on your machine. Claude Code and Codex load the same reviewer skill from their user skill directories.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Editors -->
+  <section class="section" style="text-align: center;">
+    <div class="section-label">Integrations</div>
+    <h2>Works With Your Editor</h2>
+    <p class="desc" style="margin-left: auto; margin-right: auto;">
+      Install once on your machine. Claude Code and Codex load the reviewer from their native skill directories.
+    </p>
+    <div class="editors">
+      <div class="editor-tag">Claude Code</div>
+      <div class="editor-tag">Codex</div>
+    </div>
+    <br><br>
+    <div class="section-label">Language Coverage</div>
+    <div class="lang-list" style="margin-top: 1rem;">
+      <span class="lang-pill">TypeScript</span>
+      <span class="lang-pill">JavaScript</span>
+      <span class="lang-pill">Python</span>
+      <span class="lang-pill">SQL</span>
+      <span class="lang-pill">Java</span>
+      <span class="lang-pill">C#</span>
+      <span class="lang-pill">Go</span>
+      <span class="lang-pill">Rust</span>
+      <span class="lang-pill">C++</span>
+      <span class="lang-pill">PHP</span>
+    </div>
+  </section>
+
+  <!-- Install -->
+  <section class="section" id="install" style="text-align: center;">
+    <div class="section-label">Quick Start</div>
+    <h2>Install in 30 Seconds</h2>
+    <p class="desc" style="margin-left: auto; margin-right: auto;">
+      Clone the repo and run the installer. That's it.
+    </p>
+    <div class="install-block" style="text-align: left;">
+      <div class="label">Interactive install</div>
+      <code>python3 scripts/install.py</code>
+      <div class="label">Automation</div>
+      <code>python3 scripts/install.py --install claude,codex</code>
+      <div class="label">Then use</div>
+      <code>ai-review</code>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <p>AI Reviewer — Adversarial review for AI-assisted code</p>
+    <p style="margin-top: 0.5rem;">MIT License &middot; Built by <a href="https://lunarrails.io">Lunar Rails</a></p>
+  </footer>
+</body>
+</html>

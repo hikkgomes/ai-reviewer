@@ -1,0 +1,209 @@
+<!-- AI-REVIEWER-START -->
+# AI Reviewer Rules (Cursor Adapter)
+
+Use this content in `.cursorrules` or `.cursor/rules/ai-reviewer.mdc` for a self-contained adversarial review policy.
+
+## Scope
+
+- Default to reviewing changed code first.
+- Expand to surrounding files only to validate contracts, invariants, and integration wiring.
+- Prefer evidence-backed findings over speculative concerns.
+
+## Severity Classification
+
+- Critical: security exploitability, auth bypass, destructive operations without controls, data loss/corruption.
+- High: incorrect business behavior, runtime failures, incompatible contracts, unrecoverable path failures.
+- Medium: meaningful maintainability or edge-case risk with plausible impact.
+- Low: style and minor consistency issues.
+
+## Empirical Risk Multipliers
+
+Bias attention (not severity):
+- Security: 2.74x.
+- Error handling: 2.0x.
+- Logic correctness: 1.75x.
+- Readability/style defects: ~3x frequency.
+- Performance I/O defects: ~8x frequency.
+- Concurrency defects: ~2x.
+
+## Six-Layer Review Process
+
+### Layer 1: Requirement Fidelity
+
+Objective:
+- Confirm the implementation solves the requested behavior exactly.
+
+Checks:
+- Generic proxy behavior that mirrors prompt wording but misses domain semantics.
+- Missing constraints from multi-part requirements.
+- Business rule drift in defaults, thresholds, ownership, transitions.
+- Missing negative behavior (rejections, denials, invariants).
+
+Empirical note:
+- Semantic mismatches are the largest class of missed review bugs (~51%).
+
+### Layer 2: Logic and Edge Cases
+
+Objective:
+- Catch silent semantic failures that compile and run.
+
+Checks:
+- Boundaries: empty/null/NaN/invalid enum/duplicates/partial state.
+- Control flow: inverted conditions, stale values, unintended mutation.
+- Async behavior: ordering, retries, timeout, cancellation, idempotency.
+- Failure behavior: exception handling, cleanup, user-visible error semantics.
+
+Empirical notes:
+- A large share of AI defects remain logically wrong despite successful execution.
+- Exception handling defects are overrepresented in missed semantic bugs.
+
+### Layer 3: API and Dependency Integrity
+
+Objective:
+- Validate interfaces and dependencies as facts, not assumptions.
+
+Checks:
+- Hallucinated libs/methods/endpoints/flags/env vars.
+- Versioned API signature drift.
+- Schema and payload contract mismatches.
+- Duplicate internal utilities that bypass canonical components.
+
+### Layer 4: Security Patterns
+
+Objective:
+- Review all trust boundaries and sensitive flows.
+
+Checks:
+- Auth/authz/object-level checks and tenant isolation.
+- Injection vectors: SQL, shell, template, path traversal, SSRF.
+- Secret exposure in code, tests, logs, telemetry.
+- Unsafe crypto/deserialization, permissive CORS/CSP/TLS settings.
+- Destructive workflows missing authorization, auditing, rollback.
+
+Empirical note:
+- Security defects are materially more frequent in AI-assisted code (+274% in cited source data).
+
+### Layer 5: System Awareness
+
+Objective:
+- Verify end-to-end fit with repository architecture.
+
+Checks:
+- Cross-layer wiring completeness.
+- Cache/queue/config/feature-flag/observability compatibility.
+- Naming/layering/error-model conformance.
+- All new fields/events/routes/enums wired through required layers.
+
+### Layer 6: Test Quality
+
+Objective:
+- Ensure tests validate behavior and failure modes.
+
+Checks:
+- Public behavior assertions over implementation details.
+- Error path and rollback coverage.
+- Tests that fail for intended bug classes.
+- Realistic fixtures and non-hallucinated schemas.
+- Mocks that preserve behavior under review.
+
+Empirical note:
+- Give error-path tests extra depth due to elevated AI error-handling defects.
+
+## Human Review-Miss Buckets
+
+Prioritize these classes during manual review:
+- Semantic mismatch.
+- Exception and cleanup failures.
+- Interface and integration mismatch.
+- Missing checks and null handling.
+- Concurrency/timing/configuration faults.
+
+## Language-Specific High-Signal Checks
+
+### Python
+- Broad exception swallowing.
+- Mutable defaults and partial initialization.
+- Async lifecycle leaks.
+
+### JavaScript / TypeScript
+- Type erasure via `any` and unsafe narrowing.
+- Promise rejection and cancellation gaps.
+- Runtime payload/schema mismatch.
+
+### Java / C#
+- Nullability and contract drift.
+- Transaction boundary errors.
+- Async blocking and exception propagation pitfalls.
+
+### Go
+- Ignored errors and context propagation failures.
+- Goroutine leaks and channel lifecycle mistakes.
+- Retry loops without safe limits.
+
+### Rust
+- Ownership/lifetime workarounds masking design issues.
+- Unsafe usage lacking strong invariants.
+
+### C/C++
+- Bounds, lifetime, and ownership hazards.
+- Use-after-free/double-free risk.
+- Non-RAII resource handling.
+
+### SQL
+- Interpolated query injection risk.
+- Missing authorization/tenant filters.
+- Migration and locking risk.
+
+### PHP
+- Legacy insecure APIs.
+- Missing strict typing conventions.
+- Weak error/null handling.
+
+## Report Contract
+
+For each finding include:
+- Severity.
+- Layer.
+- Location (`path:line`).
+- Impact.
+- Evidence.
+- Fix recommendation.
+
+If no findings:
+- State "No findings".
+- Provide residual risk and unverified areas.
+
+## Command/Check Summary Contract
+
+For each command run, include:
+- Command.
+- Exit code.
+- Relevant output lines.
+- Interpretation.
+
+## Cursor Execution Guidance
+
+If terminal access is available, run checks manually using commands like:
+- `bash scripts/review_changed.sh <base-branch>` for branch-diff review.
+- `bash scripts/review_changed.sh` when base is implicit.
+- `bash scripts/review.sh` for full-scope review.
+
+If these scripts are unavailable in the current repo:
+- Run equivalent `git diff`, test, lint, and static-analysis commands directly.
+- Keep the six-layer methodology and report contract unchanged.
+
+## Cursor Placement Guidance
+
+Preferred install targets:
+- `.cursorrules` (single-file rules).
+- `.cursor/rules/ai-reviewer.mdc` (modular rules file).
+
+When both exist:
+- Prefer `.cursor/rules/ai-reviewer.mdc` to keep rules modular and updatable.
+
+## Rule Hygiene
+
+- Keep this adapter self-contained.
+- Avoid external references that would fail in another machine/editor.
+- Update with new empirical data only when source attribution is included.
+<!-- AI-REVIEWER-END -->

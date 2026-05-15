@@ -1,0 +1,86 @@
+review_defaults:
+  review_scope: changed
+  run_changed_script_first: true
+  prefer_evidence_over_guessing: true
+  state_uncertainty_explicitly: true
+  load_language_modules: true
+
+severity_order:
+  - critical
+  - high
+  - medium
+  - low
+
+risk_multipliers:
+  security: 2.74
+  error_handling: 2.0
+  logic: 1.75
+  readability_consistency_frequency: 3.0
+  performance_io_frequency: 8.0
+  concurrency: 2.0
+
+layers:
+  requirement_fidelity:
+    layer: 1
+    empirical_anchor: "semantic intent/execution mismatches are a dominant missed-review class"
+    categories:
+      - prompt_mirroring
+      - business_rule_drift
+      - god_prompt_decay
+      - missing_negative_behavior
+  logic_edge_cases:
+    layer: 2
+    risk_multiplier: 1.75
+    categories:
+      - silent_logic_failure
+      - boundary_condition
+      - null_empty_duplicate_state
+      - error_handling
+      - async_ordering
+      - mutable_state
+  api_dependency_integrity:
+    layer: 3
+    categories:
+      - hallucinated_api
+      - slopsquatting_dependency
+      - schema_hallucination
+      - version_signature_mismatch
+      - reinvented_internal_utility
+  security_patterns:
+    layer: 4
+    risk_multiplier: 2.74
+    categories:
+      - auth_authz
+      - injection
+      - secret_exposure
+      - unsafe_deserialization
+      - permissive_config
+      - destructive_operation
+  system_awareness:
+    layer: 5
+    categories:
+      - cross_layer_inconsistency
+      - global_state_misuse
+      - architectural_violation
+      - multi_file_incompleteness
+      - observability_gap
+  test_quality:
+    layer: 6
+    categories:
+      - implementation_mirroring_test
+      - missing_edge_case
+      - missing_error_path
+      - unrealistic_fixture
+      - overmocking
+
+critical_risks:
+  - auth
+  - authorization
+  - payments
+  - secrets
+  - migrations
+  - data_deletion
+  - public_api
+  - infra
+  - shell_execution
+  - pii
