@@ -183,21 +183,9 @@ def merge_block(existing: str, incoming: str, start: str, end: str) -> str:
     return f"{base}{block}\n"
 
 
-def detect_cursor_targets() -> tuple[Path, bool]:
-    home = Path.home()
-    cwd = Path.cwd()
-    for base in (cwd, home):
-        rules_file = base / ".cursorrules"
-        rules_dir = base / ".cursor"
-        if rules_dir.exists():
-            return (rules_dir / "rules" / "ai-reviewer.mdc", True)
-        if rules_file.exists():
-            return (rules_file, True)
-    return (cwd / ".cursor" / "rules" / "ai-reviewer.mdc", False)
-
-
 def install_cursor() -> None:
-    target, detected = detect_cursor_targets()
+    cursor_base = Path.home() / ".cursor"
+    target = cursor_base / "rules" / "ai-reviewer.mdc"
     incoming = CURSOR_ADAPTER.read_text(encoding="utf-8").rstrip()
     wrapped = f"{CURSOR_START}\n{incoming}\n{CURSOR_END}\n"
 
@@ -209,8 +197,7 @@ def install_cursor() -> None:
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(merged, encoding="utf-8")
-    where = "detected target" if detected else "project default"
-    print(f"Installed Cursor rules ({where}): {target}")
+    print(f"Installed Cursor rules: {target}")
 
 
 INSTALLERS = {
@@ -223,11 +210,11 @@ INSTALLERS = {
 def detected_options() -> list[InstallOption]:
     claude_detected = command_exists("claude") or (Path.home() / ".claude").exists()
     codex_detected = command_exists("codex") or (Path.home() / ".codex").exists()
-    _, cursor_detected = detect_cursor_targets()
+    cursor_detected = command_exists("cursor") or (Path.home() / ".cursor").exists()
     return [
         InstallOption("claude", "Claude Code skill", "~/.claude/skills/ai-reviewer", claude_detected),
         InstallOption("codex", "Codex skills", "~/.codex/skills/ai-review and ai-review-universal", codex_detected),
-        InstallOption("cursor", "Cursor rules", ".cursorrules or .cursor/rules/ai-reviewer.mdc", cursor_detected),
+        InstallOption("cursor", "Cursor rules", "~/.cursor/rules/ai-reviewer.mdc", cursor_detected),
     ]
 
 
