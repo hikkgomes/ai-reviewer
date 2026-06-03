@@ -1,5 +1,5 @@
-<!-- AI-REVIEWER-START -->
-# AI Reviewer Methodology (Codex Adapter)
+<!-- DISSECT-START -->
+# Dissect Methodology (Codex Adapter)
 
 Use this block in `AGENTS.md` when the editor cannot reference external skill files directly.
 
@@ -215,11 +215,11 @@ When running checks include:
 
 If Codex skills are installed, prefer these assets:
 
-- `~/.codex/skills/ai-review/reference/methodology.md`
-- `~/.codex/skills/ai-review/reference/risk-weights.md`
-- `~/.codex/skills/ai-review/reference/report-template.md`
-- `~/.codex/skills/ai-review/scripts/review_changed.sh`
-- `~/.codex/skills/ai-review/scripts/review.sh`
+- `~/.agents/skills/dissect-diff/reference/methodology.md`
+- `~/.agents/skills/dissect-diff/reference/risk-weights.md`
+- `~/.agents/skills/dissect-diff/reference/report-template.md`
+- `~/.agents/skills/dissect-diff/scripts/review_changed.sh`
+- `~/.agents/skills/dissect-diff/scripts/review.sh`
 
 Fallback:
 - If skill paths are unavailable, use this adapter as the canonical process.
@@ -227,7 +227,7 @@ Fallback:
 ## Merge/Update Guidance
 
 Keep this adapter wrapped with markers so installers can update only this section:
-- Start marker: `<!-- AI-REVIEWER-START -->`
+- Start marker: `<!-- DISSECT-START -->`
 - End marker: `<!-- AI-REVIEWER-END -->`
 
 Do not nest markers.

@@ -4,7 +4,7 @@ Use this command for baseline audits, focused subsystem reviews, security sweeps
 
 Workflow:
 
-1. Locate the installed skill directory at `.claude/skills/ai-reviewer` in the target project or `~/.claude/skills/ai-reviewer`.
+1. Locate the installed skill directory at `.claude/skills/dissect` in the target project or `~/.claude/skills/dissect`.
 2. Read `reference/methodology.md`, `reference/risk-weights.md`, and `reference/report-template.md` from that skill directory.
 3. Read the target repository's `.ai-review/local.json` if present.
 4. Determine scope from the prompt:

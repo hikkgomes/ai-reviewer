@@ -11,7 +11,7 @@ Workflow:
 2. Read `reference/risk-weights.md` and `reference/report-template.md`.
 3. Read the target repository's `.ai-review/local.json` if present.
 4. Identify changed files and activate matching `reference/lang/*.md` modules.
-5. Use `scripts/review_changed.sh <base>` for `/ai-review` diff review. Use `scripts/review.sh` for `/ai-review-universal` whole-repo or prompt-scoped review.
+5. Use `scripts/review_changed.sh <base>` for `/dissect-diff` diff review. Use `scripts/review.sh` for `/dissect-full` whole-repo or prompt-scoped review.
 6. Apply the six layers in order:
    - Requirement Fidelity
    - Logic and Edge Cases

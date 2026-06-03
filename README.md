@@ -1,6 +1,6 @@
-# AI Reviewer
+# Dissect
 
-A shared AI-assisted code review methodology packaged as machine-level skills for Claude Code and Codex. Codex gets separate `ai-review` and `ai-review-universal` skills so both review modes are directly selectable.
+A shared AI-assisted code review methodology packaged as machine-level skills for Claude Code and Codex. Codex gets separate `dissect-diff` and `dissect-full` skills so both review modes are directly selectable.
 
 ## Install
 
@@ -14,8 +14,8 @@ The installer detects supported AI agents on your machine and opens an interacti
 
 Supported machine-level skill installs:
 
-- Claude Code: `~/.claude/skills/ai-reviewer`
-- Codex: `~/.codex/skills/ai-review` and `~/.codex/skills/ai-review-universal`
+- Claude Code: `~/.claude/skills/dissect`
+- Codex: `~/.agents/skills/dissect-diff` and `~/.agents/skills/dissect-full`
 
 After installation, restart the installed AI editors so they reload skills.
 
@@ -23,14 +23,14 @@ After installation, restart the installed AI editors so they reload skills.
 
 Use these review modes in any supported editor:
 
-- `ai-review`: diff review against a branch, PR base, staged/unstaged changes, or any explicit diff scope
-- `ai-review-universal`: whole-repo review or prompt-scoped review of existing code
+- `dissect-diff`: diff review against a branch, PR base, staged/unstaged changes, or any explicit diff scope
+- `dissect-full`: whole-repo review or prompt-scoped review of existing code
 
 Examples:
 
 ```text
-Use the ai-reviewer skill to run ai-review against origin/main
-Use the ai-reviewer skill to run ai-review-universal on the auth module
+Use the dissect skill to run dissect-diff against origin/main
+Use the dissect skill to run dissect-full on the auth module
 ```
 
 ### Non-Interactive Install

@@ -1,7 +1,7 @@
-<!-- AI-REVIEWER-START -->
-# AI Reviewer Rules (Cursor Adapter)
+<!-- DISSECT-START -->
+# Dissect Rules (Cursor Adapter)
 
-Use this content in `.cursorrules` or `.cursor/rules/ai-reviewer.mdc` for a self-contained adversarial review policy.
+Use this content in `.cursorrules` or `.cursor/rules/dissect.mdc` for a self-contained adversarial review policy.
 
 ## Scope
 
@@ -196,10 +196,10 @@ If these scripts are unavailable in the current repo:
 
 Preferred install targets:
 - `.cursorrules` (single-file rules).
-- `.cursor/rules/ai-reviewer.mdc` (modular rules file).
+- `.cursor/rules/dissect.mdc` (modular rules file).
 
 When both exist:
-- Prefer `.cursor/rules/ai-reviewer.mdc` to keep rules modular and updatable.
+- Prefer `.cursor/rules/dissect.mdc` to keep rules modular and updatable.
 
 ## Rule Hygiene
 

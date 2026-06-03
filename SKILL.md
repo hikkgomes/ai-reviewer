@@ -1,17 +1,17 @@
 ---
-name: ai-reviewer
+name: dissect
 description: Adversarial review of AI-assisted code. Use for diff review, universal repository review, and security/correctness review.
 ---
 
-# AI Reviewer
+# Dissect
 
-Use this skill when reviewing AI-assisted code. There are two review modes: ai-review for diff review of new changes and ai-review-universal for existing-code review.
+Use this skill when reviewing AI-assisted code. There are two review modes: dissect-diff for diff review of new changes and dissect-full for existing-code review.
 
 ## Review Workflows
 
-Use ai-review for diff review. Compare new changes against the branch, PR base, staged/unstaged files, or explicit diff scope named by the user. Review only new behavior, opening surrounding code only for context.
+Use dissect-diff for diff review. Compare new changes against the branch, PR base, staged/unstaged files, or explicit diff scope named by the user. Review only new behavior, opening surrounding code only for context.
 
-Use ai-review-universal for whole-repo review or prompt-scoped review of existing code, regardless of whether it changed recently.
+Use dissect-full for whole-repo review or prompt-scoped review of existing code, regardless of whether it changed recently.
 
 For both modes:
 

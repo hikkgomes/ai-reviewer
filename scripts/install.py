@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 import termios
@@ -10,13 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SKILL_NAME = "ai-reviewer"
-CODEX_SKILL_NAMES = ("ai-review", "ai-review-universal")
+SKILL_NAME = "dissect"
+CODEX_SKILL_NAMES = ("dissect-diff", "dissect-full")
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 ADAPTERS_ROOT = SOURCE_ROOT / "adapters"
 CURSOR_ADAPTER = ADAPTERS_ROOT / "cursor-rules.md"
-CURSOR_START = "<!-- AI-REVIEWER-START -->"
-CURSOR_END = "<!-- AI-REVIEWER-END -->"
+CURSOR_START = "<!-- DISSECT-START -->"
+CURSOR_END = "<!-- DISSECT-END -->"
 SKILL_ITEMS = [
     "SKILL.md",
     "README.md",
@@ -38,7 +39,7 @@ class InstallOption:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Install ai-reviewer as a machine-level skill.")
+    parser = argparse.ArgumentParser(description="Install dissect as a machine-level skill.")
     parser.add_argument(
         "--install",
         default="",
@@ -71,33 +72,43 @@ def install_skill(destination: Path) -> None:
         copy_item(SOURCE_ROOT / item, destination / item)
 
 
+def symlink_force(src: Path, dst: Path) -> None:
+    if dst.is_symlink() or dst.exists():
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        else:
+            shutil.rmtree(dst)
+    os.symlink(src, dst)
+
+
 def install_claude() -> None:
     claude_base = Path.home() / ".claude"
     skill_destination = claude_base / "skills" / SKILL_NAME
-    install_skill(skill_destination)
+    skill_destination.parent.mkdir(parents=True, exist_ok=True)
+    symlink_force(SOURCE_ROOT, skill_destination)
 
     commands_dir = claude_base / "commands"
     agents_dir = claude_base / "agents"
     commands_dir.mkdir(parents=True, exist_ok=True)
     agents_dir.mkdir(parents=True, exist_ok=True)
     for command in (SOURCE_ROOT / "commands").glob("*.md"):
-        shutil.copy2(command, commands_dir / command.name)
+        symlink_force(command, commands_dir / command.name)
     for agent in (SOURCE_ROOT / "agents").glob("*.md"):
-        shutil.copy2(agent, agents_dir / agent.name)
+        symlink_force(agent, agents_dir / agent.name)
 
-    print(f"Installed Claude Code skill: {skill_destination}")
+    print(f"Installed Claude Code skill: {skill_destination} -> {SOURCE_ROOT}")
     print(f"Installed Claude Code commands: {commands_dir}")
     print(f"Installed Claude Code agents: {agents_dir}")
 
 
 def codex_skill_entrypoint(name: str) -> str:
-    if name == "ai-review":
+    if name == "dissect-diff":
         return """---
-name: ai-review
+name: dissect-diff
 description: Diff review for AI-assisted code. Use to review new changes against a branch, PR base, staged/unstaged files, or explicit diff scope.
 ---
 
-# ai-review
+# dissect-diff
 
 Review only new changes against a base branch, PR base, or explicitly requested diff scope.
 
@@ -112,11 +123,11 @@ Workflow:
 7. Apply all six methodology layers and report findings first.
 """
     return """---
-name: ai-review-universal
-description: Universal review for AI-assisted code. Use to review the whole repository or prompt-scoped existing code regardless of whether it changed recently.
+name: dissect-full
+description: Full review for AI-assisted code. Use to review the whole repository or prompt-scoped existing code regardless of whether it changed recently.
 ---
 
-# ai-review-universal
+# dissect-full
 
 Review the whole repository, or the repo areas named in the prompt, regardless of whether the code is new.
 
@@ -131,32 +142,34 @@ Workflow:
 """
 
 
-def install_codex_skill(name: str, codex_base: Path) -> None:
-    destination = codex_base / "skills" / name
+def install_codex_skill(name: str, agents_base: Path) -> None:
+    destination = agents_base / "skills" / name
     install_skill(destination)
     (destination / "SKILL.md").write_text(codex_skill_entrypoint(name), encoding="utf-8")
     print(f"Installed Codex skill: {destination}")
 
 
-def remove_legacy_codex_skill(codex_base: Path) -> None:
-    legacy = codex_base / "skills" / SKILL_NAME
-    skill_file = legacy / "SKILL.md"
-    if not skill_file.exists():
-        return
-    try:
-        content = skill_file.read_text(encoding="utf-8")
-    except Exception:
-        return
-    if "name: ai-reviewer" in content and "AI Reviewer" in content:
-        shutil.rmtree(legacy)
-        print(f"Removed legacy Codex skill: {legacy}")
+def remove_legacy_codex_skill() -> None:
+    for base in (Path.home() / ".codex", Path.home() / ".agents"):
+        for name in ("ai-reviewer", "ai-review", "ai-review-universal"):
+            legacy = base / "skills" / name
+            skill_file = legacy / "SKILL.md"
+            if not skill_file.exists():
+                continue
+            try:
+                content = skill_file.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if "name: ai-reviewer" in content or "name: ai-review" in content:
+                shutil.rmtree(legacy)
+                print(f"Removed legacy Codex skill: {legacy}")
 
 
 def install_codex() -> None:
-    codex_base = Path.home() / ".codex"
+    agents_base = Path.home() / ".agents"
     for name in CODEX_SKILL_NAMES:
-        install_codex_skill(name, codex_base)
-    remove_legacy_codex_skill(codex_base)
+        install_codex_skill(name, agents_base)
+    remove_legacy_codex_skill()
 
 
 def merge_block(existing: str, incoming: str, start: str, end: str) -> str:
@@ -185,7 +198,7 @@ def merge_block(existing: str, incoming: str, start: str, end: str) -> str:
 
 def install_cursor() -> None:
     cursor_base = Path.home() / ".cursor"
-    target = cursor_base / "rules" / "ai-reviewer.mdc"
+    target = cursor_base / "rules" / "dissect.mdc"
     incoming = CURSOR_ADAPTER.read_text(encoding="utf-8").rstrip()
     wrapped = f"{CURSOR_START}\n{incoming}\n{CURSOR_END}\n"
 
@@ -209,12 +222,12 @@ INSTALLERS = {
 
 def detected_options() -> list[InstallOption]:
     claude_detected = command_exists("claude") or (Path.home() / ".claude").exists()
-    codex_detected = command_exists("codex") or (Path.home() / ".codex").exists()
+    codex_detected = command_exists("codex") or (Path.home() / ".codex").exists() or (Path.home() / ".agents").exists()
     cursor_detected = command_exists("cursor") or (Path.home() / ".cursor").exists()
     return [
-        InstallOption("claude", "Claude Code skill", "~/.claude/skills/ai-reviewer", claude_detected),
-        InstallOption("codex", "Codex skills", "~/.codex/skills/ai-review and ai-review-universal", codex_detected),
-        InstallOption("cursor", "Cursor rules", "~/.cursor/rules/ai-reviewer.mdc", cursor_detected),
+        InstallOption("claude", "Claude Code skill", "~/.claude/skills/dissect", claude_detected),
+        InstallOption("codex", "Codex skills", "~/.agents/skills/dissect-diff and dissect-full", codex_detected),
+        InstallOption("cursor", "Cursor rules", "~/.cursor/rules/dissect.mdc", cursor_detected),
     ]
 
 
@@ -244,7 +257,7 @@ def select_options(options: list[InstallOption]) -> list[str]:
 
     while True:
         clear_screen()
-        print("AI Reviewer installer\n")
+        print("Dissect installer\n")
         print("Use ↑/↓ to move, Space to toggle, Enter to install, a to toggle all, q to cancel.\n")
         for index, option in enumerate(options):
             pointer = "›" if index == cursor else " "
