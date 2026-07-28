@@ -5,7 +5,9 @@
     "monorepo": false
   },
   "review_options": {
-    "run_install_on_review": false
+    "run_install_on_review": false,
+    "deterministic_output": "text",
+    "fail_on_severity": "none"
   },
   "commands": {
     "install": "",
@@ -30,7 +32,27 @@
       "vendor/",
       "target/"
     ],
-    "critical": []
+    "critical": [],
+    "critical_routes": [],
+    "public_routes": [],
+    "auth_sensitive": [],
+    "tenant_identifiers": [],
+    "sensitive_data": [],
+    "payment": [],
+    "deployment_infrastructure": [],
+    "generated_bundles": [],
+    "screenshot_critical_pages": [],
+    "operational_evidence": []
+  },
+  "security_review": {
+    "scan_generated_bundles": false,
+    "scan_git_history": false,
+    "git_history_depth": 20,
+    "payment_providers": [],
+    "known_public_origins": [],
+    "approved_production_urls": [],
+    "allowed_runtime_checks": [],
+    "tool_commands": {}
   },
   "risk": {
     "auth_sensitive": [],

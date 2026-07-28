@@ -24,6 +24,7 @@ SKILL_ITEMS = [
     "LICENSE",
     "commands",
     "agents",
+    "adapters",
     "reference",
     "scripts",
     "config",
@@ -114,7 +115,7 @@ Review only new changes against a base branch, PR base, or explicitly requested 
 
 Workflow:
 
-1. Read `reference/methodology.md`, `reference/risk-weights.md`, and `reference/report-template.md` from this skill.
+1. Read `reference/methodology.md`, `reference/check-families.md`, `reference/risk-weights.md`, and `reference/report-template.md` from this skill.
 2. Read the target repository's `.ai-review/local.json` if present.
 3. Determine the diff scope from the prompt: named branch, PR base, upstream/base branch, staged/unstaged files, or untracked files.
 4. Detect languages in changed files and read matching modules under `reference/lang/`.
@@ -133,7 +134,7 @@ Review the whole repository, or the repo areas named in the prompt, regardless o
 
 Workflow:
 
-1. Read `reference/methodology.md`, `reference/risk-weights.md`, and `reference/report-template.md` from this skill.
+1. Read `reference/methodology.md`, `reference/check-families.md`, `reference/risk-weights.md`, and `reference/report-template.md` from this skill.
 2. Read the target repository's `.ai-review/local.json` if present.
 3. Determine scope from the prompt: whole repo, specific paths, modules, features, languages, or risk domains.
 4. Detect languages in scope and read matching modules under `reference/lang/`.

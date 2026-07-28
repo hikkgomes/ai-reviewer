@@ -84,3 +84,23 @@ critical_risks:
   - infra
   - shell_execution
   - pii
+
+# Stable coverage families. Detailed reviewer guidance is canonical in
+# reference/check-families.md; do not duplicate it here or in adapters.
+check_families:
+  SEC-SECRETS: [3, 4, 5]
+  SEC-AUTHN: [1, 4, 5, 6]
+  SEC-AUTHZ: [1, 2, 4, 5, 6]
+  SEC-DATABASE: [2, 3, 4, 5, 6]
+  SEC-ROUTES: [1, 4, 5]
+  SEC-BROWSER: [3, 4, 5]
+  SEC-PAYMENTS: [1, 2, 3, 4, 5, 6]
+  SEC-DATA: [1, 4, 5, 6]
+  SEC-DEPLOY: [1, 4, 5]
+  SUP-DEPENDENCY: [3, 5, 6]
+  OPS-OBSERVABILITY: [2, 5, 6]
+  OPS-RECOVERY: [4, 5, 6]
+  OPS-DESTRUCTIVE: [1, 2, 4, 5, 6]
+  GOV-REGRESSION: [1, 5, 6]
+  GOV-AUDIT: [1, 4, 5]
+  ABUSE-BRAND: [1, 4, 5]

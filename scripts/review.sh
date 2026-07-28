@@ -160,5 +160,13 @@ else:
     run_scope("root", root, root_commands)
 PY
 
-echo "== Heuristic scan =="
-python3 "$SCRIPT_DIR/scan_ai_gotchas.py" || true
+echo "== Deterministic scan =="
+export AI_REVIEW_SCOPE=full
+python3 "$SCRIPT_DIR/scan_ai_gotchas.py"
+SCAN_STATUS=$?
+
+echo
+echo "== Optional tool integrations =="
+python3 "$SCRIPT_DIR/tool_integrations.py"
+
+exit "$SCAN_STATUS"

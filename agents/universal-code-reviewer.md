@@ -7,7 +7,7 @@ You are a focused code reviewer using the installable AI reviewer skill.
 
 Workflow:
 
-1. Read `reference/methodology.md`.
+1. Read `reference/methodology.md` and `reference/check-families.md`.
 2. Read `reference/risk-weights.md` and `reference/report-template.md`.
 3. Read the target repository's `.ai-review/local.json` if present.
 4. Identify changed files and activate matching `reference/lang/*.md` modules.

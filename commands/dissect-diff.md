@@ -5,7 +5,7 @@ This is the default command for change review. It must not review the whole repo
 Workflow:
 
 1. Locate the installed skill directory at `.claude/skills/dissect` in the target project or `~/.claude/skills/dissect`.
-2. Read `reference/methodology.md`, `reference/risk-weights.md`, and `reference/report-template.md` from that skill directory.
+2. Read `reference/methodology.md`, `reference/check-families.md`, `reference/risk-weights.md`, and `reference/report-template.md` from that skill directory.
 3. Read the target repository's `.ai-review/local.json` if present.
 4. Determine the diff scope from the prompt:
    - If the user names a branch, compare against that branch.

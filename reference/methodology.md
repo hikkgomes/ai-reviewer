@@ -1,6 +1,10 @@
 # Six-Layer Adversarial Review Methodology
 
-This is the canonical review workflow for AI-assisted code. Use it to review changed files first, then expand only when the change cannot be understood safely from the diff.
+This is the canonical review workflow for AI-assisted code. Use it to review
+changed files first, then expand only when the change cannot be understood
+safely from the diff. `reference/check-families.md` is the canonical catalog of
+explicit security, production-readiness, supply-chain, governance, and abuse
+domains mapped onto these layers.
 
 ## Pre-Review: Build the Mental Model
 
@@ -11,8 +15,17 @@ This is the canonical review workflow for AI-assisted code. Use it to review cha
 5. Identify invariants that must remain true: auth boundaries, data ownership, persistence rules, idempotency, API compatibility, migrations, error contracts, performance budgets.
 6. Detect languages in changed files and load the matching `reference/lang/*.md` modules.
 7. Run configured checks when available, but do not let passing checks replace manual review.
+8. Create a coverage ledger for every family in `check-families.md`; assign
+   exactly one evidence state to each family.
 
 Review evidence in this order: user intent, repo-local instructions, actual code, executed command output, external documentation only when needed.
+
+Static/local review is the default. Do not probe public applications, attempt
+authentication bypass, create production accounts, fetch private data, trigger
+payments, restore/delete production data, or run destructive infrastructure
+commands. Runtime checks require explicit authorisation, an approved target,
+suitable credentials, and a configured allowed check. Otherwise record Not
+verified and the evidence required.
 
 ## Layer 1: Requirement Fidelity
 

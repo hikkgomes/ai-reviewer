@@ -15,7 +15,7 @@ Use dissect-full for whole-repo review or prompt-scoped review of existing code,
 
 For both modes:
 
-1. Read `reference/methodology.md`.
+1. Read `reference/methodology.md` and `reference/check-families.md`.
 2. Read `reference/risk-weights.md` and `reference/report-template.md`.
 3. Read the target repository's `.ai-review/local.json` if present.
 4. Detect languages in scope and read matching modules in `reference/lang/`.

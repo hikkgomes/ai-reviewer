@@ -183,5 +183,12 @@ if not ran_any:
     print()
 PY
 
-echo "== Heuristic scan =="
+echo "== Deterministic scan =="
 python3 "$SCRIPT_DIR/scan_ai_gotchas.py"
+SCAN_STATUS=$?
+
+echo
+echo "== Optional tool integrations =="
+python3 "$SCRIPT_DIR/tool_integrations.py"
+
+exit "$SCAN_STATUS"

@@ -8,70 +8,88 @@
 - Language modules:
 - Risk weighting:
 
-## Findings by Layer
+## Review Scope
 
-Report findings grouped by methodology layer first, then by severity within each layer.
+- Included:
+- Excluded:
+- Runtime authorisation:
 
-### Layer 1: Requirement Fidelity
+## Commands and Tools Executed
 
-- No issues found in this layer.
+For each tool record detection, command, exit code, relevant output, and whether
+the result was complete. Configured checks must never be silently skipped.
 
-### Layer 2: Logic and Edge Cases
+## Findings by Severity
 
-- No issues found in this layer.
+Order findings Critical, High, Medium, then Low. Every finding uses:
 
-### Layer 3: API and Dependency Integrity
+### [Severity] [CHECK-ID] Title
 
-- No issues found in this layer.
-
-### Layer 4: Security Patterns
-
-- No issues found in this layer.
-
-### Layer 5: System Awareness
-
-- No issues found in this layer.
-
-### Layer 6: Test Quality
-
-- No issues found in this layer.
-
-When a finding exists, use this exact shape:
-
-### [Severity] Title
-
-- Layer:
-- Location: `path:line`
+- Confidence:
+- Methodology layer:
+- Location or command evidence:
 - Impact:
-- Evidence:
-- Fix:
+- Exploit or failure scenario:
+- Recommended fix:
+- Verification guidance:
+
+## Coverage Ledger
+
+Assign exactly one state to every applicable family: Finding, Checked, Not
+applicable, or Not verified.
+
+| Check family | State | Evidence / reason |
+| --- | --- | --- |
+| SEC-SECRETS |  |  |
+| SEC-AUTHN |  |  |
+| SEC-AUTHZ |  |  |
+| SEC-DATABASE |  |  |
+| SEC-ROUTES |  |  |
+| SEC-BROWSER |  |  |
+| SEC-PAYMENTS |  |  |
+| SEC-DATA |  |  |
+| SEC-DEPLOY |  |  |
+| SUP-DEPENDENCY |  |  |
+| OPS-OBSERVABILITY |  |  |
+| OPS-RECOVERY |  |  |
+| OPS-DESTRUCTIVE |  |  |
+| GOV-REGRESSION |  |  |
+| GOV-AUDIT |  |  |
+| ABUSE-BRAND |  |  |
+
+## Operational Controls and Evidence
+
+- Static configuration observed:
+- Runtime/operational proof observed:
+
+## Not Applicable
+
+List families and the evidence that the technology/control is absent.
+
+## Not Verified
+
+List families, why verification was impossible, and the exact evidence needed.
 
 ## Example Finding
 
-### [High] Retry Loop Ignores Cancellation Signal
+### [High] [COR-RETRY-001] Retry Loop Ignores Cancellation Signal
 
-- Layer: Layer 2: Logic and Edge Cases
-- Location: `services/sync_worker.py:148`
+- Confidence: High
+- Methodology layer: Layer 2 — Logic and Edge Cases
+- Location or command evidence: `services/sync_worker.py:148`
 - Impact: Worker can continue issuing external writes after caller cancellation, causing duplicate side effects and delayed shutdown.
-- Evidence: `while True` loop catches timeout exceptions and retries without checking `ctx.cancelled` or equivalent cancellation token.
-- Fix: Check cancellation state at top of loop and before each retry; propagate cancellation error instead of retrying.
-
-## Verification
-
-Use this structure for automated checks and manual commands:
-
-- Command: `<command text>`
-- Exit code: `<numeric code>`
-- Relevant output: `<only the lines that matter>`
-- Interpretation: `<what this means for correctness/risk>`
-
-Also include:
-
-- Not run / not verified:
+- Exploit or failure scenario: A cancelled request times out repeatedly and keeps mutating external state.
+- Recommended fix: Check cancellation state at top of loop and before each retry; propagate cancellation error instead of retrying.
+- Verification guidance: Add a test that cancels during a timeout and asserts no later write occurs.
 
 ## Residual Risk
 
-Mention remaining uncertainty, missing tests, or areas that need human product/security confirmation.
+Mention remaining uncertainty, missing tests, or areas that need human product/
+security confirmation. A clean static review is not proof of production safety.
+
+## Remediation Priorities
+
+List a concise, ordered set of next actions.
 
 ## Guidance Notes
 

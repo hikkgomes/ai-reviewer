@@ -1,6 +1,10 @@
 # Dissect
 
-A shared AI-assisted code review methodology packaged as machine-level skills for Claude Code and Codex. Codex gets separate `dissect-diff` and `dissect-full` skills so both review modes are directly selectable.
+An evidence-first AI-assisted code review methodology packaged as machine-level
+skills for Claude Code, Codex, and Cursor. Dissect combines semantic/correctness
+review, application-security review, production-readiness review, and optional
+deterministic checks. Codex keeps separate `dissect-diff` and `dissect-full`
+skills so both review modes remain directly selectable.
 
 ## Install
 
@@ -62,6 +66,107 @@ The core methodology lives in `reference/methodology.md`:
 
 Reference materials include human and AI error taxonomies, empirical risk weights, a report template, and language modules for TypeScript, JavaScript, Python, SQL, Java/C#, Go, Rust, C++, and PHP.
 
+The six layers remain the primary reasoning model. Stable coverage families in
+`reference/check-families.md` make secrets, authentication, authorisation/tenant
+isolation, database/RLS, sensitive routes, browser/transport, payments,
+sensitive data, deployment exposure, dependencies, observability, recovery,
+destructive actions, regression protection, governance, and brand abuse
+explicit.
+
+Every applicable family ends in one evidence state:
+
+- **Finding:** concrete evidence demonstrates a problem.
+- **Checked:** sufficient evidence was inspected and no problem was found.
+- **Not applicable:** the technology or control is absent.
+- **Not verified:** runtime access, configuration, credentials, or operational
+  proof is missing.
+
+Not verified is not safe, and missing evidence alone is not a vulnerability. A
+clean static review is not proof that a production system is secure or
+compliant.
+
+## Automated and Human Coverage
+
+The deterministic scanner handles high-signal syntactic evidence such as
+credential shapes, privileged browser environment names, unconditional RLS
+policies, credentialed wildcard CORS, unsafe dependency sources, and broad
+destructive commands. It emits stable check IDs, evidence locations,
+confidence, explanation, and remediation.
+
+Authentication correctness, effective route protection, ownership and tenant
+isolation, payment semantics, governance, backup restoration, and production
+reachability require human, runtime, or operational evidence. Scanner candidates
+for these areas must be confirmed against surrounding configuration and code.
+
+Static/local review is the default. Dissect does not probe public applications,
+bypass authentication, create production accounts, retrieve private data,
+trigger payments, or perform destructive/recovery operations. Runtime checks
+require explicit authorisation, an approved URL, credentials, and an entry in
+`security_review.allowed_runtime_checks`.
+
+## Configuration
+
+Copy `config/local.json.template` to `.ai-review/local.json`. Existing
+configuration remains valid. Optional fields describe public and critical
+routes, auth/sensitive/payment/infra paths, tenant identifiers, generated
+bundles, screenshot-critical pages, operational evidence, payment providers,
+known origins, approved production URLs, allowed runtime checks, and explicit
+tool commands.
+
+Generated bundles and recent Git history are disabled by default:
+
+```json
+{
+  "security_review": {
+    "scan_generated_bundles": true,
+    "scan_git_history": true,
+    "git_history_depth": 20,
+    "tool_commands": {
+      "gitleaks": "gitleaks detect --no-banner --redact"
+    }
+  }
+}
+```
+
+Installed tools are detected but execute only when configured. Reports include
+whether each tool was detected, its command, exit code, relevant output, and
+whether the result completed. This keeps network-dependent and potentially
+expansive audits opt-in.
+
+## CI and JSON Output
+
+The default exit status remains non-failing. Opt into CI enforcement with a
+threshold:
+
+```bash
+python3 scripts/scan_ai_gotchas.py --format json --fail-on high > dissect.json
+```
+
+Or configure `review_options.deterministic_output` and
+`review_options.fail_on_severity`. Exit code `2` means at least one finding met
+the threshold. The JSON contract is versioned with `schema_version`.
+
+Run the offline regression suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 scripts/sync_adapters.py --check
+```
+
+## Extending Dissect
+
+Add a new family once in `reference/check-families.md` and map it in
+`config/rules.yaml`. Add deterministic rules only for reliable syntactic
+evidence, with a stable ID, severity, confidence, explanation, remediation, and
+positive/negative fixtures. Then regenerate adapters:
+
+```bash
+python3 scripts/sync_adapters.py
+```
+
+CI verifies that embedded adapters match the canonical methodology and family
+catalog, preventing silent Claude/Codex/Cursor drift.
+
 ## Scripts
 
 Scripts are designed to run from the target repository:
@@ -72,7 +177,7 @@ bash /path/to/skill/scripts/review.sh
 python3 /path/to/skill/scripts/scan_ai_gotchas.py
 ```
 
-`review_changed.sh` reviews the diff against a base branch when provided, plus staged, unstaged, and untracked files. It runs configured lint/typecheck commands from `.ai-review/local.json`, prints detected languages, and runs the heuristic gotcha scanner only on the diff file list. `review.sh` runs broader configured commands and the scanner for universal review.
+`review_changed.sh` reviews the diff against a base branch when provided, plus staged, unstaged, and untracked files. It runs configured lint/typecheck commands from `.ai-review/local.json`, prints detected languages, and runs deterministic checks only on the diff file list. `review.sh` runs broader configured commands and the scanner for universal review.
 
 ## Files
 
