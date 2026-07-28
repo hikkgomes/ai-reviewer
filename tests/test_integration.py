@@ -32,6 +32,11 @@ class IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_ci_runs_offline_tests_and_adapter_drift_check(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn("python3 -m unittest discover -s tests -v", workflow)
+        self.assertIn("python3 scripts/sync_adapters.py --check", workflow)
+
     def test_family_ids_and_layers_match_rules_config(self) -> None:
         import re
 
@@ -143,6 +148,37 @@ class IntegrationTests(unittest.TestCase):
             self.assertTrue(missing["configured"])
             self.assertFalse(missing["executed"])
             self.assertIn("not run", missing["output"])
+
+    def test_nonzero_finding_exit_is_completed_but_not_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / ".ai-review"
+            config_dir.mkdir()
+            config = {
+                "security_review": {
+                    "tool_commands": {
+                        "fixture-tool": {
+                            "command": "/bin/sh -c 'exit 1'",
+                            "finding_exit_codes": [1]
+                        }
+                    }
+                }
+            }
+            (config_dir / "local.json").write_text(json.dumps(config))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "tool_integrations.py"), "--format", "json"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+            tool = next(item for item in payload["tools"] if item["tool"] == "fixture-tool")
+            self.assertTrue(tool["execution_completed"])
+            self.assertTrue(tool["complete"])
+            self.assertFalse(tool["passed"])
+            self.assertTrue(tool["findings_produced"])
+            self.assertTrue(tool["coverage_complete"])
 
 
 if __name__ == "__main__":

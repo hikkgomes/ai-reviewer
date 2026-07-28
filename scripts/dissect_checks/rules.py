@@ -1,4 +1,3 @@
-# dissect: scanner-definition
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -136,6 +135,29 @@ def _ui_only_auth(path: str, text: str) -> Iterable[tuple[int, str]]:
     return [(text.count("\n", 0, m.start()) + 1, m.group(0)) for m in pattern.finditer(text)]
 
 
+def _browser_privileged_key(path: str, text: str) -> Iterable[tuple[int, str]]:
+    suffix = Path(path).suffix.lower()
+    if suffix not in {".js", ".jsx", ".ts", ".tsx", ".map"}:
+        return []
+    public_name = re.compile(
+        r"(?:NEXT_PUBLIC|VITE|PUBLIC|REACT_APP)[A-Z0-9_]*(?:SERVICE_ROLE|SECRET|PRIVATE_KEY)[A-Z0-9_]*",
+        re.I,
+    )
+    matches = list(public_name.finditer(text))
+    generated_or_browser = (
+        suffix == ".map"
+        or any(part.lower() in {"dist", "build", ".next", "public", "static", "client", "browser", "frontend"} for part in Path(path).parts)
+        or re.search(r"(?:^|[._-])(?:client|browser)(?:[._-]|$)", Path(path).name, re.I)
+    )
+    if generated_or_browser:
+        matches.extend(re.finditer(r"\bSUPABASE_SERVICE_ROLE_KEY\b", text))
+    unique = {(item.start(), item.group(0)): item for item in matches}
+    return [
+        (text.count("\n", 0, item.start()) + 1, item.group(0))
+        for item in unique.values()
+    ]
+
+
 def _unprotected_sensitive_route(path: str, text: str) -> Iterable[tuple[int, str]]:
     pattern = re.compile(
         r"\b(?:app|router)\.(?:get|post|put|patch|delete)\s*\(\s*"
@@ -164,13 +186,9 @@ RULES = (
         "high",
         "A privileged server/service-role credential is referenced by browser-delivered code.",
         "Move the privileged operation and credential to a server boundary; rotate exposed credentials.",
-        regex_matcher(
-            r"(?:NEXT_PUBLIC|VITE|PUBLIC|REACT_APP)[A-Z0-9_]*(?:SERVICE_ROLE|SECRET|PRIVATE_KEY)[A-Z0-9_]*"
-            r"|SUPABASE_SERVICE_ROLE_KEY",
-            suffixes=(".js", ".jsx", ".ts", ".tsx", ".map"),
-        ),
+        _browser_privileged_key,
         ("src/client.ts", "const key = import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY"),
-        ("src/client.ts", "const key = import.meta.env.VITE_SUPABASE_ANON_KEY"),
+        ("server/supabase.ts", "const key = process.env.SUPABASE_SERVICE_ROLE_KEY"),
     ),
     Rule(
         "SEC-SECRETS-002",

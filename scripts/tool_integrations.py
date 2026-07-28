@@ -29,7 +29,16 @@ def main() -> int:
     results = []
 
     for name in sorted(set(KNOWN_TOOLS) | set(configured)):
-        command = str(configured.get(name) or "").strip()
+        raw_config = configured.get(name)
+        if isinstance(raw_config, dict):
+            command = str(raw_config.get("command") or "").strip()
+            finding_exit_codes = {
+                int(code) for code in raw_config.get("finding_exit_codes", [])
+                if isinstance(code, int) or (isinstance(code, str) and code.isdigit())
+            }
+        else:
+            command = str(raw_config or "").strip()
+            finding_exit_codes = set()
         try:
             executable = shlex.split(command)[0] if command else name.split()[0]
         except ValueError:
@@ -41,8 +50,12 @@ def main() -> int:
             "configured": bool(command),
             "command": command,
             "executed": False,
+            "execution_completed": False,
             "exit_code": None,
             "complete": False,
+            "passed": None,
+            "findings_produced": None,
+            "coverage_complete": None,
             "output": "",
         }
         if command:
@@ -59,8 +72,19 @@ def main() -> int:
                 )
                 result.update({
                     "executed": True,
+                    "execution_completed": True,
                     "exit_code": completed.returncode,
-                    "complete": completed.returncode == 0,
+                    "complete": True,
+                    "passed": completed.returncode == 0,
+                    "findings_produced": (
+                        completed.returncode in finding_exit_codes
+                        if finding_exit_codes
+                        else (False if completed.returncode == 0 else None)
+                    ),
+                    "coverage_complete": (
+                        completed.returncode == 0
+                        or completed.returncode in finding_exit_codes
+                    ),
                     "output": (completed.stdout + completed.stderr).strip()[-4000:],
                 })
         elif detected:
@@ -77,7 +101,9 @@ def main() -> int:
                 f"[tool] {result['tool']}: detected={str(result['detected']).lower()} "
                 f"configured={str(result['configured']).lower()} executed={str(result['executed']).lower()} "
                 f"exit={result['exit_code'] if result['exit_code'] is not None else 'n/a'} "
-                f"complete={str(result['complete']).lower()}"
+                f"execution_completed={str(result['execution_completed']).lower()} "
+                f"passed={result['passed']} findings={result['findings_produced']} "
+                f"coverage_complete={result['coverage_complete']}"
             )
             if result["command"]:
                 print(f"  command: {result['command']}")

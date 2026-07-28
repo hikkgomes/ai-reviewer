@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-from dissect_checks.engine import history_scan_available, options_from_environment, scan_paths
+from dissect_checks.engine import options_from_environment, scan_report
 
 
 SEVERITY = {"low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -40,13 +40,14 @@ def main() -> int:
         include_generated=args.include_generated,
         include_history=args.history,
     )
-    findings = scan_paths(options)
-    complete = history_scan_available(options)
+    report = scan_report(options)
+    findings = report.findings
     if output_format == "json":
         print(json.dumps({
             "schema_version": SCHEMA_VERSION,
             "scanner": "dissect",
-            "complete": complete,
+            "complete": report.complete,
+            "coverage_errors": list(report.coverage_errors),
             "options": {
                 "generated_bundles": options.include_generated,
                 "git_history": options.include_history,
@@ -70,6 +71,9 @@ def main() -> int:
                 f"[{item.disposition.upper()}][{item.severity.upper()}][{item.check_id}][{item.confidence}] "
                 f"{item.path}:{item.line} :: {item.evidence}"
             )
+    if output_format == "text" and report.coverage_errors:
+        for error in report.coverage_errors:
+            print(f"[INCOMPLETE] {error}", file=sys.stderr)
 
     if fail_on != "none":
         threshold = SEVERITY[fail_on]

@@ -1,5 +1,4 @@
 {
-  "_dissect": "scanner-fixture",
   "vulnerable": [
     {
       "name": "frontend privileged secret exposure",

@@ -91,7 +91,12 @@ The deterministic scanner handles high-signal syntactic evidence such as
 credential shapes, privileged browser environment names, unconditional RLS
 policies, credentialed wildcard CORS, unsafe dependency sources, and broad
 destructive commands. It emits stable check IDs, evidence locations,
-confidence, explanation, and remediation.
+confidence, explanation, and remediation. Secret evidence is centrally redacted
+to a safe prefix and fingerprint before text or JSON output is produced.
+
+The modular scanner also preserves the complete pre-existing heuristic baseline.
+`tests/test_rules.py` contains an explicit expected-ID set so deleting a legacy
+detector cannot silently reduce coverage.
 
 Authentication correctness, effective route protection, ownership and tenant
 isolation, payment semantics, governance, backup restoration, and production
@@ -122,7 +127,10 @@ Generated bundles and recent Git history are disabled by default:
     "scan_git_history": true,
     "git_history_depth": 20,
     "tool_commands": {
-      "gitleaks": "gitleaks detect --no-banner --redact"
+      "gitleaks": {
+        "command": "gitleaks detect --no-banner --redact",
+        "finding_exit_codes": [1]
+      }
     }
   }
 }
@@ -130,8 +138,9 @@ Generated bundles and recent Git history are disabled by default:
 
 Installed tools are detected but execute only when configured. Reports include
 whether each tool was detected, its command, exit code, relevant output, and
-whether the result completed. This keeps network-dependent and potentially
-expansive audits opt-in.
+separate fields for execution completion, pass/fail, finding-producing exits,
+and coverage completeness. This keeps network-dependent and potentially
+expansive audits opt-in without confusing “findings found” with “tool failed.”
 
 ## CI and JSON Output
 
@@ -144,7 +153,9 @@ python3 scripts/scan_ai_gotchas.py --format json --fail-on high > dissect.json
 
 Or configure `review_options.deterministic_output` and
 `review_options.fail_on_severity`. Exit code `2` means at least one finding met
-the threshold. The JSON contract is versioned with `schema_version`.
+the threshold. The JSON contract is versioned with `schema_version`. Its
+`complete` flag becomes false and `coverage_errors` explains the gap when files,
+commits, or dependency manifests could not be inspected.
 
 Run the offline regression suite with:
 
