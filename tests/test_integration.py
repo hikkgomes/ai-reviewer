@@ -123,7 +123,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("\nnew\n", merged)
         self.assertNotIn("\nold\n", merged)
 
-    def test_configured_missing_tool_is_reported(self) -> None:
+    def test_legacy_shell_tool_command_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_dir = root / ".ai-review"
@@ -147,19 +147,19 @@ class IntegrationTests(unittest.TestCase):
             missing = next(item for item in payload["tools"] if item["tool"] == "definitely-missing-dissect-tool")
             self.assertTrue(missing["configured"])
             self.assertFalse(missing["executed"])
-            self.assertIn("not run", missing["output"])
+            self.assertIn("shell command strings are rejected", missing["output"])
 
-    def test_nonzero_finding_exit_is_completed_but_not_passed(self) -> None:
+    def test_configured_tool_requires_explicit_approval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_dir = root / ".ai-review"
             config_dir.mkdir()
+            marker = root / "executed"
             config = {
                 "security_review": {
                     "tool_commands": {
                         "fixture-tool": {
-                            "command": "/bin/sh -c 'exit 1'",
-                            "finding_exit_codes": [1]
+                            "argv": ["/bin/sh", "-c", f"touch {marker}"],
                         }
                     }
                 }
@@ -174,11 +174,69 @@ class IntegrationTests(unittest.TestCase):
             )
             payload = json.loads(result.stdout)
             tool = next(item for item in payload["tools"] if item["tool"] == "fixture-tool")
+            self.assertFalse(tool["executed"])
+            self.assertFalse(marker.exists())
+            self.assertIn("--allow-configured-tools", tool["output"])
+
+    def test_approved_tool_redacts_output_and_reports_finding_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / ".ai-review"
+            config_dir.mkdir()
+            raw_secret = "sk_live_" + "1234567890abcdefghij"
+            config = {
+                "security_review": {
+                    "tool_commands": {
+                        "fixture-tool": {
+                            "argv": ["/bin/sh", "-c", f"printf '%s' '{raw_secret}'; exit 1"],
+                            "finding_exit_codes": [1]
+                        }
+                    }
+                }
+            }
+            (config_dir / "local.json").write_text(json.dumps(config))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "tool_integrations.py"),
+                    "--format",
+                    "json",
+                    "--allow-configured-tools",
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+            tool = next(item for item in payload["tools"] if item["tool"] == "fixture-tool")
             self.assertTrue(tool["execution_completed"])
             self.assertTrue(tool["complete"])
             self.assertFalse(tool["passed"])
             self.assertTrue(tool["findings_produced"])
             self.assertTrue(tool["coverage_complete"])
+            self.assertNotIn(raw_secret, result.stdout)
+            self.assertIn("REDACTED", tool["output"])
+
+    def test_review_script_does_not_run_repository_commands_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / ".ai-review"
+            config_dir.mkdir()
+            marker = root / "executed"
+            (config_dir / "local.json").write_text(json.dumps({
+                "commands": {"test": f"touch {marker}"},
+            }))
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts" / "review.sh")],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists())
+            self.assertIn("were not executed", result.stdout)
 
 
 if __name__ == "__main__":

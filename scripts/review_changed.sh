@@ -114,6 +114,7 @@ PY
 
 python3 - <<'PY'
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -152,6 +153,13 @@ def run_scope(label, cwd, commands):
     print(f"== Fast checks: {label} ==")
     print(f"Path: {cwd}")
     print()
+    if os.environ.get("AI_REVIEW_ALLOW_CONFIGURED_COMMANDS") != "1":
+        print(
+            "Configured repository commands were not executed. Set "
+            "AI_REVIEW_ALLOW_CONFIGURED_COMMANDS=1 in a trusted local invocation to approve them."
+        )
+        print()
+        return True
     for key, cmd in configured:
         print(f"$ {cmd}")
         sys.stdout.flush()

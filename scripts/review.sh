@@ -83,10 +83,16 @@ def run_scope(label, cwd, commands):
     print(f"== Scope: {label} ==")
     print(f"Path: {cwd}")
     print()
+    configured = [(key, cmd) for key, cmd in commands.items() if cmd]
+    if configured and os.environ.get("AI_REVIEW_ALLOW_CONFIGURED_COMMANDS") != "1":
+        print(
+            "Configured repository commands were not executed. Set "
+            "AI_REVIEW_ALLOW_CONFIGURED_COMMANDS=1 in a trusted local invocation to approve them."
+        )
+        print()
+        return
     any_commands = False
-    for key, cmd in commands.items():
-        if not cmd:
-            continue
+    for key, cmd in configured:
         any_commands = True
         print(f"$ {cmd}")
         result = subprocess.run(cmd, shell=True, cwd=cwd)

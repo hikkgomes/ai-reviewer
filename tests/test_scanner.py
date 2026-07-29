@@ -106,6 +106,41 @@ class ScannerTests(unittest.TestCase):
                 {item.check_id for item in scan_paths(ScanOptions(root=root))},
             )
 
+    def test_declared_python_dependency_uses_nearest_pyproject(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "packages" / "api"
+            package.mkdir(parents=True)
+            (package / "pyproject.toml").write_text(
+                '[project]\ndependencies = ["httpx>=0.27"]\n'
+            )
+            (package / "app.py").write_text("import httpx\n")
+            findings = scan_paths(ScanOptions(root=root))
+            self.assertFalse(any(
+                item.check_id == "SUP-DEPENDENCY-004" and item.evidence == "httpx"
+                for item in findings
+            ))
+
+    def test_declared_python_dependency_uses_requirements_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "requirements-dev.txt").write_text("httpx==0.27.0\n")
+            (root / "app.py").write_text("import httpx\n")
+            self.assertNotIn(
+                "SUP-DEPENDENCY-004",
+                {item.check_id for item in scan_paths(ScanOptions(root=root))},
+            )
+
+    def test_undeclared_python_dependency_is_flagged_when_manifest_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pyproject.toml").write_text('[project]\ndependencies = ["requests"]\n')
+            (root / "app.py").write_text("import httpx\n")
+            self.assertIn(
+                "SUP-DEPENDENCY-004",
+                {item.check_id for item in scan_paths(ScanOptions(root=root))},
+            )
+
     def test_declared_import_with_lockfile_is_not_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -195,13 +230,73 @@ class ScannerTests(unittest.TestCase):
             self.assertFalse(report.complete)
             self.assertTrue(report.coverage_errors)
 
+    def test_deleted_history_path_reads_parent_blob_without_coverage_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
+            tracked = root / "deleted.ts"
+            tracked.write_text("const key='sk_live_1234567890abcdefghij';")
+            subprocess.run(["git", "add", "deleted.ts"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "add credential"], cwd=root, check=True)
+            tracked.unlink()
+            subprocess.run(["git", "add", "-u"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "delete credential"], cwd=root, check=True)
+            report = scan_report(ScanOptions(root=root, include_history=True))
+            self.assertTrue(report.complete, report.coverage_errors)
+            self.assertTrue(any(
+                item.path == "deleted.ts" and "deleted-parent" in item.source
+                for item in report.findings
+            ))
+
+    def test_renamed_history_path_is_scanned_in_diff_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
+            old = root / "old.ts"
+            old.write_text("const key='sk_live_1234567890abcdefghij';")
+            subprocess.run(["git", "add", "old.ts"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "add credential"], cwd=root, check=True)
+            old.rename(root / "new.ts")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "rename credential"], cwd=root, check=True)
+            report = scan_report(ScanOptions(
+                root=root,
+                include_history=True,
+                file_list=("new.ts",),
+            ))
+            self.assertTrue(report.complete, report.coverage_errors)
+            self.assertTrue(any(
+                item.path == "new.ts" and "renamed-from:old.ts" in item.source
+                for item in report.findings
+            ))
+
+    def test_self_review_scans_core_rule_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts" / "dissect_checks").mkdir(parents=True)
+            (root / "scripts" / "scan_ai_gotchas.py").write_text("# scanner\n")
+            (root / "SKILL.md").write_text("name: dissect\n")
+            rule_file = root / "scripts" / "dissect_checks" / "rules.py"
+            rule_file.write_text("key = 'sk_live_1234567890abcdefghij'\n")
+            findings = scan_paths(ScanOptions(
+                root=root,
+                file_list=("scripts/dissect_checks/rules.py",),
+            ))
+            self.assertIn("SEC-SECRETS-002", {item.check_id for item in findings})
+
     def test_individual_history_read_failure_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "bad.ts").write_text("export const ok = true;")
             responses = [
                 subprocess.CompletedProcess([], 0, stdout="deadbeef\n", stderr=""),
-                subprocess.CompletedProcess([], 0, stdout="bad.ts\n", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="M\tbad.ts\n", stderr=""),
                 subprocess.CompletedProcess([], 128, stdout="", stderr="missing"),
             ]
             with patch("dissect_checks.engine.subprocess.run", side_effect=responses):

@@ -112,7 +112,9 @@ require explicit authorisation, an approved URL, credentials, and an entry in
 ## Configuration
 
 Copy `config/local.json.template` to `.ai-review/local.json`. Existing
-configuration remains valid. Optional fields describe public and critical
+configuration remains valid except legacy `security_review.tool_commands`
+shell-command strings, which are deliberately rejected; migrate those entries
+to the argument-array form below. Optional fields describe public and critical
 routes, auth/sensitive/payment/infra paths, tenant identifiers, generated
 bundles, screenshot-critical pages, operational evidence, payment providers,
 known origins, approved production URLs, allowed runtime checks, and explicit
@@ -128,7 +130,7 @@ Generated bundles and recent Git history are disabled by default:
     "git_history_depth": 20,
     "tool_commands": {
       "gitleaks": {
-        "command": "gitleaks detect --no-banner --redact",
+        "argv": ["gitleaks", "detect", "--no-banner", "--redact"],
         "finding_exit_codes": [1]
       }
     }
@@ -136,11 +138,23 @@ Generated bundles and recent Git history are disabled by default:
 }
 ```
 
-Installed tools are detected but execute only when configured. Reports include
-whether each tool was detected, its command, exit code, relevant output, and
-separate fields for execution completion, pass/fail, finding-producing exits,
-and coverage completeness. This keeps network-dependent and potentially
-expansive audits opt-in without confusing “findings found” with “tool failed.”
+Installed tools are detected but never execute from repository configuration
+alone. Tool entries must use argument arrays (shell command strings are
+rejected), and a trusted local caller must approve execution explicitly:
+
+```bash
+python3 scripts/tool_integrations.py --allow-configured-tools
+```
+
+External stdout and stderr are centrally redacted before they enter text or JSON
+results. Reports include whether each tool was detected, its argument array,
+exit code, relevant redacted output, and separate fields for execution
+completion, pass/fail, finding-producing exits, and coverage completeness.
+
+The main review scripts likewise do not run commands discovered from the
+repository unless a trusted local caller sets
+`AI_REVIEW_ALLOW_CONFIGURED_COMMANDS=1`. This approval cannot be enabled by the
+repository configuration itself.
 
 ## CI and JSON Output
 

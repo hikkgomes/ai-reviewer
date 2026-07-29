@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import ast
 import fnmatch
 import json
 import os
 import re
 import subprocess
 import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9/3.10 compatibility.
+    tomllib = None
 
 from .legacy import scan_legacy
 from .model import Finding
@@ -30,24 +36,12 @@ JS_BUILTINS = {
     "stream", "timers", "tls", "url", "util", "worker_threads", "zlib",
 }
 PY_STDLIB = set(getattr(sys, "stdlib_module_names", ())) or {
-    "argparse", "collections", "dataclasses", "fnmatch", "hashlib", "importlib",
+    "argparse", "ast", "collections", "dataclasses", "fnmatch", "hashlib", "importlib",
     "json", "os", "pathlib", "re", "shlex", "shutil", "subprocess", "sys",
     "tempfile", "termios", "tomllib", "tty", "typing", "unittest",
 }
-DISSECT_SELF_EXCLUSIONS = {
-    "README.md",
-    "reference/methodology.md",
-    "reference/check-families.md",
-    "reference/report-template.md",
-    "adapters/codex-instructions.md",
-    "adapters/cursor-rules.md",
-    "adapters/generic-instructions.md",
-    "scripts/dissect_checks/rules.py",
-    "scripts/dissect_checks/legacy.py",
+DISSECT_FIXTURE_EXCLUSIONS = {
     "tests/fixtures/security_cases.json",
-    "tests/test_integration.py",
-    "tests/test_rules.py",
-    "tests/test_scanner.py",
 }
 
 
@@ -131,9 +125,8 @@ def _is_dissect_repository(root: Path) -> bool:
 
 
 def _ignored(rel: str, options: ScanOptions) -> bool:
-    if _is_dissect_repository(options.root):
-        if rel in DISSECT_SELF_EXCLUSIONS or rel.startswith("reference/lang/"):
-            return True
+    if _is_dissect_repository(options.root) and rel in DISSECT_FIXTURE_EXCLUSIONS:
+        return True
     parts = Path(rel).parts
     for part in parts:
         if part in DEFAULT_IGNORES:
@@ -196,26 +189,49 @@ def _scan_history(options: ScanOptions) -> tuple[list[Finding], list[str]]:
     allowed = set(options.file_list)
     for commit in commits.stdout.splitlines():
         names = subprocess.run(
-            ["git", "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit],
+            ["git", "diff-tree", "--root", "--no-commit-id", "--name-status", "-M", "-r", commit],
             cwd=options.root, text=True, capture_output=True, check=False,
         )
         if names.returncode != 0:
             errors.append(f"git history: could not list commit {commit[:12]} (exit {names.returncode})")
             continue
-        for rel in names.stdout.splitlines():
-            rel = _normalise(rel)
-            if allowed and rel not in allowed:
+        for entry in names.stdout.splitlines():
+            fields = entry.split("\t")
+            status = fields[0]
+            if status.startswith(("R", "C")) and len(fields) == 3:
+                old_rel, rel = map(_normalise, fields[1:])
+                in_scope = not allowed or old_rel in allowed or rel in allowed
+            elif len(fields) == 2:
+                rel = _normalise(fields[1])
+                old_rel = rel
+                in_scope = not allowed or rel in allowed
+            else:
+                errors.append(
+                    f"git history: could not parse path status at {commit[:12]}: {entry!r}"
+                )
+                continue
+            if not in_scope:
                 continue
             if _ignored(rel, options) or not _is_text_path(rel):
                 continue
+            revision = f"{commit}^" if status == "D" else commit
+            blob_rel = old_rel if status == "D" else rel
             shown = subprocess.run(
-                ["git", "show", f"{commit}:{rel}"],
+                ["git", "show", f"{revision}:{blob_rel}"],
                 cwd=options.root, text=True, capture_output=True, check=False,
             )
             if shown.returncode:
-                errors.append(f"git history: could not read {rel} at {commit[:12]} (exit {shown.returncode})")
+                errors.append(
+                    f"git history: could not read {blob_rel} at {revision[:12]} "
+                    f"(exit {shown.returncode})"
+                )
                 continue
-            findings.extend(scan_text(rel, shown.stdout, source=f"git:{commit[:12]}"))
+            source = f"git:{commit[:12]}"
+            if status == "D":
+                source += ":deleted-parent"
+            elif status.startswith("R"):
+                source += f":renamed-from:{old_rel}"
+            findings.extend(scan_text(rel, shown.stdout, source=source))
     return findings, errors
 
 
@@ -246,6 +262,163 @@ def _load_package_manifests(options: ScanOptions) -> tuple[dict[Path, tuple[Path
 
 
 def _nearest_manifest(rel: str, manifests: dict[Path, tuple[Path, dict]]) -> tuple[Path, dict] | None:
+    parent = Path(rel).parent
+    for directory in (parent, *parent.parents):
+        if directory in manifests:
+            return manifests[directory]
+    return manifests.get(Path("."))
+
+
+def _normalise_python_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "_", value).lower()
+
+
+def _dependency_name(specifier: str) -> str | None:
+    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", specifier)
+    return _normalise_python_name(match.group(1)) if match else None
+
+
+def _parse_toml(text: str) -> dict:
+    if tomllib is not None:
+        return tomllib.loads(text)
+
+    data: dict = {}
+    section = data
+    lines = iter(text.splitlines())
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        table = re.fullmatch(r"\[([^\]]+)\]", line)
+        if table:
+            section = data
+            for part in table.group(1).split("."):
+                section = section.setdefault(part.strip().strip("'\""), {})
+            continue
+        if "=" not in line:
+            continue
+        key, raw_value = (part.strip() for part in line.split("=", 1))
+        while raw_value.startswith("[") and raw_value.count("[") > raw_value.count("]"):
+            raw_value += "\n" + next(lines, "")
+        try:
+            value = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError):
+            value = raw_value.strip("'\"")
+        section[key.strip("'\"")] = value
+    return data
+
+
+def _load_python_manifests(
+    options: ScanOptions,
+) -> tuple[dict[Path, tuple[tuple[Path, ...], set[str]]], list[str]]:
+    by_directory: dict[Path, tuple[list[Path], set[str]]] = {}
+    errors = []
+
+    def add(path: Path, dependencies: set[str]) -> None:
+        rel = path.relative_to(options.root)
+        paths, declared = by_directory.setdefault(rel.parent, ([], set()))
+        paths.append(rel)
+        declared.update(dependencies)
+
+    for path in options.root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(options.root).as_posix()
+        if _ignored(rel, options):
+            continue
+        name = path.name
+        if name == "pyproject.toml":
+            try:
+                data = _parse_toml(path.read_text(encoding="utf-8"))
+            except OSError:
+                errors.append(f"dependency context: could not read {rel}")
+                continue
+            except (ValueError, TypeError):
+                errors.append(f"dependency context: invalid TOML in {rel}")
+                continue
+            dependencies = {
+                dependency
+                for specifier in (data.get("project") or {}).get("dependencies", [])
+                if isinstance(specifier, str)
+                for dependency in [_dependency_name(specifier)]
+                if dependency
+            }
+            for values in ((data.get("project") or {}).get("optional-dependencies") or {}).values():
+                dependencies.update(
+                    dependency
+                    for specifier in values
+                    if isinstance(specifier, str)
+                    for dependency in [_dependency_name(specifier)]
+                    if dependency
+                )
+            poetry = ((data.get("tool") or {}).get("poetry") or {})
+            poetry_groups = [poetry.get("dependencies") or {}]
+            poetry_groups.extend(
+                (group or {}).get("dependencies") or {}
+                for group in (poetry.get("group") or {}).values()
+            )
+            for group in poetry_groups:
+                dependencies.update(
+                    _normalise_python_name(package)
+                    for package in group
+                    if package.lower() != "python"
+                )
+            uv = ((data.get("tool") or {}).get("uv") or {})
+            dependencies.update(
+                dependency
+                for specifier in uv.get("dev-dependencies", [])
+                if isinstance(specifier, str)
+                for dependency in [_dependency_name(specifier)]
+                if dependency
+            )
+            for values in (data.get("dependency-groups") or {}).values():
+                dependencies.update(
+                    dependency
+                    for specifier in values
+                    if isinstance(specifier, str)
+                    for dependency in [_dependency_name(specifier)]
+                    if dependency
+                )
+            add(path, dependencies)
+        elif re.fullmatch(r"requirements(?:[-_.][A-Za-z0-9_.-]+)?\.txt", name, re.I):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                errors.append(f"dependency context: could not read {rel}")
+                continue
+            dependencies = {
+                dependency
+                for line in lines
+                if line.strip() and not line.lstrip().startswith(("#", "-", "git+", "http:"))
+                for dependency in [_dependency_name(line)]
+                if dependency
+            }
+            add(path, dependencies)
+        elif name == "Pipfile":
+            try:
+                data = _parse_toml(path.read_text(encoding="utf-8"))
+            except OSError:
+                errors.append(f"dependency context: could not read {rel}")
+                continue
+            except (ValueError, TypeError):
+                errors.append(f"dependency context: invalid TOML in {rel}")
+                continue
+            dependencies = {
+                _normalise_python_name(package)
+                for section in ("packages", "dev-packages")
+                for package in (data.get(section) or {})
+            }
+            add(path, dependencies)
+    return {
+        directory: (tuple(sorted(paths)), declared)
+        for directory, (paths, declared) in by_directory.items()
+    }, errors
+
+
+def _nearest_python_manifest(
+    rel: str,
+    manifests: dict[Path, tuple[tuple[Path, ...], set[str]]],
+) -> tuple[tuple[Path, ...], set[str]] | None:
     parent = Path(rel).parent
     for directory in (parent, *parent.parents):
         if directory in manifests:
@@ -299,12 +472,21 @@ def _javascript_dependency_findings(
     return findings
 
 
-def _python_dependency_findings(options: ScanOptions, files: list[str]) -> list[Finding]:
+def _python_dependency_findings(
+    options: ScanOptions,
+    files: list[str],
+    manifests: dict[Path, tuple[tuple[Path, ...], set[str]]],
+) -> list[Finding]:
     local_roots = {
         path.name for path in options.root.iterdir()
         if path.is_dir() and not _ignored(path.name, options)
     }
-    known = {
+    local_roots.update(
+        path.parent.name
+        for path in options.root.rglob("__init__.py")
+        if not _ignored(path.relative_to(options.root).as_posix(), options)
+    )
+    compatibility_known = {
         "pytest", "django", "flask", "fastapi", "pydantic", "sqlalchemy",
         "requests", "numpy", "pandas",
     }
@@ -316,6 +498,8 @@ def _python_dependency_findings(options: ScanOptions, files: list[str]) -> list[
     for rel in files:
         if Path(rel).suffix.lower() != ".py":
             continue
+        applicable = _nearest_python_manifest(rel, manifests)
+        manifest_paths, declared = applicable if applicable else ((), set())
         try:
             text = (options.root / rel).read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -335,7 +519,8 @@ def _python_dependency_findings(options: ScanOptions, files: list[str]) -> list[
                 module in PY_STDLIB
                 or module in local_roots
                 or module in sibling_modules
-                or module in known
+                or _normalise_python_name(module) in declared
+                or (not manifest_paths and module in compatibility_known)
                 or module.startswith("_")
             ):
                 continue
@@ -347,8 +532,16 @@ def _python_dependency_findings(options: ScanOptions, files: list[str]) -> list[
                 path=rel,
                 line=text.count("\n", 0, item.start()) + 1,
                 evidence=module,
-                explanation="A Python import is not recognised as standard-library, repository-local, or a known ecosystem dependency.",
-                remediation="Verify the package name and declare it in the applicable Python dependency manifest.",
+                explanation=(
+                    "A Python import is not recognised as standard-library, repository-local, "
+                    + (
+                        "or declared in the nearest manifest(s): "
+                        + ", ".join(path.as_posix() for path in manifest_paths)
+                        if manifest_paths
+                        else "or a known ecosystem dependency."
+                    )
+                ),
+                remediation="Verify the package name and declare it in the nearest Python dependency manifest.",
                 disposition="review-candidate",
             ))
     return findings
@@ -397,8 +590,10 @@ def scan_report(options: ScanOptions) -> ScanReport:
 
     manifests, manifest_errors = _load_package_manifests(options)
     errors.extend(manifest_errors)
+    python_manifests, python_manifest_errors = _load_python_manifests(options)
+    errors.extend(python_manifest_errors)
     findings.extend(_javascript_dependency_findings(options, files, manifests))
-    findings.extend(_python_dependency_findings(options, files))
+    findings.extend(_python_dependency_findings(options, files, python_manifests))
     findings.extend(_lockfile_findings(options, files, manifests))
     if options.include_history:
         history_findings, history_errors = _scan_history(options)
