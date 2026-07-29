@@ -98,6 +98,9 @@ The modular scanner also preserves the complete pre-existing heuristic baseline.
 `tests/test_rules.py` contains an explicit expected-ID set so deleting a legacy
 detector cannot silently reduce coverage.
 
+Dissect supports Python 3.11 through 3.14. CI runs the complete offline suite on
+the minimum, an intermediate release, and the newest supported release.
+
 Authentication correctness, effective route protection, ownership and tenant
 isolation, payment semantics, governance, backup restoration, and production
 reachability require human, runtime, or operational evidence. Scanner candidates
@@ -128,6 +131,9 @@ Generated bundles and recent Git history are disabled by default:
     "scan_generated_bundles": true,
     "scan_git_history": true,
     "git_history_depth": 20,
+    "python_import_aliases": {
+      "company_api": "company-sdk"
+    },
     "tool_commands": {
       "gitleaks": {
         "argv": ["gitleaks", "detect", "--no-banner", "--redact"],
@@ -143,7 +149,7 @@ alone. Tool entries must use argument arrays (shell command strings are
 rejected), and a trusted local caller must approve execution explicitly:
 
 ```bash
-python3 scripts/tool_integrations.py --allow-configured-tools
+python3 scripts/tool_integrations.py --allow-tool gitleaks
 ```
 
 External stdout and stderr are centrally redacted before they enter text or JSON
@@ -152,9 +158,24 @@ exit code, relevant redacted output, and separate fields for execution
 completion, pass/fail, finding-producing exits, and coverage completeness.
 
 The main review scripts likewise do not run commands discovered from the
-repository unless a trusted local caller sets
-`AI_REVIEW_ALLOW_CONFIGURED_COMMANDS=1`. This approval cannot be enabled by the
-repository configuration itself.
+repository unless a trusted local caller names command categories in
+`AI_REVIEW_ALLOWED_COMMANDS`, for example `lint,typecheck`. Unapproved commands
+are displayed but remain inert. This allow-list cannot be enabled by repository
+configuration.
+
+`python_import_aliases` maps import name to declared distribution name. Dissect
+also uses installed package metadata and a tested built-in map for common names
+such as `PIL`/`Pillow`, `yaml`/`PyYAML`, `bs4`/`beautifulsoup4`,
+`sklearn`/`scikit-learn`, and `cv2`/`opencv-python`; it never queries a network.
+Requirements includes and constraints are resolved recursively within the
+repository, with cycles deduplicated and missing includes reported as coverage
+errors.
+
+Git history is parsed with NUL-delimited status records. Rename ancestry follows
+the old path backward while findings retain the reviewed path. Copies follow
+the detected source ancestry only when the copied destination is in scope.
+Merge commits inspect every parent for the scoped lineage, and duplicate blobs
+reached through aliases or parents are deduplicated.
 
 ## CI and JSON Output
 

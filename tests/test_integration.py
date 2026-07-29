@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +38,8 @@ class IntegrationTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         self.assertIn("python3 -m unittest discover -s tests -v", workflow)
         self.assertIn("python3 scripts/sync_adapters.py --check", workflow)
+        for version in ("3.11", "3.13", "3.14"):
+            self.assertIn(f'"{version}"', workflow)
 
     def test_family_ids_and_layers_match_rules_config(self) -> None:
         import re
@@ -98,7 +102,31 @@ class IntegrationTests(unittest.TestCase):
     def test_configuration_template_is_valid_json(self) -> None:
         data = json.loads((ROOT / "config" / "local.json.template").read_text())
         self.assertIn("security_review", data)
+        self.assertIn("python_import_aliases", data["security_review"])
         self.assertEqual(data["review_options"]["fail_on_severity"], "none")
+
+    def test_unsupported_python_fails_with_clear_message_when_available(self) -> None:
+        legacy = Path("/usr/bin/python3")
+        if not legacy.exists():
+            self.skipTest("system Python is unavailable")
+        unsupported = subprocess.run(
+            [
+                str(legacy),
+                "-c",
+                "import sys; raise SystemExit(0 if sys.version_info < (3, 11) else 1)",
+            ],
+            check=False,
+        )
+        if unsupported.returncode != 0:
+            self.skipTest("system Python is supported")
+        result = subprocess.run(
+            [str(legacy), str(ROOT / "scripts" / "scan_ai_gotchas.py")],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires Python 3.11", result.stderr)
 
     def test_codex_installer_preserves_two_workflows(self) -> None:
         installer = load_installer()
@@ -106,9 +134,27 @@ class IntegrationTests(unittest.TestCase):
             base = Path(directory)
             for name in installer.CODEX_SKILL_NAMES:
                 installer.install_codex_skill(name, base)
-                skill = (base / "skills" / name / "SKILL.md").read_text()
+                installed = base / "skills" / name
+                skill = (installed / "SKILL.md").read_text()
                 self.assertIn(f"name: {name}", skill)
-                self.assertTrue((base / "skills" / name / "reference" / "check-families.md").exists())
+                self.assertTrue((installed / "reference" / "check-families.md").exists())
+                project = base / f"project-{name}"
+                project.mkdir()
+                (project / "safe.py").write_text("import json\n")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(installed / "scripts" / "scan_ai_gotchas.py"),
+                        "--format",
+                        "json",
+                    ],
+                    cwd=project,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(json.loads(result.stdout)["complete"])
 
     def test_cursor_merge_replaces_only_managed_block(self) -> None:
         installer = load_installer()
@@ -176,7 +222,7 @@ class IntegrationTests(unittest.TestCase):
             tool = next(item for item in payload["tools"] if item["tool"] == "fixture-tool")
             self.assertFalse(tool["executed"])
             self.assertFalse(marker.exists())
-            self.assertIn("--allow-configured-tools", tool["output"])
+            self.assertIn("--allow-tool fixture-tool", tool["output"])
 
     def test_approved_tool_redacts_output_and_reports_finding_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -201,7 +247,8 @@ class IntegrationTests(unittest.TestCase):
                     str(ROOT / "scripts" / "tool_integrations.py"),
                     "--format",
                     "json",
-                    "--allow-configured-tools",
+                    "--allow-tool",
+                    "fixture-tool",
                 ],
                 cwd=root,
                 text=True,
@@ -215,7 +262,7 @@ class IntegrationTests(unittest.TestCase):
             self.assertFalse(tool["passed"])
             self.assertTrue(tool["findings_produced"])
             self.assertTrue(tool["coverage_complete"])
-            self.assertNotIn(raw_secret, result.stdout)
+            self.assertFalse(raw_secret in result.stdout, "tool output leaked credential")
             self.assertIn("REDACTED", tool["output"])
 
     def test_review_script_does_not_run_repository_commands_by_default(self) -> None:
@@ -233,10 +280,52 @@ class IntegrationTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 check=False,
+                env={
+                    **os.environ,
+                    "PATH": (
+                        f"{Path(shutil.which('python3.11') or sys.executable).parent}:"
+                        f"{os.environ.get('PATH', '')}"
+                    ),
+                },
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(marker.exists())
             self.assertIn("were not executed", result.stdout)
+
+    def test_approved_review_command_output_and_plan_are_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / ".ai-review"
+            config_dir.mkdir()
+            secret = "review-command-secret"
+            (config_dir / "local.json").write_text(json.dumps({
+                "commands": {
+                    "test": f"printf 'token={secret}'",
+                    "build": f"printf 'password={secret}'",
+                },
+            }))
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts" / "review.sh")],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "AI_REVIEW_ALLOWED_COMMANDS": "test",
+                    "PATH": (
+                        f"{Path(shutil.which('python3.11') or sys.executable).parent}:"
+                        f"{os.environ.get('PATH', '')}"
+                    ),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(
+                secret in result.stdout + result.stderr,
+                "review command output leaked credential",
+            )
+            self.assertIn("REDACTED", result.stdout)
+            self.assertIn("[not approved] build", result.stdout)
 
 
 if __name__ == "__main__":

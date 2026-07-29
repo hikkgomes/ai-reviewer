@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from fixture_support import synthetic
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -22,7 +23,7 @@ class ScannerTests(unittest.TestCase):
             root = Path(directory)
             bundle = root / "dist" / "app.js"
             bundle.parent.mkdir()
-            bundle.write_text("const key='sk_live_1234567890abcdefghij';")
+            bundle.write_text(synthetic("const key='sk_live_1234567890abcdefghij';"))
             self.assertEqual(scan_paths(ScanOptions(root=root)), [])
             findings = scan_paths(
                 ScanOptions(root=root, include_generated=True, ignore=("dist/",))
@@ -37,7 +38,7 @@ class ScannerTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
             tracked = root / "config.ts"
-            tracked.write_text("const key='sk_live_1234567890abcdefghij';")
+            tracked.write_text(synthetic("const key='sk_live_1234567890abcdefghij';"))
             subprocess.run(["git", "add", "config.ts"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "credential fixture"], cwd=root, check=True)
             tracked.write_text("const key=getStripeKey();")
@@ -50,7 +51,7 @@ class ScannerTests(unittest.TestCase):
     def test_json_output_schema_and_ci_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "bad.ts").write_text("const key='sk_live_1234567890abcdefghij';")
+            (root / "bad.ts").write_text(synthetic("const key='sk_live_1234567890abcdefghij';"))
             script = ROOT / "scripts" / "scan_ai_gotchas.py"
             result = subprocess.run(
                 [sys.executable, str(script), "--format", "json", "--fail-on", "critical"],
@@ -70,12 +71,15 @@ class ScannerTests(unittest.TestCase):
                 },
             )
             self.assertIn("remediation", payload["findings"][0])
-            self.assertNotIn("sk_live_1234567890abcdefghij", result.stdout)
+            self.assertFalse(
+                synthetic("sk_live_1234567890abcdefghij") in result.stdout,
+                "scanner JSON leaked credential",
+            )
 
     def test_file_list_limits_diff_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "bad.ts").write_text("const key='sk_live_1234567890abcdefghij';")
+            (root / "bad.ts").write_text(synthetic("const key='sk_live_1234567890abcdefghij';"))
             (root / "safe.ts").write_text("const key=getKey();")
             findings = scan_paths(ScanOptions(root=root, file_list=("safe.ts",)))
             self.assertEqual(findings, [])
@@ -153,12 +157,12 @@ class ScannerTests(unittest.TestCase):
             )
 
     def test_secret_evidence_is_redacted_centrally(self) -> None:
-        raw = "sk_live_1234567890abcdefghij"
+        raw = synthetic("sk_live_1234567890abcdefghij")
         findings = scan_text("config.ts", f"const key='{raw}';")
         secret_findings = [item for item in findings if item.category == "secrets"]
         self.assertTrue(secret_findings)
         for finding in secret_findings:
-            self.assertNotIn(raw, finding.evidence)
+            self.assertFalse(raw in finding.evidence, "finding evidence leaked credential")
             self.assertIn("sha256=", finding.evidence)
         repeated = scan_text(
             "config.py",
@@ -177,7 +181,7 @@ class ScannerTests(unittest.TestCase):
     def test_content_marker_cannot_disable_scanning(self) -> None:
         findings = scan_text(
             "src/vulnerable.ts",
-            "// dissect: scanner-definition\nconst key='sk_live_1234567890abcdefghij';",
+            synthetic("// dissect: scanner-definition\nconst key='sk_live_1234567890abcdefghij';"),
         )
         self.assertIn("SEC-SECRETS-002", {item.check_id for item in findings})
 
@@ -189,7 +193,9 @@ class ScannerTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
             (root / "in-scope.ts").write_text("export const ok = true;")
-            (root / "unrelated.ts").write_text("const key='sk_live_1234567890abcdefghij';")
+            (root / "unrelated.ts").write_text(
+                synthetic("const key='sk_live_1234567890abcdefghij';")
+            )
             subprocess.run(["git", "add", "."], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "history"], cwd=root, check=True)
             findings = scan_paths(ScanOptions(
@@ -238,7 +244,7 @@ class ScannerTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
             tracked = root / "deleted.ts"
-            tracked.write_text("const key='sk_live_1234567890abcdefghij';")
+            tracked.write_text(synthetic("const key='sk_live_1234567890abcdefghij';"))
             subprocess.run(["git", "add", "deleted.ts"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "add credential"], cwd=root, check=True)
             tracked.unlink()
@@ -259,7 +265,7 @@ class ScannerTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
             old = root / "old.ts"
-            old.write_text("const key='sk_live_1234567890abcdefghij';")
+            old.write_text(synthetic("const key='sk_live_1234567890abcdefghij';"))
             subprocess.run(["git", "add", "old.ts"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "add credential"], cwd=root, check=True)
             old.rename(root / "new.ts")
@@ -272,7 +278,7 @@ class ScannerTests(unittest.TestCase):
             ))
             self.assertTrue(report.complete, report.coverage_errors)
             self.assertTrue(any(
-                item.path == "new.ts" and "renamed-from:old.ts" in item.source
+                item.path == "new.ts" and "rename:old.ts->new.ts" in item.source
                 for item in report.findings
             ))
 
@@ -283,7 +289,7 @@ class ScannerTests(unittest.TestCase):
             (root / "scripts" / "scan_ai_gotchas.py").write_text("# scanner\n")
             (root / "SKILL.md").write_text("name: dissect\n")
             rule_file = root / "scripts" / "dissect_checks" / "rules.py"
-            rule_file.write_text("key = 'sk_live_1234567890abcdefghij'\n")
+            rule_file.write_text(synthetic("key = 'sk_live_1234567890abcdefghij'\n"))
             findings = scan_paths(ScanOptions(
                 root=root,
                 file_list=("scripts/dissect_checks/rules.py",),
@@ -294,19 +300,30 @@ class ScannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "bad.ts").write_text("export const ok = true;")
-            responses = [
-                subprocess.CompletedProcess([], 0, stdout="deadbeef\n", stderr=""),
-                subprocess.CompletedProcess([], 0, stdout="M\tbad.ts\n", stderr=""),
-                subprocess.CompletedProcess([], 128, stdout="", stderr="missing"),
-            ]
-            with patch("dissect_checks.engine.subprocess.run", side_effect=responses):
+            rev_list = subprocess.CompletedProcess(
+                [], 0, stdout="deadbeef\n", stderr=""
+            )
+            with (
+                patch("dissect_checks.engine.subprocess.run", return_value=rev_list),
+                patch(
+                    "dissect_checks.engine._commit_statuses",
+                    return_value=([(None, "M", "bad.ts", "bad.ts")], []),
+                ),
+                patch(
+                    "dissect_checks.engine._read_history_blob",
+                    return_value=(
+                        None,
+                        "git history: could not read 'bad.ts' at deadbeef (exit 128)",
+                    ),
+                ),
+            ):
                 report = scan_report(ScanOptions(
                     root=root,
                     include_history=True,
                     file_list=("bad.ts",),
                 ))
             self.assertFalse(report.complete)
-            self.assertIn("could not read bad.ts", report.coverage_errors[0])
+            self.assertIn("could not read 'bad.ts'", report.coverage_errors[0])
 
 
 if __name__ == "__main__":

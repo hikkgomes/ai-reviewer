@@ -52,6 +52,7 @@
     "known_public_origins": [],
     "approved_production_urls": [],
     "allowed_runtime_checks": [],
+    "python_import_aliases": {},
     "tool_commands": {}
   },
   "risk": {

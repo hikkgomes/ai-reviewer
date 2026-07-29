@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 import sys
 
+if sys.version_info < (3, 11):
+    raise SystemExit("Dissect requires Python 3.11 or newer.")
+
 from dissect_checks.engine import options_from_environment, scan_report
 
 

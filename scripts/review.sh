@@ -2,8 +2,14 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export DISSECT_SCRIPT_DIR="$SCRIPT_DIR"
 ROOT="$(pwd)"
 cd "$ROOT"
+
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "Dissect requires Python 3.11 or newer." >&2
+    exit 1
+fi
 
 DETECTED_JSON="$(mktemp /tmp/ai_review_detected.XXXXXX.json 2>/dev/null || mktemp -t ai_review_detected)"
 export DETECTED_JSON
@@ -16,6 +22,10 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
+
+sys.path.insert(0, os.environ["DISSECT_SCRIPT_DIR"])
+from dissect_checks.redaction import redact_sensitive_text
 
 root = pathlib.Path.cwd()
 local_path = root / ".ai-review" / "local.json"
@@ -84,18 +94,35 @@ def run_scope(label, cwd, commands):
     print(f"Path: {cwd}")
     print()
     configured = [(key, cmd) for key, cmd in commands.items() if cmd]
-    if configured and os.environ.get("AI_REVIEW_ALLOW_CONFIGURED_COMMANDS") != "1":
+    allowed = {
+        value.strip()
+        for value in os.environ.get("AI_REVIEW_ALLOWED_COMMANDS", "").split(",")
+        if value.strip()
+    }
+    approved = [(key, cmd) for key, cmd in configured if key in allowed]
+    rejected = [(key, cmd) for key, cmd in configured if key not in allowed]
+    for key, cmd in rejected:
+        print(f"[not approved] {key}: {redact_sensitive_text(cmd)}")
+    if rejected:
+        print()
+    if configured and not approved:
         print(
-            "Configured repository commands were not executed. Set "
-            "AI_REVIEW_ALLOW_CONFIGURED_COMMANDS=1 in a trusted local invocation to approve them."
+            "Configured repository commands were not executed. Set a trusted local "
+            "AI_REVIEW_ALLOWED_COMMANDS comma-separated allow-list after reviewing this plan."
         )
         print()
         return
     any_commands = False
-    for key, cmd in configured:
+    for key, cmd in approved:
         any_commands = True
-        print(f"$ {cmd}")
-        result = subprocess.run(cmd, shell=True, cwd=cwd)
+        print(f"$ {redact_sensitive_text(cmd)}")
+        result = subprocess.run(
+            cmd, shell=True, cwd=cwd, text=True, capture_output=True
+        )
+        if result.stdout:
+            print(redact_sensitive_text(result.stdout), end="")
+        if result.stderr:
+            print(redact_sensitive_text(result.stderr), end="", file=sys.stderr)
         print(f"[exit {result.returncode}] {key}")
         print()
     if not any_commands:

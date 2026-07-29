@@ -7,8 +7,12 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
-from dissect_checks.redaction import redact_sensitive_text
+if sys.version_info < (3, 11):
+    raise SystemExit("Dissect requires Python 3.11 or newer.")
+
+from dissect_checks.redaction import redact_argv, redact_sensitive_text
 
 
 KNOWN_TOOLS = ("gitleaks", "trufflehog", "semgrep", "trivy", "npm", "pnpm", "yarn", "pip-audit", "cargo")
@@ -25,9 +29,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument(
-        "--allow-configured-tools",
-        action="store_true",
-        help="Explicitly allow trusted local tool argv entries to execute.",
+        "--allow-tool",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Explicitly allow one named trusted local tool; repeat for multiple tools.",
     )
     args = parser.parse_args()
     config = load_config()
@@ -52,13 +58,14 @@ def main() -> int:
             execution_argv = []
             finding_exit_codes = set()
         configured_entry = raw_config is not None
+        display_name = redact_sensitive_text(name)
         executable = execution_argv[0] if execution_argv else name.split()[0]
         detected = bool(executable and shutil.which(executable))
         result = {
-            "tool": name,
+            "tool": display_name,
             "detected": detected,
             "configured": configured_entry,
-            "argv": [redact_sensitive_text(value) for value in execution_argv],
+            "argv": redact_argv(execution_argv),
             "executed": False,
             "execution_completed": False,
             "exit_code": None,
@@ -73,10 +80,10 @@ def main() -> int:
                 "Configured check was not run: use an object with a non-empty string argv array; "
                 "shell command strings are rejected."
             )
-        elif execution_argv and not args.allow_configured_tools:
+        elif execution_argv and name not in set(args.allow_tool):
             result["output"] = (
-                "Configured check was not run: pass --allow-configured-tools from a trusted "
-                "local invocation to approve execution."
+                f"Configured check was not run: pass --allow-tool {display_name} from a trusted "
+                "local invocation after reviewing the displayed argv."
             )
         elif execution_argv:
             if not detected:
@@ -112,7 +119,7 @@ def main() -> int:
         elif detected:
             result["output"] = (
                 "Detected but not executed; configure a trusted argv entry and invoke "
-                "--allow-configured-tools explicitly."
+                "--allow-tool NAME explicitly."
             )
         results.append(result)
 

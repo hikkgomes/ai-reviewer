@@ -2,21 +2,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import ast
 import fnmatch
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.9/3.10 compatibility.
-    tomllib = None
-
+from .fixtures import is_owned_dissect_root, mask_owned_fixture_spans
 from .legacy import scan_legacy
 from .model import Finding
+from .python_dependencies import (
+    KNOWN_IMPORT_ALIASES,
+    installed_aliases,
+    load_python_manifests,
+    nearest_context,
+    normalise_name,
+)
+from .redaction import redact_sensitive_text
 from .rules import RULES
 
 
@@ -54,6 +58,7 @@ class ScanOptions:
     file_list: tuple[str, ...] = ()
     ignore: tuple[str, ...] = ()
     generated_paths: tuple[str, ...] = ()
+    python_import_aliases: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,10 @@ def options_from_environment(root: Path, *, include_generated: bool = False, inc
             _normalise(item)
             for item in [*paths.get("generated", []), *paths.get("generated_bundles", [])]
         )),
+        python_import_aliases=tuple(
+            (str(module), str(distribution))
+            for module, distribution in (security.get("python_import_aliases") or {}).items()
+        ),
     )
 
 
@@ -114,18 +123,8 @@ def _matches_prefix_or_glob(rel: str, patterns: tuple[str, ...]) -> bool:
     return False
 
 
-def _is_dissect_repository(root: Path) -> bool:
-    try:
-        return (
-            (root / "scripts" / "scan_ai_gotchas.py").exists()
-            and "name: dissect" in (root / "SKILL.md").read_text(encoding="utf-8")
-        )
-    except OSError:
-        return False
-
-
 def _ignored(rel: str, options: ScanOptions) -> bool:
-    if _is_dissect_repository(options.root) and rel in DISSECT_FIXTURE_EXCLUSIONS:
+    if is_owned_dissect_root(options.root) and rel in DISSECT_FIXTURE_EXCLUSIONS:
         return True
     parts = Path(rel).parts
     for part in parts:
@@ -173,6 +172,111 @@ def scan_text(path: str, text: str, source: str = "working-tree") -> list[Findin
     return findings
 
 
+def _scan_owned_text(
+    options: ScanOptions,
+    reviewed_path: str,
+    original_path: str,
+    text: str,
+    source: str,
+) -> list[Finding]:
+    masked = mask_owned_fixture_spans(options.root, original_path, text)
+    return scan_text(reviewed_path, masked, source)
+
+
+def _parse_name_status(data: bytes) -> tuple[list[tuple[str, str, str]], str | None]:
+    tokens = data.split(b"\0")
+    if tokens and not tokens[-1]:
+        tokens.pop()
+    entries = []
+    index = 0
+    while index < len(tokens):
+        status = tokens[index].decode("ascii", errors="replace")
+        index += 1
+        path_count = 2 if status.startswith(("R", "C")) else 1
+        if index + path_count > len(tokens):
+            return entries, f"truncated name-status record for {status!r}"
+        paths = [
+            token.decode("utf-8", errors="surrogateescape")
+            for token in tokens[index:index + path_count]
+        ]
+        index += path_count
+        old_path = _normalise(paths[0])
+        new_path = _normalise(paths[-1])
+        entries.append((status, old_path, new_path))
+    return entries, None
+
+
+def _commit_statuses(
+    options: ScanOptions,
+    commit: str,
+) -> tuple[list[tuple[str | None, str, str, str]], list[str]]:
+    parents_result = subprocess.run(
+        ["git", "rev-list", "--parents", "-n", "1", commit],
+        cwd=options.root,
+        capture_output=True,
+        check=False,
+    )
+    if parents_result.returncode:
+        return [], [f"git history: could not resolve parents for {commit[:12]}"]
+    fields = parents_result.stdout.decode("ascii", errors="replace").strip().split()
+    parents = fields[1:]
+    comparisons: list[tuple[str | None, list[str]]]
+    if parents:
+        comparisons = [
+            (
+                parent,
+                [
+                    "git", "diff-tree", "--no-commit-id", "--name-status", "-z",
+                    "-M", "-C", "--find-copies-harder", "-r", parent, commit,
+                ],
+            )
+            for parent in parents
+        ]
+    else:
+        comparisons = [(
+            None,
+            [
+                "git", "diff-tree", "--root", "--no-commit-id", "--name-status",
+                "-z", "-M", "-C", "--find-copies-harder", "-r", commit,
+            ],
+        )]
+    statuses = []
+    errors = []
+    for parent, command in comparisons:
+        result = subprocess.run(command, cwd=options.root, capture_output=True, check=False)
+        if result.returncode:
+            label = parent[:12] if parent else "root"
+            errors.append(
+                f"git history: diff {label}..{commit[:12]} failed with exit {result.returncode}"
+            )
+            continue
+        parsed, parse_error = _parse_name_status(result.stdout)
+        if parse_error:
+            errors.append(f"git history: {commit[:12]}: {parse_error}")
+            continue
+        statuses.extend((parent, status, old, new) for status, old, new in parsed)
+    return statuses, errors
+
+
+def _read_history_blob(
+    options: ScanOptions,
+    revision: str,
+    path: str,
+) -> tuple[str | None, str | None]:
+    result = subprocess.run(
+        ["git", "show", f"{revision}:{path}"],
+        cwd=options.root,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        return None, (
+            f"git history: could not read {path!r} at {revision[:12]} "
+            f"(exit {result.returncode})"
+        )
+    return result.stdout.decode("utf-8", errors="ignore"), None
+
+
 def _scan_history(options: ScanOptions) -> tuple[list[Finding], list[str]]:
     try:
         commits = subprocess.run(
@@ -186,52 +290,66 @@ def _scan_history(options: ScanOptions) -> tuple[list[Finding], list[str]]:
 
     findings = []
     errors = []
-    allowed = set(options.file_list)
+    lineage: dict[str, set[str]] = {
+        rel: {rel}
+        for rel in options.file_list
+        if not _ignored(rel, options) and _is_text_path(rel)
+    }
+    seen = set()
     for commit in commits.stdout.splitlines():
-        names = subprocess.run(
-            ["git", "diff-tree", "--root", "--no-commit-id", "--name-status", "-M", "-r", commit],
-            cwd=options.root, text=True, capture_output=True, check=False,
+        statuses, status_errors = _commit_statuses(options, commit)
+        errors.extend(status_errors)
+        if not options.file_list:
+            for _parent, status, old_path, new_path in statuses:
+                reviewed = old_path if status == "D" else new_path
+                if not _ignored(reviewed, options) and _is_text_path(reviewed):
+                    lineage.setdefault(reviewed, {reviewed})
+        targets: set[tuple[str, str, str, str]] = set()
+        for reviewed_path, aliases in lineage.items():
+            for parent, status, old_path, new_path in statuses:
+                if status.startswith("R") and aliases.intersection({old_path, new_path}):
+                    aliases.update({old_path, new_path})
+                    targets.add((commit, new_path, reviewed_path, f"rename:{old_path}->{new_path}"))
+                    if parent:
+                        targets.add((parent, old_path, reviewed_path, f"rename-parent:{old_path}"))
+                elif status.startswith("C") and new_path in aliases:
+                    aliases.add(old_path)
+                    targets.add((commit, new_path, reviewed_path, f"copy:{old_path}->{new_path}"))
+                    if parent:
+                        targets.add((parent, old_path, reviewed_path, f"copy-parent:{old_path}"))
+                elif status == "D" and old_path in aliases:
+                    if parent:
+                        targets.add((parent, old_path, reviewed_path, f"deleted-parent:{old_path}"))
+                elif status[:1] in {"A", "M", "T"} and new_path in aliases:
+                    targets.add((commit, new_path, reviewed_path, f"path:{new_path}"))
+        ordered_targets = sorted(
+            targets,
+            key=lambda target: (
+                0 if target[3].startswith(("rename:", "copy:")) else 1,
+                target,
+            ),
         )
-        if names.returncode != 0:
-            errors.append(f"git history: could not list commit {commit[:12]} (exit {names.returncode})")
-            continue
-        for entry in names.stdout.splitlines():
-            fields = entry.split("\t")
-            status = fields[0]
-            if status.startswith(("R", "C")) and len(fields) == 3:
-                old_rel, rel = map(_normalise, fields[1:])
-                in_scope = not allowed or old_rel in allowed or rel in allowed
-            elif len(fields) == 2:
-                rel = _normalise(fields[1])
-                old_rel = rel
-                in_scope = not allowed or rel in allowed
-            else:
-                errors.append(
-                    f"git history: could not parse path status at {commit[:12]}: {entry!r}"
+        for revision, original_path, reviewed_path, provenance in ordered_targets:
+            text, read_error = _read_history_blob(options, revision, original_path)
+            if read_error:
+                errors.append(read_error)
+                continue
+            assert text is not None
+            fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            source = f"git:{commit[:12]}:{provenance}"
+            for finding in _scan_owned_text(
+                options, reviewed_path, original_path, text, source
+            ):
+                key = (
+                    reviewed_path,
+                    finding.check_id,
+                    finding.line,
+                    finding.evidence,
+                    fingerprint,
                 )
-                continue
-            if not in_scope:
-                continue
-            if _ignored(rel, options) or not _is_text_path(rel):
-                continue
-            revision = f"{commit}^" if status == "D" else commit
-            blob_rel = old_rel if status == "D" else rel
-            shown = subprocess.run(
-                ["git", "show", f"{revision}:{blob_rel}"],
-                cwd=options.root, text=True, capture_output=True, check=False,
-            )
-            if shown.returncode:
-                errors.append(
-                    f"git history: could not read {blob_rel} at {revision[:12]} "
-                    f"(exit {shown.returncode})"
-                )
-                continue
-            source = f"git:{commit[:12]}"
-            if status == "D":
-                source += ":deleted-parent"
-            elif status.startswith("R"):
-                source += f":renamed-from:{old_rel}"
-            findings.extend(scan_text(rel, shown.stdout, source=source))
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(finding)
     return findings, errors
 
 
@@ -262,163 +380,6 @@ def _load_package_manifests(options: ScanOptions) -> tuple[dict[Path, tuple[Path
 
 
 def _nearest_manifest(rel: str, manifests: dict[Path, tuple[Path, dict]]) -> tuple[Path, dict] | None:
-    parent = Path(rel).parent
-    for directory in (parent, *parent.parents):
-        if directory in manifests:
-            return manifests[directory]
-    return manifests.get(Path("."))
-
-
-def _normalise_python_name(value: str) -> str:
-    return re.sub(r"[-_.]+", "_", value).lower()
-
-
-def _dependency_name(specifier: str) -> str | None:
-    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", specifier)
-    return _normalise_python_name(match.group(1)) if match else None
-
-
-def _parse_toml(text: str) -> dict:
-    if tomllib is not None:
-        return tomllib.loads(text)
-
-    data: dict = {}
-    section = data
-    lines = iter(text.splitlines())
-    for raw_line in lines:
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        table = re.fullmatch(r"\[([^\]]+)\]", line)
-        if table:
-            section = data
-            for part in table.group(1).split("."):
-                section = section.setdefault(part.strip().strip("'\""), {})
-            continue
-        if "=" not in line:
-            continue
-        key, raw_value = (part.strip() for part in line.split("=", 1))
-        while raw_value.startswith("[") and raw_value.count("[") > raw_value.count("]"):
-            raw_value += "\n" + next(lines, "")
-        try:
-            value = ast.literal_eval(raw_value)
-        except (SyntaxError, ValueError):
-            value = raw_value.strip("'\"")
-        section[key.strip("'\"")] = value
-    return data
-
-
-def _load_python_manifests(
-    options: ScanOptions,
-) -> tuple[dict[Path, tuple[tuple[Path, ...], set[str]]], list[str]]:
-    by_directory: dict[Path, tuple[list[Path], set[str]]] = {}
-    errors = []
-
-    def add(path: Path, dependencies: set[str]) -> None:
-        rel = path.relative_to(options.root)
-        paths, declared = by_directory.setdefault(rel.parent, ([], set()))
-        paths.append(rel)
-        declared.update(dependencies)
-
-    for path in options.root.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(options.root).as_posix()
-        if _ignored(rel, options):
-            continue
-        name = path.name
-        if name == "pyproject.toml":
-            try:
-                data = _parse_toml(path.read_text(encoding="utf-8"))
-            except OSError:
-                errors.append(f"dependency context: could not read {rel}")
-                continue
-            except (ValueError, TypeError):
-                errors.append(f"dependency context: invalid TOML in {rel}")
-                continue
-            dependencies = {
-                dependency
-                for specifier in (data.get("project") or {}).get("dependencies", [])
-                if isinstance(specifier, str)
-                for dependency in [_dependency_name(specifier)]
-                if dependency
-            }
-            for values in ((data.get("project") or {}).get("optional-dependencies") or {}).values():
-                dependencies.update(
-                    dependency
-                    for specifier in values
-                    if isinstance(specifier, str)
-                    for dependency in [_dependency_name(specifier)]
-                    if dependency
-                )
-            poetry = ((data.get("tool") or {}).get("poetry") or {})
-            poetry_groups = [poetry.get("dependencies") or {}]
-            poetry_groups.extend(
-                (group or {}).get("dependencies") or {}
-                for group in (poetry.get("group") or {}).values()
-            )
-            for group in poetry_groups:
-                dependencies.update(
-                    _normalise_python_name(package)
-                    for package in group
-                    if package.lower() != "python"
-                )
-            uv = ((data.get("tool") or {}).get("uv") or {})
-            dependencies.update(
-                dependency
-                for specifier in uv.get("dev-dependencies", [])
-                if isinstance(specifier, str)
-                for dependency in [_dependency_name(specifier)]
-                if dependency
-            )
-            for values in (data.get("dependency-groups") or {}).values():
-                dependencies.update(
-                    dependency
-                    for specifier in values
-                    if isinstance(specifier, str)
-                    for dependency in [_dependency_name(specifier)]
-                    if dependency
-                )
-            add(path, dependencies)
-        elif re.fullmatch(r"requirements(?:[-_.][A-Za-z0-9_.-]+)?\.txt", name, re.I):
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-            except OSError:
-                errors.append(f"dependency context: could not read {rel}")
-                continue
-            dependencies = {
-                dependency
-                for line in lines
-                if line.strip() and not line.lstrip().startswith(("#", "-", "git+", "http:"))
-                for dependency in [_dependency_name(line)]
-                if dependency
-            }
-            add(path, dependencies)
-        elif name == "Pipfile":
-            try:
-                data = _parse_toml(path.read_text(encoding="utf-8"))
-            except OSError:
-                errors.append(f"dependency context: could not read {rel}")
-                continue
-            except (ValueError, TypeError):
-                errors.append(f"dependency context: invalid TOML in {rel}")
-                continue
-            dependencies = {
-                _normalise_python_name(package)
-                for section in ("packages", "dev-packages")
-                for package in (data.get(section) or {})
-            }
-            add(path, dependencies)
-    return {
-        directory: (tuple(sorted(paths)), declared)
-        for directory, (paths, declared) in by_directory.items()
-    }, errors
-
-
-def _nearest_python_manifest(
-    rel: str,
-    manifests: dict[Path, tuple[tuple[Path, ...], set[str]]],
-) -> tuple[tuple[Path, ...], set[str]] | None:
     parent = Path(rel).parent
     for directory in (parent, *parent.parents):
         if directory in manifests:
@@ -475,7 +436,7 @@ def _javascript_dependency_findings(
 def _python_dependency_findings(
     options: ScanOptions,
     files: list[str],
-    manifests: dict[Path, tuple[tuple[Path, ...], set[str]]],
+    manifests: dict,
 ) -> list[Finding]:
     local_roots = {
         path.name for path in options.root.iterdir()
@@ -486,9 +447,10 @@ def _python_dependency_findings(
         for path in options.root.rglob("__init__.py")
         if not _ignored(path.relative_to(options.root).as_posix(), options)
     )
-    compatibility_known = {
-        "pytest", "django", "flask", "fastapi", "pydantic", "sqlalchemy",
-        "requests", "numpy", "pandas",
+    metadata_aliases = installed_aliases()
+    configured_aliases = {
+        normalise_name(module): normalise_name(distribution)
+        for module, distribution in options.python_import_aliases
     }
     import_re = re.compile(
         r"^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*))",
@@ -498,8 +460,9 @@ def _python_dependency_findings(
     for rel in files:
         if Path(rel).suffix.lower() != ".py":
             continue
-        applicable = _nearest_python_manifest(rel, manifests)
-        manifest_paths, declared = applicable if applicable else ((), set())
+        applicable = nearest_context(rel, manifests)
+        manifest_paths = applicable.paths if applicable else ()
+        declared = applicable.distributions if applicable else frozenset()
         try:
             text = (options.root / rel).read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -519,8 +482,10 @@ def _python_dependency_findings(
                 module in PY_STDLIB
                 or module in local_roots
                 or module in sibling_modules
-                or _normalise_python_name(module) in declared
-                or (not manifest_paths and module in compatibility_known)
+                or normalise_name(module) in declared
+                or KNOWN_IMPORT_ALIASES.get(normalise_name(module)) in declared
+                or configured_aliases.get(normalise_name(module)) in declared
+                or bool(metadata_aliases.get(normalise_name(module), set()) & declared)
                 or module.startswith("_")
             ):
                 continue
@@ -584,13 +549,17 @@ def scan_report(options: ScanOptions) -> ScanReport:
         try:
             text = (options.root / rel).read_text(encoding="utf-8", errors="ignore")
         except OSError:
-            errors.append(f"working tree: could not read {rel}")
+            if not (options.include_history and options.file_list):
+                errors.append(f"working tree: could not read {rel}")
             continue
-        findings.extend(scan_text(rel, text))
+        findings.extend(_scan_owned_text(options, rel, rel, text, "working-tree"))
 
     manifests, manifest_errors = _load_package_manifests(options)
     errors.extend(manifest_errors)
-    python_manifests, python_manifest_errors = _load_python_manifests(options)
+    python_manifests, python_manifest_errors = load_python_manifests(
+        options.root,
+        lambda rel: _ignored(rel, options),
+    )
     errors.extend(python_manifest_errors)
     findings.extend(_javascript_dependency_findings(options, files, manifests))
     findings.extend(_python_dependency_findings(options, files, python_manifests))
@@ -600,15 +569,20 @@ def scan_report(options: ScanOptions) -> ScanReport:
         findings.extend(history_findings)
         errors.extend(history_errors)
 
-    unique = {
-        (item.check_id, item.path, item.line, item.evidence, item.source): item
-        for item in findings
-    }
+    unique = {}
+    for item in findings:
+        key = (item.check_id, item.path, item.line, item.evidence)
+        previous = unique.get(key)
+        if previous is None or (
+            previous.source == "working-tree" and item.source.startswith("git:")
+        ):
+            unique[key] = item
     ordered = tuple(sorted(
         unique.values(),
         key=lambda item: (item.path, item.line, item.check_id, item.source),
     ))
-    return ScanReport(ordered, not errors, tuple(errors))
+    safe_errors = tuple(redact_sensitive_text(error) for error in errors)
+    return ScanReport(ordered, not safe_errors, safe_errors)
 
 
 def scan_paths(options: ScanOptions) -> list[Finding]:
