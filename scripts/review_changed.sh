@@ -78,8 +78,8 @@ fi
 echo
 echo "== Detected languages =="
 python3 - <<'PY'
+import os
 import pathlib
-import subprocess
 
 EXTENSIONS = {
     ".ts": "typescript",
@@ -105,12 +105,10 @@ EXTENSIONS = {
 }
 
 try:
-    changed = subprocess.check_output(
-        "(git diff --name-only --cached; git diff --name-only; git ls-files --others --exclude-standard) 2>/dev/null | sort -u",
-        shell=True,
-        text=True,
+    changed = pathlib.Path(os.environ["AI_REVIEW_FILE_LIST"]).read_text(
+        encoding="utf-8"
     ).splitlines()
-except Exception:
+except (KeyError, OSError):
     changed = []
 
 languages = sorted({EXTENSIONS.get(pathlib.Path(path).suffix.lower()) for path in changed} - {None})

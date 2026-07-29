@@ -156,6 +156,98 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(json.loads(result.stdout)["complete"])
 
+    def test_installed_codex_skills_authenticate_dissect_fixtures_only(self) -> None:
+        installer = load_installer()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            installed_skills = []
+            for name in installer.CODEX_SKILL_NAMES:
+                installer.install_codex_skill(name, base)
+                installed = base / "skills" / name
+                installed_skills.append(installed)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(installed / "scripts" / "scan_ai_gotchas.py"),
+                        "--format",
+                        "json",
+                        "--fail-on",
+                        "high",
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                severe = [
+                    item for item in payload["findings"]
+                    if item["severity"] in {"high", "critical"}
+                ]
+                self.assertEqual(severe, [])
+
+            checkout = base / "dissect-checkout"
+            shutil.copytree(
+                ROOT,
+                checkout,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            )
+            rules = checkout / "scripts" / "dissect_checks" / "rules.py"
+            expected_line = len(rules.read_text().splitlines()) + 2
+            real = "sk_live_" + "ZYXWVUTSRQPONMLK987654321"
+            with rules.open("a", encoding="utf-8") as handle:
+                handle.write(f"\nREAL_CREDENTIAL = '{real}'\n")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(installed_skills[0] / "scripts" / "scan_ai_gotchas.py"),
+                    "--format",
+                    "json",
+                ],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            secrets = [
+                item for item in json.loads(result.stdout)["findings"]
+                if item["check_id"] == "SEC-SECRETS-002"
+                and item["path"] == "scripts/dissect_checks/rules.py"
+            ]
+            self.assertEqual(len(secrets), 1)
+            self.assertEqual(secrets[0]["line"], expected_line)
+            self.assertNotIn(real, result.stdout)
+
+            lookalike = base / "lookalike"
+            (lookalike / "scripts" / "dissect_checks").mkdir(parents=True)
+            (lookalike / "SKILL.md").write_text("name: dissect\n")
+            fake = (
+                "Rule('ID', 'secrets', 'critical', 'high', 'e', 'r', matcher,\n"
+                "     ('fixture.ts', \"key='sk_live_"
+                + "ZYXWVUTSRQPONMLK987654321'\"),\n"
+                "     ('safe.ts', 'safe'))\n"
+            )
+            (lookalike / "scripts" / "dissect_checks" / "rules.py").write_text(fake)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(installed_skills[1] / "scripts" / "scan_ai_gotchas.py"),
+                    "--format",
+                    "json",
+                ],
+                cwd=lookalike,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "SEC-SECRETS-002",
+                {item["check_id"] for item in json.loads(result.stdout)["findings"]},
+            )
+
     def test_cursor_merge_replaces_only_managed_block(self) -> None:
         installer = load_installer()
         old = "user rule\n\n<!-- DISSECT-START -->\nold\n<!-- DISSECT-END -->\n"
@@ -222,7 +314,7 @@ class IntegrationTests(unittest.TestCase):
             tool = next(item for item in payload["tools"] if item["tool"] == "fixture-tool")
             self.assertFalse(tool["executed"])
             self.assertFalse(marker.exists())
-            self.assertIn("--allow-tool fixture-tool", tool["output"])
+            self.assertIn("--allow-custom-tool fixture-tool=RESOLVED_PATH", tool["output"])
 
     def test_approved_tool_redacts_output_and_reports_finding_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -247,8 +339,8 @@ class IntegrationTests(unittest.TestCase):
                     str(ROOT / "scripts" / "tool_integrations.py"),
                     "--format",
                     "json",
-                    "--allow-tool",
-                    "fixture-tool",
+                    "--allow-custom-tool",
+                    "fixture-tool=/bin/sh",
                 ],
                 cwd=root,
                 text=True,
@@ -264,6 +356,99 @@ class IntegrationTests(unittest.TestCase):
             self.assertTrue(tool["coverage_complete"])
             self.assertFalse(raw_secret in result.stdout, "tool output leaked credential")
             self.assertIn("REDACTED", tool["output"])
+
+    def test_known_tool_approval_is_bound_to_executable_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            trusted_bin = base / "trusted-bin"
+            root = base / "target"
+            trusted_bin.mkdir()
+            (root / ".ai-review").mkdir(parents=True)
+            executable = trusted_bin / "gitleaks"
+            executable.write_text("#!/bin/sh\nprintf 'token=tool-output-secret'\n")
+            executable.chmod(0o755)
+            secret = "configured-argv-secret"
+            (root / ".ai-review" / "local.json").write_text(json.dumps({
+                "security_review": {
+                    "tool_commands": {
+                        "gitleaks": {
+                            "argv": [str(executable), "detect", "--token", secret],
+                        }
+                    }
+                }
+            }))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "tool_integrations.py"),
+                    "--format",
+                    "json",
+                    "--allow-tool",
+                    "gitleaks",
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "PATH": f"{trusted_bin}:{os.environ.get('PATH', '')}"},
+            )
+            payload = json.loads(result.stdout)
+            tool = next(item for item in payload["tools"] if item["tool"] == "gitleaks")
+            self.assertTrue(tool["approved"])
+            self.assertTrue(tool["executed"])
+            self.assertEqual(Path(tool["resolved_executable"]), executable.resolve())
+            self.assertNotIn(secret, result.stdout)
+            self.assertNotIn("tool-output-secret", result.stdout)
+            self.assertIn("REDACTED", result.stdout)
+
+    def test_known_tool_label_cannot_authorise_shell_symlink_or_renamed_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "target"
+            root.mkdir()
+            (root / ".ai-review").mkdir()
+            candidates = [Path("/bin/sh")]
+            symlink = base / "gitleaks-symlink"
+            symlink.symlink_to("/bin/sh")
+            candidates.append(symlink)
+            renamed = base / "gitleaks"
+            shutil.copyfile("/bin/sh", renamed)
+            renamed.chmod(0o755)
+            candidates.append(renamed)
+            marker = root / "executed"
+            for candidate in candidates:
+                with self.subTest(candidate=str(candidate)):
+                    (root / ".ai-review" / "local.json").write_text(json.dumps({
+                        "security_review": {
+                            "tool_commands": {
+                                "gitleaks": {
+                                    "argv": [str(candidate), "-c", f"touch {marker}"],
+                                }
+                            }
+                        }
+                    }))
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(ROOT / "scripts" / "tool_integrations.py"),
+                            "--format",
+                            "json",
+                            "--allow-tool",
+                            "gitleaks",
+                        ],
+                        cwd=root,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    tool = next(
+                        item for item in json.loads(result.stdout)["tools"]
+                        if item["tool"] == "gitleaks"
+                    )
+                    self.assertFalse(tool["approved"])
+                    self.assertFalse(tool["executed"])
+                    self.assertFalse(marker.exists())
+                    self.assertIn("identity", tool["output"].lower())
 
     def test_review_script_does_not_run_repository_commands_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

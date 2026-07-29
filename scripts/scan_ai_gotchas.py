@@ -13,7 +13,7 @@ from dissect_checks.engine import options_from_environment, scan_report
 
 
 SEVERITY = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,8 +72,13 @@ def main() -> int:
         for item in findings:
             print(
                 f"[{item.disposition.upper()}][{item.severity.upper()}][{item.check_id}][{item.confidence}] "
-                f"{item.path}:{item.line} :: {item.evidence}"
+                f"{item.path}:{item.line} :: {item.evidence} :: source={item.source}"
             )
+            for historical in item.historical_sources:
+                print(
+                    f"  historical-source: {historical.source} "
+                    f"{historical.path}:{historical.line}"
+                )
     if output_format == "text" and report.coverage_errors:
         for error in report.coverage_errors:
             print(f"[INCOMPLETE] {error}", file=sys.stderr)

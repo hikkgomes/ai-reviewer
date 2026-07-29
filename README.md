@@ -152,6 +152,17 @@ rejected), and a trusted local caller must approve execution explicitly:
 python3 scripts/tool_integrations.py --allow-tool gitleaks
 ```
 
+Known tool labels are bound to matching resolved executable identities.
+Repository-local executables, shell interpreters, generic runners, symlinks to a
+different executable, and byte-identical renamed runner binaries are rejected.
+Custom integrations use a separate trusted-local approval that includes the
+resolved executable path:
+
+```bash
+python3 scripts/tool_integrations.py \
+  --allow-custom-tool company-scanner=/opt/company/bin/company-scanner
+```
+
 External stdout and stderr are centrally redacted before they enter text or JSON
 results. Reports include whether each tool was detected, its argument array,
 exit code, relevant redacted output, and separate fields for execution
@@ -167,15 +178,25 @@ configuration.
 also uses installed package metadata and a tested built-in map for common names
 such as `PIL`/`Pillow`, `yaml`/`PyYAML`, `bs4`/`beautifulsoup4`,
 `sklearn`/`scikit-learn`, and `cv2`/`opencv-python`; it never queries a network.
-Requirements includes and constraints are resolved recursively within the
-repository, with cycles deduplicated and missing includes reported as coverage
-errors.
+Requirement and constraint graphs are resolved separately and recursively
+within the repository, with cycles deduplicated and missing includes reported as
+coverage errors. A constraint can pin a declared requirement but never counts as
+an install declaration by itself.
 
 Git history is parsed with NUL-delimited status records. Rename ancestry follows
 the old path backward while findings retain the reviewed path. Copies follow
 the detected source ancestry only when the copied destination is in scope.
-Merge commits inspect every parent for the scoped lineage, and duplicate blobs
-reached through aliases or parents are deduplicated.
+Merge commits inspect every parent. Rename aliases share a canonical logical
+lineage, while copy ancestry stays separate. Duplicate evidence reached through
+aliases or parents is aggregated without discarding provenance. When an issue
+still exists, working-tree evidence is primary and historical paths, commits,
+and lines are attached in `historical_sources`.
+
+Self-review fixture handling authenticates the target checkout against a
+versioned manifest derived from the executing skill copy's trusted project
+anchors. Only matching AST fixture nodes are masked. Installed Codex copies can
+therefore review the source checkout without broad exclusions, while filenames,
+comments, or copied marker text in another repository cannot enable masking.
 
 ## CI and JSON Output
 
@@ -188,7 +209,9 @@ python3 scripts/scan_ai_gotchas.py --format json --fail-on high > dissect.json
 
 Or configure `review_options.deterministic_output` and
 `review_options.fail_on_severity`. Exit code `2` means at least one finding met
-the threshold. The JSON contract is versioned with `schema_version`. Its
+the threshold. JSON schema `2.0` adds structured `historical_sources` to each
+finding and makes current-versus-historical evidence explicit. The contract is
+versioned with `schema_version`. Its
 `complete` flag becomes false and `coverage_errors` explains the gap when files,
 commits, or dependency manifests could not be inspected.
 
@@ -223,7 +246,12 @@ bash /path/to/skill/scripts/review.sh
 python3 /path/to/skill/scripts/scan_ai_gotchas.py
 ```
 
-`review_changed.sh` reviews the diff against a base branch when provided, plus staged, unstaged, and untracked files. It runs configured lint/typecheck commands from `.ai-review/local.json`, prints detected languages, and runs deterministic checks only on the diff file list. `review.sh` runs broader configured commands and the scanner for universal review.
+`review_changed.sh` reviews the diff against a base branch when provided, plus
+staged, unstaged, and untracked files. Language detection and deterministic
+scanning both consume the same generated file list, so clean committed branch
+changes, deletions, and renames remain in scope. It runs configured
+lint/typecheck commands from `.ai-review/local.json`. `review.sh` runs broader
+configured commands and the scanner for universal review.
 
 ## Files
 

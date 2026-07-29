@@ -62,7 +62,7 @@ class ScannerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["schema_version"], "1.0")
+            self.assertEqual(payload["schema_version"], "2.0")
             self.assertEqual(
                 set(payload),
                 {
@@ -71,6 +71,7 @@ class ScannerTests(unittest.TestCase):
                 },
             )
             self.assertIn("remediation", payload["findings"][0])
+            self.assertIn("historical_sources", payload["findings"][0])
             self.assertFalse(
                 synthetic("sk_live_1234567890abcdefghij") in result.stdout,
                 "scanner JSON leaked credential",
@@ -278,7 +279,12 @@ class ScannerTests(unittest.TestCase):
             ))
             self.assertTrue(report.complete, report.coverage_errors)
             self.assertTrue(any(
-                item.path == "new.ts" and "rename:old.ts->new.ts" in item.source
+                item.path == "new.ts"
+                and item.source == "working-tree"
+                and any(
+                    "rename:old.ts->new.ts" in source.source
+                    for source in item.historical_sources
+                )
                 for item in report.findings
             ))
 

@@ -28,6 +28,7 @@ SKILL_ITEMS = [
     "reference",
     "scripts",
     "config",
+    "tests",
 ]
 
 

@@ -22,6 +22,7 @@ KNOWN_IMPORT_ALIASES = {
 class PythonDependencyContext:
     paths: tuple[Path, ...]
     distributions: frozenset[str]
+    constraints: frozenset[str] = frozenset()
 
 
 def normalise_name(value: str) -> str:
@@ -55,19 +56,23 @@ def _strip_comment(line: str) -> str:
 def _requirement_file(
     path: Path,
     root: Path,
-    visited: set[Path],
-    dependencies: set[str],
+    visited: set[tuple[Path, str]],
+    requirements: set[str],
+    constraints: set[str],
     paths: list[Path],
     errors: list[str],
+    *,
+    mode: str,
 ) -> None:
     resolved = path.resolve()
-    if resolved in visited:
+    visit = (resolved, mode)
+    if visit in visited:
         return
-    visited.add(resolved)
+    visited.add(visit)
     try:
         resolved.relative_to(root.resolve())
     except ValueError:
-        errors.append(f"dependency context: requirements include escapes repository: {path}")
+        errors.append(f"dependency context: {mode} include escapes repository: {path}")
         return
     try:
         text = path.read_text(encoding="utf-8")
@@ -76,7 +81,8 @@ def _requirement_file(
             label = path.relative_to(root).as_posix()
         except ValueError:
             label = path.as_posix()
-        errors.append(f"dependency context: missing included requirements file {label}")
+        include_kind = "requirements" if mode == "requirement" else "constraint"
+        errors.append(f"dependency context: missing included {include_kind} file {label}")
         return
     paths.append(path.relative_to(root))
     logical_lines = []
@@ -102,17 +108,34 @@ def _requirement_file(
         if not tokens:
             continue
         if tokens[0] in {"-r", "--requirement", "-c", "--constraint"} and len(tokens) >= 2:
-            _requirement_file(path.parent / tokens[1], root, visited, dependencies, paths, errors)
+            included_mode = (
+                "requirement" if tokens[0] in {"-r", "--requirement"} else "constraint"
+            )
+            _requirement_file(
+                path.parent / tokens[1],
+                root,
+                visited,
+                requirements,
+                constraints,
+                paths,
+                errors,
+                mode=included_mode,
+            )
             continue
         for prefix in ("--requirement=", "--constraint="):
             if tokens[0].startswith(prefix):
+                included_mode = (
+                    "requirement" if prefix == "--requirement=" else "constraint"
+                )
                 _requirement_file(
                     path.parent / tokens[0][len(prefix):],
                     root,
                     visited,
-                    dependencies,
+                    requirements,
+                    constraints,
                     paths,
                     errors,
+                    mode=included_mode,
                 )
                 break
         else:
@@ -123,20 +146,29 @@ def _requirement_file(
                 specifier = tokens[0].split("=", 1)[1]
             dependency = dependency_name(specifier)
             if dependency and not specifier.startswith((".", "/")):
-                dependencies.add(dependency)
+                target = constraints if mode == "constraint" else requirements
+                target.add(dependency)
 
 
 def load_python_manifests(
     root: Path,
     ignored: Callable[[str], bool],
 ) -> tuple[dict[Path, PythonDependencyContext], list[str]]:
-    collected: dict[Path, tuple[list[Path], set[str]]] = {}
+    collected: dict[Path, tuple[list[Path], set[str], set[str]]] = {}
     errors = []
 
-    def add(directory: Path, paths: list[Path], dependencies: set[str]) -> None:
-        known_paths, known_dependencies = collected.setdefault(directory, ([], set()))
+    def add(
+        directory: Path,
+        paths: list[Path],
+        dependencies: set[str],
+        constraints: set[str] | None = None,
+    ) -> None:
+        known_paths, known_dependencies, known_constraints = collected.setdefault(
+            directory, ([], set(), set())
+        )
         known_paths.extend(path for path in paths if path not in known_paths)
         known_dependencies.update(dependencies)
+        known_constraints.update(constraints or ())
 
     for path in root.rglob("*"):
         if not path.is_file():
@@ -192,11 +224,26 @@ def load_python_manifests(
                     if dependency
                 )
             add(rel.parent, [rel], dependencies)
-        elif re.fullmatch(r"requirements(?:[-_.][A-Za-z0-9_.-]+)?\.(?:txt|in)", path.name, re.I):
+        elif re.fullmatch(
+            r"(?:requirements|constraints)(?:[-_.][A-Za-z0-9_.-]+)?\.(?:txt|in)",
+            path.name,
+            re.I,
+        ):
             dependencies: set[str] = set()
+            constraints: set[str] = set()
             paths: list[Path] = []
-            _requirement_file(path, root, set(), dependencies, paths, errors)
-            add(rel.parent, paths, dependencies)
+            mode = "constraint" if path.name.lower().startswith("constraints") else "requirement"
+            _requirement_file(
+                path,
+                root,
+                set(),
+                dependencies,
+                constraints,
+                paths,
+                errors,
+                mode=mode,
+            )
+            add(rel.parent, paths, dependencies, constraints)
         elif path.name == "Pipfile":
             try:
                 data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -216,8 +263,9 @@ def load_python_manifests(
         directory: PythonDependencyContext(
             tuple(sorted(paths)),
             frozenset(dependencies),
+            frozenset(constraints),
         )
-        for directory, (paths, dependencies) in collected.items()
+        for directory, (paths, dependencies, constraints) in collected.items()
     }, errors
 
 

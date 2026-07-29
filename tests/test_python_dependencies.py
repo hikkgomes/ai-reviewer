@@ -115,6 +115,63 @@ class PythonDependencyTests(unittest.TestCase):
             )
             self.assertEqual(dependency_candidates(root), [])
 
+    def test_constraints_do_not_declare_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "requirements.txt").write_text("-c constraints.txt\n")
+            (root / "constraints.txt").write_text("httpx==0.28.0\n")
+            (root / "app.py").write_text("import httpx\n")
+            candidates = dependency_candidates(root)
+            self.assertEqual([item.evidence for item in candidates], ["httpx"])
+
+            (root / "requirements.txt").write_text(
+                "-r requirements-api.in\n-c constraints.txt\n"
+            )
+            (root / "requirements-api.in").write_text("httpx[http2]>=0.27\n")
+            self.assertEqual(dependency_candidates(root), [])
+
+    def test_nested_requirement_and_constraint_includes_are_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "requirements.txt").write_text(
+                "-r nested/requirements.in\n-c nested/constraints.in\n"
+            )
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "requirements.in").write_text(
+                "-r ../requirements.txt\n"
+                "-e git+https://example.invalid/editable.git#egg=editable_pkg\n"
+                "direct_pkg @ https://example.invalid/direct.whl\n"
+            )
+            (nested / "constraints.in").write_text(
+                "-c ../constraints-extra.txt\nconstraint_only==1\n"
+            )
+            (root / "constraints-extra.txt").write_text(
+                "-c nested/constraints.in\neditable_pkg==2\n"
+            )
+            (root / "app.py").write_text(
+                "import editable_pkg\nimport direct_pkg\nimport constraint_only\n"
+            )
+            report = scan_report(ScanOptions(root=root))
+            self.assertTrue(report.complete, report.coverage_errors)
+            candidates = [
+                item.evidence for item in report.findings
+                if item.check_id == "SUP-DEPENDENCY-004"
+            ]
+            self.assertEqual(candidates, ["constraint_only"])
+
+    def test_missing_nested_constraint_is_a_coverage_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "requirements.txt").write_text("-c missing-constraints.txt\n")
+            (root / "app.py").write_text("import missing_dependency\n")
+            report = scan_report(ScanOptions(root=root))
+            self.assertFalse(report.complete)
+            self.assertTrue(any(
+                "missing included constraint file" in error
+                for error in report.coverage_errors
+            ))
+
     def test_local_package_is_allowed_but_hallucinated_neighbor_is_not(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

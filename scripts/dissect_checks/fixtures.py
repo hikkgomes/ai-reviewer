@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import ast
+from functools import lru_cache
+import hashlib
 from pathlib import Path
 
 
+_MANIFEST_VERSION = 1
+_PROJECT_ANCHORS = (
+    "LICENSE",
+    "config/rules.yaml",
+    "reference/check-families.md",
+    "reference/taxonomy-ai.md",
+)
 _STRUCTURED_RULE_PATH = "scripts/dissect_checks/rules.py"
 _LEGACY_RULE_PATH = "scripts/dissect_checks/legacy.py"
 _FIXTURE_REGISTRY_PATH = "scripts/dissect_checks/fixtures.py"
@@ -13,16 +22,65 @@ _HISTORICAL_SYNTHETIC_VALUES = (
 )
 
 
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _skill_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+@lru_cache(maxsize=1)
+def _trusted_fixture_manifest() -> dict:
+    """Build the versioned fixture manifest from the executing skill copy."""
+    root = _skill_root()
+    anchors = {}
+    for path in _PROJECT_ANCHORS:
+        try:
+            anchors[path] = _sha256((root / path).read_bytes())
+        except OSError:
+            return {}
+
+    fixture_paths = {
+        _STRUCTURED_RULE_PATH,
+        _LEGACY_RULE_PATH,
+        _FIXTURE_REGISTRY_PATH,
+        *(
+            path.relative_to(root).as_posix()
+            for path in (root / "tests").glob("*.py")
+            if path.is_file()
+        ),
+    }
+    fixtures = {}
+    for path in sorted(fixture_paths):
+        try:
+            tree = ast.parse((root / path).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        digests = {
+            _sha256(ast.dump(node, include_attributes=False).encode("utf-8"))
+            for node in _fixture_nodes(path, tree)
+        }
+        if digests:
+            fixtures[path] = frozenset(digests)
+    return {
+        "version": _MANIFEST_VERSION,
+        "anchors": anchors,
+        "fixtures": fixtures,
+    }
+
+
 def is_owned_dissect_root(root: Path) -> bool:
+    """Authenticate a checkout against the executing skill's trusted anchors."""
+    manifest = _trusted_fixture_manifest()
+    if manifest.get("version") != _MANIFEST_VERSION:
+        return False
     try:
-        return (
-            (root / "scripts" / "dissect_checks" / "fixtures.py").resolve()
-            == Path(__file__).resolve()
-            and
-            (root / "scripts" / "scan_ai_gotchas.py").is_file()
-            and "name: dissect" in (root / "SKILL.md").read_text(encoding="utf-8")
+        return all(
+            _sha256((root / path).read_bytes()) == digest
+            for path, digest in manifest["anchors"].items()
         )
-    except OSError:
+    except (KeyError, OSError):
         return False
 
 
@@ -76,11 +134,8 @@ def mask_owned_fixture_spans(root: Path, path: str, text: str) -> str:
     """Blank only AST-proven fixture literals owned by Dissect itself."""
     if not is_owned_dissect_root(root):
         return text
-    if path not in {
-        _STRUCTURED_RULE_PATH, _LEGACY_RULE_PATH, _FIXTURE_REGISTRY_PATH,
-    } and not (
-        path.startswith(_TEST_PREFIX) and path.endswith(".py")
-    ):
+    allowed_digests = _trusted_fixture_manifest().get("fixtures", {}).get(path)
+    if not allowed_digests:
         return text
     try:
         tree = ast.parse(text)
@@ -89,6 +144,9 @@ def mask_owned_fixture_spans(root: Path, path: str, text: str) -> str:
     lines = text.splitlines(keepends=True)
     spans = []
     for node in _fixture_nodes(path, tree):
+        digest = _sha256(ast.dump(node, include_attributes=False).encode("utf-8"))
+        if digest not in allowed_digests:
+            continue
         if not all(hasattr(node, attr) for attr in ("lineno", "col_offset", "end_lineno", "end_col_offset")):
             continue
         start = _character_offset(lines, node.lineno, node.col_offset)

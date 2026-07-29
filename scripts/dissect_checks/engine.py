@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import fnmatch
-import hashlib
 import json
 import os
 import re
@@ -12,7 +11,7 @@ import sys
 
 from .fixtures import is_owned_dissect_root, mask_owned_fixture_spans
 from .legacy import scan_legacy
-from .model import Finding
+from .model import Finding, HistoricalSource
 from .python_dependencies import (
     KNOWN_IMPORT_ALIASES,
     installed_aliases,
@@ -66,6 +65,16 @@ class ScanReport:
     findings: tuple[Finding, ...]
     complete: bool
     coverage_errors: tuple[str, ...] = ()
+
+
+@dataclass
+class _HistoryLineage:
+    reviewed_path: str
+    aliases: set[str]
+    copy_ancestry: set[str]
+
+    def follows(self, path: str) -> bool:
+        return path in self.aliases or path in self.copy_ancestry
 
 
 def _normalise(path: str) -> str:
@@ -290,38 +299,140 @@ def _scan_history(options: ScanOptions) -> tuple[list[Finding], list[str]]:
 
     findings = []
     errors = []
-    lineage: dict[str, set[str]] = {
-        rel: {rel}
+    lineages = [
+        _HistoryLineage(rel, {rel}, set())
         for rel in options.file_list
         if not _ignored(rel, options) and _is_text_path(rel)
-    }
-    seen = set()
+    ]
+
+    def create_lineage(path: str) -> _HistoryLineage:
+        lineage = _HistoryLineage(path, {path}, set())
+        lineages.append(lineage)
+        return lineage
+
+    def identity_matches(*paths: str) -> list[_HistoryLineage]:
+        return [
+            lineage for lineage in lineages
+            if any(path in lineage.aliases for path in paths)
+        ]
+
+    def traversal_matches(*paths: str) -> list[_HistoryLineage]:
+        return [
+            lineage for lineage in lineages
+            if any(lineage.follows(path) for path in paths)
+        ]
+
+    def merge_rename_identities(matches: list[_HistoryLineage]) -> _HistoryLineage | None:
+        if not matches:
+            return None
+        primary = next(
+            (
+                lineage for lineage in matches
+                if (options.root / lineage.reviewed_path).exists()
+            ),
+            matches[0],
+        )
+        for duplicate in matches:
+            if duplicate is primary:
+                continue
+            primary.aliases.update(duplicate.aliases)
+            primary.copy_ancestry.update(duplicate.copy_ancestry)
+            lineages.remove(duplicate)
+        return primary
+
     for commit in commits.stdout.splitlines():
         statuses, status_errors = _commit_statuses(options, commit)
         errors.extend(status_errors)
-        if not options.file_list:
-            for _parent, status, old_path, new_path in statuses:
-                reviewed = old_path if status == "D" else new_path
-                if not _ignored(reviewed, options) and _is_text_path(reviewed):
-                    lineage.setdefault(reviewed, {reviewed})
         targets: set[tuple[str, str, str, str]] = set()
-        for reviewed_path, aliases in lineage.items():
-            for parent, status, old_path, new_path in statuses:
-                if status.startswith("R") and aliases.intersection({old_path, new_path}):
-                    aliases.update({old_path, new_path})
-                    targets.add((commit, new_path, reviewed_path, f"rename:{old_path}->{new_path}"))
+        for parent, status, old_path, new_path in statuses:
+            kind = status[:1]
+            if kind == "R":
+                identities = identity_matches(old_path, new_path)
+                primary = merge_rename_identities(identities)
+                relevant = traversal_matches(old_path, new_path)
+                if primary is None and not options.file_list:
+                    primary = create_lineage(new_path)
+                    relevant.append(primary)
+                relevant = list({
+                    id(lineage): lineage for lineage in traversal_matches(old_path, new_path)
+                }.values())
+                for lineage in relevant:
+                    if old_path in lineage.aliases or new_path in lineage.aliases:
+                        lineage.aliases.update({old_path, new_path})
+                    else:
+                        lineage.copy_ancestry.update({old_path, new_path})
+                    targets.add((
+                        commit,
+                        new_path,
+                        lineage.reviewed_path,
+                        f"rename:{old_path}->{new_path}",
+                    ))
                     if parent:
-                        targets.add((parent, old_path, reviewed_path, f"rename-parent:{old_path}"))
-                elif status.startswith("C") and new_path in aliases:
-                    aliases.add(old_path)
-                    targets.add((commit, new_path, reviewed_path, f"copy:{old_path}->{new_path}"))
+                        targets.add((
+                            parent,
+                            old_path,
+                            lineage.reviewed_path,
+                            f"rename-parent:{old_path}",
+                        ))
+            elif kind == "C":
+                relevant = [
+                    lineage for lineage in lineages if lineage.follows(new_path)
+                ]
+                if not identity_matches(new_path) and not options.file_list:
+                    relevant.append(create_lineage(new_path))
+                for lineage in {
+                    id(item): item for item in relevant
+                }.values():
+                    lineage.copy_ancestry.add(old_path)
+                    targets.add((
+                        commit,
+                        new_path,
+                        lineage.reviewed_path,
+                        f"copy:{old_path}->{new_path}",
+                    ))
                     if parent:
-                        targets.add((parent, old_path, reviewed_path, f"copy-parent:{old_path}"))
-                elif status == "D" and old_path in aliases:
+                        targets.add((
+                            parent,
+                            old_path,
+                            lineage.reviewed_path,
+                            f"copy-parent:{old_path}",
+                        ))
+                if not options.file_list and not identity_matches(old_path):
+                    source_lineage = create_lineage(old_path)
                     if parent:
-                        targets.add((parent, old_path, reviewed_path, f"deleted-parent:{old_path}"))
-                elif status[:1] in {"A", "M", "T"} and new_path in aliases:
-                    targets.add((commit, new_path, reviewed_path, f"path:{new_path}"))
+                        targets.add((
+                            parent,
+                            old_path,
+                            source_lineage.reviewed_path,
+                            f"copy-source:{old_path}",
+                        ))
+            elif kind == "D":
+                relevant = traversal_matches(old_path)
+                if not identity_matches(old_path) and not options.file_list:
+                    relevant.append(create_lineage(old_path))
+                if parent:
+                    for lineage in {
+                        id(item): item for item in relevant
+                    }.values():
+                        targets.add((
+                            parent,
+                            old_path,
+                            lineage.reviewed_path,
+                            f"deleted-parent:{old_path}",
+                        ))
+            elif kind in {"A", "M", "T"}:
+                relevant = traversal_matches(new_path)
+                if not identity_matches(new_path) and not options.file_list:
+                    relevant.append(create_lineage(new_path))
+                for lineage in {
+                    id(item): item for item in relevant
+                }.values():
+                    targets.add((
+                        commit,
+                        new_path,
+                        lineage.reviewed_path,
+                        f"path:{new_path}",
+                    ))
         ordered_targets = sorted(
             targets,
             key=lambda target: (
@@ -335,21 +446,16 @@ def _scan_history(options: ScanOptions) -> tuple[list[Finding], list[str]]:
                 errors.append(read_error)
                 continue
             assert text is not None
-            fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            source = f"git:{commit[:12]}:{provenance}"
+            source = f"git:{revision[:12]}:{provenance}"
             for finding in _scan_owned_text(
                 options, reviewed_path, original_path, text, source
             ):
-                key = (
-                    reviewed_path,
-                    finding.check_id,
-                    finding.line,
-                    finding.evidence,
-                    fingerprint,
-                )
-                if key not in seen:
-                    seen.add(key)
-                    findings.append(finding)
+                findings.append(replace(
+                    finding,
+                    historical_sources=(
+                        HistoricalSource(source, original_path, finding.line),
+                    ),
+                ))
     return findings, errors
 
 
@@ -541,6 +647,55 @@ def _lockfile_findings(options: ScanOptions, files: list[str], manifests: dict[P
     return findings
 
 
+def _aggregate_findings(findings: list[Finding]) -> tuple[Finding, ...]:
+    """Prefer current evidence while retaining every historical provenance record."""
+    groups: dict[tuple, dict[str, list[Finding]]] = {}
+    for item in findings:
+        identity = (
+            item.check_id,
+            item.category,
+            item.severity,
+            item.confidence,
+            item.path,
+            item.evidence,
+            item.explanation,
+            item.remediation,
+            item.disposition,
+        )
+        bucket = groups.setdefault(identity, {"working": [], "history": []})
+        bucket["working" if item.source == "working-tree" else "history"].append(item)
+
+    aggregated = []
+    for bucket in groups.values():
+        provenance = {}
+        for item in bucket["history"]:
+            sources = item.historical_sources or (
+                HistoricalSource(item.source, item.path, item.line),
+            )
+            for source in sources:
+                provenance[(source.source, source.path, source.line)] = source
+        historical_sources = tuple(provenance.values())
+
+        if bucket["working"]:
+            current = {}
+            for item in bucket["working"]:
+                current[(item.line, item.source)] = item
+            aggregated.extend(
+                replace(item, historical_sources=historical_sources)
+                for item in current.values()
+            )
+        elif bucket["history"]:
+            aggregated.append(replace(
+                bucket["history"][0],
+                historical_sources=historical_sources,
+            ))
+
+    return tuple(sorted(
+        aggregated,
+        key=lambda item: (item.path, item.line, item.check_id, item.source),
+    ))
+
+
 def scan_report(options: ScanOptions) -> ScanReport:
     findings = []
     errors = []
@@ -569,18 +724,7 @@ def scan_report(options: ScanOptions) -> ScanReport:
         findings.extend(history_findings)
         errors.extend(history_errors)
 
-    unique = {}
-    for item in findings:
-        key = (item.check_id, item.path, item.line, item.evidence)
-        previous = unique.get(key)
-        if previous is None or (
-            previous.source == "working-tree" and item.source.startswith("git:")
-        ):
-            unique[key] = item
-    ordered = tuple(sorted(
-        unique.values(),
-        key=lambda item: (item.path, item.line, item.check_id, item.source),
-    ))
+    ordered = _aggregate_findings(findings)
     safe_errors = tuple(redact_sensitive_text(error) for error in errors)
     return ScanReport(ordered, not safe_errors, safe_errors)
 
