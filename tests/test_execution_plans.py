@@ -264,6 +264,43 @@ class ExecutionPlanTests(unittest.TestCase):
                 self.assertIsNone(completed)
                 self.assertTrue(error)
 
+    def test_shebang_arguments_are_bound_and_used_in_snapshot_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "scanner"
+            executable.write_text("#!/bin/sh -e\nprintf approved\n")
+            executable.chmod(0o755)
+            plan, error = build_execution_plan(
+                kind="tool", name="shebang", argv=[str(executable), "user"],
+                working_directory=root,
+            )
+            self.assertIsNone(error)
+            assert plan
+            self.assertEqual(plan.interpreter_arguments, ("-e",))
+            changed = replace(plan, interpreter_arguments=("-x",))
+            self.assertNotEqual(plan.approval_digest, changed.approval_digest)
+            completed_result = subprocess.CompletedProcess([], 0, "approved", "")
+            with patch("dissect_checks.execution_plan.subprocess.run", return_value=completed_result) as run:
+                completed, execution_error = execute_approved_plan(plan, plan.approval_digest)
+            self.assertIsNone(execution_error)
+            self.assertIsNotNone(completed)
+            command = run.call_args.args[0]
+            self.assertEqual(command[1], "-e")
+            self.assertEqual(command[3:], ["user"])
+
+    def test_unsupported_env_split_shebang_is_rejected_during_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "scanner"
+            executable.write_text("#!/usr/bin/env -S sh -e\nprintf rejected\n")
+            executable.chmod(0o755)
+            plan, error = build_execution_plan(
+                kind="tool", name="shebang", argv=[str(executable)],
+                working_directory=root,
+            )
+            self.assertIsNone(plan)
+            self.assertIn("env -S", error or "")
+
 
 if __name__ == "__main__":
     unittest.main()

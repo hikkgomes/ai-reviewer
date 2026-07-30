@@ -68,6 +68,21 @@ def detected_languages(output: str) -> set[str]:
     return set() if line == "none" else set(line.split(", "))
 
 
+def scan_scope(root: Path) -> dict:
+    scope = root / "scope.bin"
+    scope.write_bytes(serialize_entries(changed_entries(root)))
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "scan_ai_gotchas.py"), "--format", "json"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "AI_REVIEW_FILE_LIST": str(scope)},
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 class ReviewChangedLanguageTests(unittest.TestCase):
     def test_unusual_git_filenames_remain_exact_and_nul_delimited(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -247,6 +262,52 @@ class ReviewChangedLanguageTests(unittest.TestCase):
             self.assertTrue(any(item.status.startswith("R") and item.new_path == new for item in entries))
             deletion = next(item for item in entries if item.status.startswith("D") and item.old_path == new)
             self.assertEqual((deletion.source_kind, deletion.index_stage), ("index", 0))
+
+    def test_staged_secret_is_scanned_when_worktree_is_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            target = root / "app.py"
+            target.write_text("safe = True\n")
+            commit(root, "base")
+            target.write_text(f"secret = '{synthetic('sk_live_1234567890abcdefghij')}'\n")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            target.write_text("safe = True\n")
+            findings = [item for item in scan_scope(root)["findings"] if item["check_id"] == "SEC-SECRETS-002"]
+            self.assertTrue(findings)
+            self.assertTrue(findings[0]["source"].startswith("git:index:0:staged"))
+
+    def test_unstaged_secret_is_scanned_when_index_is_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            target = root / "app.py"
+            target.write_text("safe = True\n")
+            commit(root, "base")
+            target.write_text("safe = True\n")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            target.write_text(f"secret = '{synthetic('sk_live_1234567890abcdefghij')}'\n")
+            findings = [item for item in scan_scope(root)["findings"] if item["check_id"] == "SEC-SECRETS-002"]
+            self.assertTrue(findings)
+            self.assertEqual(findings[0]["source"], "working-tree")
+
+    def test_identical_index_and_worktree_findings_aggregate_with_both_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            target = root / "app.py"
+            target.write_text("safe = True\n")
+            commit(root, "base")
+            target.write_text(f"secret = '{synthetic('sk_live_1234567890abcdefghij')}'\n")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            finding = next(
+                item for item in scan_scope(root)["findings"]
+                if item["check_id"] == "SEC-SECRETS-002"
+            )
+            self.assertEqual(finding["source"], "working-tree")
+            self.assertIn("git:index:0:staged", {
+                source["source"] for source in finding["historical_sources"]
+            })
 
 
 if __name__ == "__main__":

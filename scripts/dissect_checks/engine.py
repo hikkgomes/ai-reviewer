@@ -56,7 +56,7 @@ class ScanOptions:
     include_history: bool = False
     history_depth: int = 20
     file_list: tuple[str, ...] = ()
-    diff_entries: tuple[tuple[str, str, str, bool, str, str, int | None], ...] = ()
+    diff_entries: tuple[tuple[str, str, str, bool, str, str, int | None, str], ...] = ()
     ignore: tuple[str, ...] = ()
     generated_paths: tuple[str, ...] = ()
     python_import_aliases: tuple[tuple[str, str], ...] = ()
@@ -123,7 +123,11 @@ def options_from_environment(
                     index_stage = entry.get("index_stage")
                     if index_stage is not None and not isinstance(index_stage, int):
                         raise ValueError("invalid index stage")
-                    diff_entries.append((status, old_path, new_path, exists, source_kind, commit_revision, index_stage))
+                    blob_path = _normalise(str(entry.get(
+                        "blob_path",
+                        old_path if status.startswith("D") else new_path,
+                    )))
+                    diff_entries.append((status, old_path, new_path, exists, source_kind, commit_revision, index_stage, blob_path))
                     if exists:
                         file_list.append(new_path)
                 except (KeyError, TypeError, ValueError, UnicodeDecodeError):
@@ -194,7 +198,7 @@ def _is_text_path(rel: str) -> bool:
 
 def _candidate_files(options: ScanOptions) -> list[str]:
     if options.diff_entries:
-        candidates = [new for _status, _old, new, exists, _kind, _commit, _stage in options.diff_entries if exists]
+        candidates = [new for _status, _old, new, exists, _kind, _commit, _stage, _blob in options.diff_entries if exists]
     elif options.file_list:
         candidates = list(options.file_list)
     else:
@@ -396,6 +400,69 @@ def _read_index_blob(
             f"(exit {result.returncode})"
         )
     return result.stdout.decode("utf-8", errors="ignore"), None
+
+
+def _diff_source_path(status: str, old_path: str, new_path: str, blob_path: str) -> str:
+    return blob_path or (old_path if status.startswith("D") else new_path)
+
+
+def _diff_source_label(source_kind: str, revision: str, stage: int | None, status: str) -> str:
+    if source_kind == "commit":
+        suffix = ":deleted-base" if status.startswith("D") else ""
+        return f"git:{revision[:12]}:committed-diff{suffix}"
+    if source_kind == "index":
+        suffix = ":deleted-base" if status.startswith("D") else ""
+        return f"git:index:{stage}:staged{suffix}"
+    if source_kind == "untracked":
+        return "untracked"
+    return "working-tree"
+
+
+def _scan_diff_layers(
+    options: ScanOptions,
+) -> tuple[list[Finding], list[str]]:
+    findings: list[Finding] = []
+    errors: list[str] = []
+    for status, old_path, new_path, exists, source_kind, revision, stage, blob_path in options.diff_entries:
+        if _ignored(old_path, options) and _ignored(new_path, options):
+            continue
+        reviewed_path = old_path if status.startswith("D") else new_path
+        original_path = _diff_source_path(status, old_path, new_path, blob_path)
+        if not _is_text_path(reviewed_path):
+            continue
+        source = _diff_source_label(source_kind, revision, stage, status)
+        text: str | None
+        read_error: str | None
+        if source_kind == "commit":
+            text, read_error = _read_history_blob(options, revision, original_path)
+            # An addition has no committed blob by definition. It is still a
+            # complete layer; the index/worktree blobs carry its evidence.
+            if read_error and status.startswith("A"):
+                continue
+        elif source_kind == "index":
+            if stage is None:
+                errors.append(f"diff scope: {original_path!r} has no index stage")
+                continue
+            text, read_error = _read_index_blob(options, stage, original_path)
+        else:
+            if not exists:
+                if source_kind == "working-tree":
+                    errors.append(f"working tree: could not read {original_path}")
+                continue
+            try:
+                text = (options.root / original_path).read_text(
+                    encoding="utf-8", errors="ignore"
+                )
+                read_error = None
+            except OSError:
+                text = None
+                read_error = f"{source_kind}: could not read {original_path}"
+        if read_error:
+            errors.append(read_error)
+            continue
+        assert text is not None
+        findings.extend(_scan_owned_text(options, reviewed_path, original_path, text, source))
+    return findings, errors
 
 
 def _scan_history(options: ScanOptions) -> tuple[list[Finding], list[str]]:
@@ -769,7 +836,7 @@ def _lockfile_findings(options: ScanOptions, files: list[str], manifests: dict[P
 
 
 def _aggregate_findings(findings: list[Finding]) -> tuple[Finding, ...]:
-    """Correlate only stable, unambiguous occurrences and retain all provenance."""
+    """Correlate stable occurrences across commit, index, and worktree layers."""
     current_by_occurrence: dict[tuple, list[Finding]] = {}
     history_by_occurrence: dict[tuple, list[Finding]] = {}
     current_by_context: dict[tuple, set[str]] = {}
@@ -791,7 +858,12 @@ def _aggregate_findings(findings: list[Finding]) -> tuple[Finding, ...]:
             item.context_fingerprint,
             item.evidence,
         )
-        if item.source == "working-tree":
+        is_layer = (
+            item.source in {"working-tree", "untracked"}
+            or item.source.startswith("git:index:")
+            or ":committed-diff" in item.source
+        )
+        if is_layer:
             current_by_occurrence.setdefault(occurrence, []).append(item)
             current_by_context.setdefault(context, set()).add(item.occurrence_id)
         else:
@@ -827,15 +899,30 @@ def _aggregate_findings(findings: list[Finding]) -> tuple[Finding, ...]:
                         source.occurrence_id,
                     )
                 ] = source
-        historical_sources = tuple(provenance.values())
-        current = {
-            (item.line, item.source, item.occurrence_id): item
-            for item in current_items
-        }
-        aggregated.extend(
-            replace(item, historical_sources=historical_sources)
-            for item in current.values()
+        preferred = min(
+            current_items,
+            key=lambda item: {
+                "working-tree": 0,
+                "untracked": 1,
+            }.get(
+                item.source,
+                2 if item.source.startswith("git:index:") else 3,
+            ),
         )
+        for item in current_items:
+            if item is preferred:
+                continue
+            source = HistoricalSource(
+                source=item.source,
+                path=item.path,
+                line=item.line,
+                match_fingerprint=item.match_fingerprint,
+                context_fingerprint=item.context_fingerprint,
+                occurrence_id=item.occurrence_id,
+            )
+            provenance[(source.source, source.path, source.line, source.occurrence_id)] = source
+        historical_sources = tuple(provenance.values())
+        aggregated.append(replace(preferred, historical_sources=historical_sources))
         if historical_items and unambiguous:
             consumed_history.add(occurrence)
 
@@ -871,38 +958,19 @@ def scan_report(options: ScanOptions) -> ScanReport:
     findings = []
     errors = []
     files = _candidate_files(options)
-    for rel in files:
-        try:
-            text = (options.root / rel).read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            if not (options.include_history and options.file_list):
-                errors.append(f"working tree: could not read {rel}")
-            continue
-        findings.extend(_scan_owned_text(options, rel, rel, text, "working-tree"))
-
-    # A deletion has no current file to open. Its base blob is nevertheless useful
-    # evidence and, unlike a failed current read, is not a coverage failure when it
-    # can be read successfully.
-    for status, old_path, _new_path, _exists, source_kind, commit_revision, index_stage in options.diff_entries:
-        if not status.startswith("D") or _ignored(old_path, options) or not _is_text_path(old_path):
-            continue
-        if source_kind == "index":
-            if index_stage is None:
-                errors.append(f"diff scope: deleted {old_path!r} has no index stage")
+    if options.diff_entries:
+        layer_findings, layer_errors = _scan_diff_layers(options)
+        findings.extend(layer_findings)
+        errors.extend(layer_errors)
+    else:
+        for rel in files:
+            try:
+                text = (options.root / rel).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                if not (options.include_history and options.file_list):
+                    errors.append(f"working tree: could not read {rel}")
                 continue
-            text, read_error = _read_index_blob(options, index_stage, old_path)
-            source = f"git:index:{index_stage}:deleted-base"
-        elif source_kind == "commit" and commit_revision:
-            text, read_error = _read_history_blob(options, commit_revision, old_path)
-            source = f"git:{commit_revision[:12]}:deleted-base"
-        else:
-            errors.append(f"diff scope: deleted {old_path!r} has no applicable evidence source")
-            continue
-        if read_error:
-            errors.append(read_error)
-            continue
-        assert text is not None
-        findings.extend(_scan_owned_text(options, old_path, old_path, text, source))
+            findings.extend(_scan_owned_text(options, rel, rel, text, "working-tree"))
 
     manifests, manifest_errors = _load_package_manifests(options)
     errors.extend(manifest_errors)

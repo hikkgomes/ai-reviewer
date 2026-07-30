@@ -70,6 +70,36 @@ class RedactionTests(unittest.TestCase):
                     self.assertNotIn(secret, rendered)
                 self.assertIn(visible, rendered)
 
+    def test_shell_redaction_has_no_collidable_placeholder_state(self) -> None:
+        marker = "__DISSECT_SHELL_SECRET_0__"
+        command = f"{marker}; before && tool --token secret; {marker} after"
+        rendered = redact_shell_command(command)
+        self.assertIn(f"{marker}; before", rendered)
+        self.assertIn(f"; {marker} after", rendered)
+        self.assertIn("before && tool --token", rendered)
+        self.assertNotIn("secret", rendered)
+
+    def test_shell_redaction_handles_escaped_words_quotes_and_expansions(self) -> None:
+        rendered = redact_shell_command(
+            'tool --token secret\\ value --password foo\\"bar '
+            '&& tool --token "${VARIABLE}" --token "$((1 + $(echo 2)))"'
+        )
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("value", rendered)
+        self.assertIn('\\"', rendered)
+        self.assertIn('"${VARIABLE}"', rendered)
+        self.assertIn('"$((1 + $(echo 2)))"', rendered)
+
+    def test_malformed_shell_is_rejected(self) -> None:
+        for command in (
+            'tool --token "unterminated',
+            "tool --token $(unterminated",
+            "tool --token `unterminated",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError):
+                    redact_shell_command(command)
+
     def test_urls_private_keys_jwt_and_auth_headers(self) -> None:
         password = "url-password"
         self.assert_redacted(f"https://user:{password}@example.com/path", password)

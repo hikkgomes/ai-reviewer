@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tempfile
 from typing import Callable, Mapping
@@ -13,8 +14,8 @@ from typing import Callable, Mapping
 from .redaction import redact_argv, redact_environment, redact_shell_command, redact_sensitive_text
 
 
-PLAN_SCHEMA_VERSION = 2
-APPROVAL_DOMAIN = b"dissect-execution-plan-v2\0"
+PLAN_SCHEMA_VERSION = 3
+APPROVAL_DOMAIN = b"dissect-execution-plan-v3\0"
 _ENV_NAME = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")
 
 
@@ -64,7 +65,16 @@ def _resolve_executable(value: str, environment: Mapping[str, str]) -> Path | No
         return None
 
 
-def _shebang_identity(path: Path, environment: Mapping[str, str]) -> tuple[str, str] | None:
+@dataclass(frozen=True)
+class _ShebangIdentity:
+    resolver: str
+    interpreter_path: str
+    interpreter_sha256: str
+    arguments: tuple[str, ...] = ()
+    environment_options: tuple[str, ...] = ()
+
+
+def _shebang_identity(path: Path, environment: Mapping[str, str]) -> _ShebangIdentity | None:
     try:
         first = path.read_bytes().splitlines()[0]
     except (OSError, IndexError):
@@ -72,22 +82,69 @@ def _shebang_identity(path: Path, environment: Mapping[str, str]) -> tuple[str, 
     if not first.startswith(b"#!"):
         return None
     try:
-        words = first[2:].decode("utf-8").strip().split()
+        words = shlex.split(first[2:].decode("utf-8").strip(), posix=True)
     except UnicodeDecodeError:
         raise ValueError("script executable has a non-UTF-8 shebang")
     if not words:
         raise ValueError("script executable has an empty shebang")
     interpreter = words[0]
+    resolver = interpreter
+    interpreter_arguments = tuple(words[1:])
+    environment_options: list[str] = []
     # /usr/bin/env intentionally delegates interpreter selection to PATH. Bind the
     # selected interpreter itself rather than accepting an extra mutable resolver.
     if Path(interpreter).name == "env":
-        if len(words) != 2 or words[1].startswith("-"):
-            raise ValueError("script executable uses an unsupported env shebang")
-        interpreter = words[1]
+        index = 0
+        while index < len(interpreter_arguments):
+            argument = interpreter_arguments[index]
+            if argument == "--":
+                index += 1
+                break
+            if argument in {"-S", "--split-string"} or argument.startswith("-S"):
+                raise ValueError("script executable uses an unsupported env -S shebang")
+            if argument in {"-i", "--ignore-environment"}:
+                environment_options.append(argument)
+                index += 1
+                continue
+            if argument in {"-u", "--unset"}:
+                if index + 1 >= len(interpreter_arguments):
+                    raise ValueError("env shebang has an incomplete unset option")
+                if not _valid_environment_name(interpreter_arguments[index + 1]):
+                    raise ValueError("env shebang has an invalid unset variable")
+                environment_options.extend((argument, interpreter_arguments[index + 1]))
+                index += 2
+                continue
+            if argument.startswith("--unset="):
+                if not _valid_environment_name(argument.split("=", 1)[1]):
+                    raise ValueError("env shebang has an invalid unset variable")
+                environment_options.append(argument)
+                index += 1
+                continue
+            if "=" in argument and _valid_environment_name(argument.split("=", 1)[0]):
+                environment_options.append(argument)
+                index += 1
+                continue
+            if argument.startswith("-"):
+                raise ValueError("script executable uses an unsupported env option")
+            break
+        if index >= len(interpreter_arguments):
+            raise ValueError("script executable uses an env shebang without an interpreter")
+        interpreter = interpreter_arguments[index]
+        interpreter_arguments = interpreter_arguments[index + 1:]
+        if not interpreter_arguments and "-i" not in environment_options and "--ignore-environment" not in environment_options:
+            # A plain env shebang is valid; this branch only documents that no
+            # mutable resolver or second command is retained in the plan.
+            pass
     resolved = _resolve_executable(interpreter, environment)
     if resolved is None:
         raise ValueError("script interpreter was not found in the approved environment")
-    return str(resolved), _sha256_file(resolved)
+    return _ShebangIdentity(
+        resolver,
+        str(resolved),
+        _sha256_file(resolved),
+        interpreter_arguments,
+        tuple(environment_options),
+    )
 
 
 @dataclass(frozen=True)
@@ -102,6 +159,9 @@ class ExecutionPlan:
     finding_exit_codes: tuple[int, ...] = ()
     interpreter_path: str = ""
     interpreter_sha256: str = ""
+    interpreter_resolver: str = ""
+    interpreter_arguments: tuple[str, ...] = ()
+    interpreter_environment_options: tuple[str, ...] = ()
     shell_semantics: str = ""
 
     @property
@@ -121,6 +181,9 @@ class ExecutionPlan:
             "finding_exit_codes": list(self.finding_exit_codes),
             "interpreter_path": self.interpreter_path,
             "interpreter_sha256": self.interpreter_sha256,
+            "interpreter_resolver": self.interpreter_resolver,
+            "interpreter_arguments": list(self.interpreter_arguments),
+            "interpreter_environment_options": list(self.interpreter_environment_options),
             "shell_semantics": self.shell_semantics,
         }
 
@@ -138,6 +201,9 @@ class ExecutionPlan:
             payload["argv"][2] = redact_shell_command(self.argv[2])
         payload["working_directory"] = redact_sensitive_text(self.working_directory)
         payload["environment"] = redact_environment(self.environment)
+        payload["interpreter_arguments"] = [redact_sensitive_text(value) for value in self.interpreter_arguments]
+        payload["interpreter_resolver"] = redact_sensitive_text(self.interpreter_resolver)
+        payload["interpreter_environment_options"] = [redact_sensitive_text(value) for value in self.interpreter_environment_options]
         payload["approval_digest"] = self.approval_digest
         return payload
 
@@ -159,7 +225,26 @@ def build_execution_plan(*, kind: str, name: str, argv: list[str] | tuple[str, .
     shell_semantics = ""
     if len(argv) == 3 and Path(argv[0]).name == "sh" and argv[1] == "-c":
         shell_semantics = "shell command is bound; nested executables are not independently authenticated"
-    plan = ExecutionPlan(kind=kind, name=name, executable_path=str(resolved), executable_sha256=executable_digest, argv=(str(resolved), *tuple(argv[1:])), working_directory=str(cwd), environment=approved_environment, finding_exit_codes=tuple(sorted(set(finding_exit_codes))), interpreter_path=interpreter[0] if interpreter else "", interpreter_sha256=interpreter[1] if interpreter else "", shell_semantics=shell_semantics)
+        try:
+            redact_shell_command(argv[2])
+        except ValueError as error:
+            return None, str(error)
+    plan = ExecutionPlan(
+        kind=kind,
+        name=name,
+        executable_path=str(resolved),
+        executable_sha256=executable_digest,
+        argv=(str(resolved), *tuple(argv[1:])),
+        working_directory=str(cwd),
+        environment=approved_environment,
+        finding_exit_codes=tuple(sorted(set(finding_exit_codes))),
+        interpreter_path=interpreter.interpreter_path if interpreter else "",
+        interpreter_sha256=interpreter.interpreter_sha256 if interpreter else "",
+        interpreter_resolver=interpreter.resolver if interpreter else "",
+        interpreter_arguments=interpreter.arguments if interpreter else (),
+        interpreter_environment_options=interpreter.environment_options if interpreter else (),
+        shell_semantics=shell_semantics,
+    )
     return plan, None
 
 
@@ -202,12 +287,30 @@ def _copy_snapshot(source_fd: int, directory: Path, name: str) -> tuple[Path, in
 
 def _run_snapshot(plan: ExecutionPlan, executable_snapshot: Path, interpreter_snapshot: Path | None) -> subprocess.CompletedProcess[str]:
     if interpreter_snapshot is not None:
-        command = [str(interpreter_snapshot), str(executable_snapshot), *plan.argv[1:]]
+        command = [str(interpreter_snapshot), *plan.interpreter_arguments, str(executable_snapshot), *plan.argv[1:]]
         executable = str(interpreter_snapshot)
     else:
         command = [str(executable_snapshot), *plan.argv[1:]]
         executable = str(executable_snapshot)
-    return subprocess.run(command, executable=executable, shell=False, cwd=plan.working_directory, env=plan.environment_dict, text=True, capture_output=True, check=False)
+    runtime_environment = plan.environment_dict
+    if any(option in {"-i", "--ignore-environment"} for option in plan.interpreter_environment_options):
+        runtime_environment = {}
+    index = 0
+    while index < len(plan.interpreter_environment_options):
+        option = plan.interpreter_environment_options[index]
+        if option in {"-u", "--unset"} and index + 1 < len(plan.interpreter_environment_options):
+            runtime_environment.pop(plan.interpreter_environment_options[index + 1], None)
+            index += 2
+        elif option.startswith("--unset="):
+            runtime_environment.pop(option.split("=", 1)[1], None)
+            index += 1
+        elif "=" in option and _valid_environment_name(option.split("=", 1)[0]):
+            name, value = option.split("=", 1)
+            runtime_environment[name] = value
+            index += 1
+        else:
+            index += 1
+    return subprocess.run(command, executable=executable, shell=False, cwd=plan.working_directory, env=runtime_environment, text=True, capture_output=True, check=False)
 
 
 def execute_approved_plan(plan: ExecutionPlan, approval_digest: str, *, runner: Callable[[ExecutionPlan, int], subprocess.CompletedProcess[str]] | None = None) -> tuple[subprocess.CompletedProcess[str] | None, str | None]:

@@ -17,6 +17,22 @@ class DiffEntry:
     source_kind: str
     commit_revision: str = ""
     index_stage: int | None = None
+    reviewed_path: str = ""
+    blob_path: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.reviewed_path:
+            object.__setattr__(
+                self,
+                "reviewed_path",
+                self.old_path if self.status.startswith("D") else self.new_path,
+            )
+        if not self.blob_path:
+            object.__setattr__(
+                self,
+                "blob_path",
+                self.old_path if self.status.startswith("D") else self.new_path,
+            )
 
 
 def _git(root: Path, arguments: list[str]) -> bytes:
@@ -33,6 +49,7 @@ def _name_status(
     source_kind: str,
     commit_revision: str = "",
     index_stage: int | None = None,
+    blob_side: str = "new",
 ) -> list[DiffEntry]:
     values = [item for item in _git(root, arguments).split(b"\0") if item]
     entries: list[DiffEntry] = []
@@ -54,6 +71,7 @@ def _name_status(
             source_kind=source_kind,
             commit_revision=commit_revision,
             index_stage=index_stage,
+            blob_path=(paths[0] if blob_side == "old" and status.startswith(("R", "C")) else old_path if status.startswith("D") else new_path),
         ))
     return entries
 
@@ -62,15 +80,68 @@ def changed_entries(root: Path, committed_range: str = "") -> list[DiffEntry]:
     entries: list[DiffEntry] = []
     if committed_range:
         base = committed_range.split("...", 1)[0]
-        entries.extend(_name_status(root, ["diff", "--name-status", "-z", "-M", "-C", "--find-copies-harder", committed_range], "commit", base))
-    entries.extend(_name_status(root, ["diff", "--cached", "--name-status", "-z", "-M", "-C", "--find-copies-harder"], "commit", "HEAD"))
-    entries.extend(_name_status(root, ["diff", "--name-status", "-z", "-M", "-C", "--find-copies-harder"], "index", index_stage=0))
+        ranged = _name_status(root, ["diff", "--name-status", "-z", "-M", "-C", "--find-copies-harder", committed_range], "commit", base, blob_side="new")
+        entries.extend(
+            item if item.status.startswith("D") else DiffEntry(
+                item.status, item.old_path, item.new_path, item.exists_in_worktree,
+                "commit", "HEAD", blob_path=item.new_path,
+            )
+            for item in ranged
+        )
+    cached = _name_status(root, ["diff", "--cached", "--name-status", "-z", "-M", "-C", "--find-copies-harder"], "commit", "HEAD", blob_side="old")
+    entries.extend(cached)
+    # The cached diff has both a committed side and an index side. Keep both
+    # records so a staged credential cannot disappear behind a different worktree.
+    entries.extend(
+        DiffEntry(
+            item.status, item.old_path, item.new_path, item.exists_in_worktree,
+            "index", index_stage=0, blob_path=item.new_path,
+        )
+        for item in cached
+        if not item.status.startswith("D")
+    )
+    unstaged = _name_status(root, ["diff", "--name-status", "-z", "-M", "-C", "--find-copies-harder"], "index", index_stage=0, blob_side="new")
+    entries.extend(unstaged)
+    # The index diff also has a worktree side. A deletion has no worktree blob.
+    entries.extend(
+        DiffEntry(item.status, item.old_path, item.new_path, item.exists_in_worktree, "working-tree", blob_path=item.new_path)
+        for item in unstaged
+        if item.exists_in_worktree and not item.status.startswith("D")
+    )
     for raw in [value for value in _git(root, ["ls-files", "-z", "--others", "--exclude-standard"]).split(b"\0") if value]:
         path = raw.decode("utf-8", errors="surrogateescape")
         entries.append(DiffEntry("A", path, path, (root / path).is_file(), "untracked"))
-    # Identical records from staged + worktree are redundant, but differently sourced
-    # records remain because their historical base can be different.
-    return sorted(set(entries), key=lambda item: (item.new_path, item.old_path, item.status, item.source_kind, item.commit_revision, item.index_stage or -1))
+    # A worktree-only change still needs the committed HEAD as independent evidence.
+    worktree_paths = {
+        item.new_path if not item.status.startswith("D") else item.old_path
+        for item in unstaged
+    }
+    deleted_worktree = {
+        item.old_path for item in unstaged if item.status.startswith("D")
+    }
+    cached_added = {item.new_path for item in cached if item.status.startswith("A")}
+    entries.extend(
+        DiffEntry("D" if path in deleted_worktree else "M", path, path, (root / path).is_file(), "commit", "HEAD", blob_path=path)
+        for path in worktree_paths
+        if path not in cached_added
+        and not any(
+            item.source_kind == "commit" and item.commit_revision == "HEAD"
+            and item.reviewed_path == path for item in entries
+        )
+    )
+    worktree_layer_paths = {
+        item.new_path for item in entries
+        if item.exists_in_worktree and not item.status.startswith("D")
+        and item.source_kind in {"working-tree", "untracked"}
+    }
+    entries.extend(
+        DiffEntry(item.status, item.old_path, item.new_path, True, "working-tree", blob_path=item.new_path)
+        for item in list(entries)
+        if item.exists_in_worktree and not item.status.startswith("D")
+        and item.new_path not in worktree_layer_paths
+        and item.source_kind not in {"working-tree", "untracked"}
+    )
+    return sorted(set(entries), key=lambda item: (item.new_path, item.old_path, item.status, item.source_kind, item.commit_revision, item.index_stage or -1, item.reviewed_path))
 
 
 def changed_paths(root: Path, committed_range: str = "") -> list[bytes]:
