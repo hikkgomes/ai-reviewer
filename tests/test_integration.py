@@ -14,6 +14,21 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def planned_digest(command: list[str], cwd: Path, key: str, item_name: str) -> str:
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
+    payload = json.loads(result.stdout)
+    item = next(value for value in payload[key] if value.get("tool") == item_name or value.get("name") == item_name)
+    return item["plan"]["approval_digest"]
+
+
 def load_installer():
     spec = importlib.util.spec_from_file_location("dissect_installer", ROOT / "scripts" / "install.py")
     module = importlib.util.module_from_spec(spec)
@@ -165,12 +180,21 @@ class IntegrationTests(unittest.TestCase):
                 installer.install_codex_skill(name, base)
                 installed = base / "skills" / name
                 installed_skills.append(installed)
+                scanner = installed / "scripts" / "scan_ai_gotchas.py"
+                plan = subprocess.run(
+                    [sys.executable, str(scanner), "--plan-self-review"],
+                    cwd=ROOT, text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(plan.returncode, 0, plan.stderr)
+                approval = json.loads(plan.stdout)["approval_digest"]
                 result = subprocess.run(
                     [
                         sys.executable,
-                        str(installed / "scripts" / "scan_ai_gotchas.py"),
+                        str(scanner),
                         "--format",
                         "json",
+                        "--approve-self-review",
+                        approval,
                         "--fail-on",
                         "high",
                     ],
@@ -188,22 +212,33 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(severe, [])
 
             checkout = base / "dissect-checkout"
-            shutil.copytree(
-                ROOT,
-                checkout,
-                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            subprocess.run(
+                ["git", "clone", "-q", "--no-hardlinks", str(ROOT), str(checkout)],
+                check=True,
             )
             rules = checkout / "scripts" / "dissect_checks" / "rules.py"
             expected_line = len(rules.read_text().splitlines()) + 2
             real = "sk_live_" + "ZYXWVUTSRQPONMLK987654321"
             with rules.open("a", encoding="utf-8") as handle:
                 handle.write(f"\nREAL_CREDENTIAL = '{real}'\n")
+            plan = subprocess.run(
+                [
+                    sys.executable,
+                    str(installed_skills[0] / "scripts" / "scan_ai_gotchas.py"),
+                    "--plan-self-review",
+                ],
+                cwd=checkout, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(plan.returncode, 0, plan.stderr)
+            approval = json.loads(plan.stdout)["approval_digest"]
             result = subprocess.run(
                 [
                     sys.executable,
                     str(installed_skills[0] / "scripts" / "scan_ai_gotchas.py"),
                     "--format",
                     "json",
+                    "--approve-self-review",
+                    approval,
                 ],
                 cwd=checkout,
                 text=True,
@@ -236,6 +271,8 @@ class IntegrationTests(unittest.TestCase):
                     str(installed_skills[1] / "scripts" / "scan_ai_gotchas.py"),
                     "--format",
                     "json",
+                    "--approve-self-review",
+                    approval,
                 ],
                 cwd=lookalike,
                 text=True,
@@ -314,7 +351,8 @@ class IntegrationTests(unittest.TestCase):
             tool = next(item for item in payload["tools"] if item["tool"] == "fixture-tool")
             self.assertFalse(tool["executed"])
             self.assertFalse(marker.exists())
-            self.assertIn("--allow-custom-tool fixture-tool=RESOLVED_PATH", tool["output"])
+            self.assertIsNotNone(tool["plan"])
+            self.assertIn("--approve-plan", tool["output"])
 
     def test_approved_tool_redacts_output_and_reports_finding_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -333,14 +371,18 @@ class IntegrationTests(unittest.TestCase):
                 }
             }
             (config_dir / "local.json").write_text(json.dumps(config))
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "tool_integrations.py"),
+                "--format",
+                "json",
+            ]
+            approval = planned_digest(command, root, "tools", "fixture-tool")
             result = subprocess.run(
                 [
-                    sys.executable,
-                    str(ROOT / "scripts" / "tool_integrations.py"),
-                    "--format",
-                    "json",
-                    "--allow-custom-tool",
-                    "fixture-tool=/bin/sh",
+                    *command,
+                    "--approve-plan",
+                    approval,
                 ],
                 cwd=root,
                 text=True,
@@ -357,7 +399,48 @@ class IntegrationTests(unittest.TestCase):
             self.assertFalse(raw_secret in result.stdout, "tool output leaked credential")
             self.assertIn("REDACTED", tool["output"])
 
-    def test_known_tool_approval_is_bound_to_executable_identity(self) -> None:
+    def test_repository_tool_plan_mutation_invalidates_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".ai-review").mkdir()
+            marker = root / "executed"
+            config_path = root / ".ai-review" / "local.json"
+            config_path.write_text(json.dumps({
+                "security_review": {
+                    "tool_commands": {
+                        "fixture": {"argv": ["/bin/sh", "-c", "exit 0"]},
+                    }
+                }
+            }))
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "tool_integrations.py"),
+                "--format", "json",
+            ]
+            approval = planned_digest(command, root, "tools", "fixture")
+            config_path.write_text(json.dumps({
+                "security_review": {
+                    "tool_commands": {
+                        "fixture": {
+                            "argv": ["/bin/sh", "-c", f"touch {marker}"],
+                        },
+                    }
+                }
+            }))
+            result = subprocess.run(
+                [*command, "--approve-plan", approval],
+                cwd=root, text=True, capture_output=True, check=False,
+            )
+            payload = json.loads(result.stdout)
+            tool = next(item for item in payload["tools"] if item["tool"] == "fixture")
+            self.assertFalse(tool["executed"])
+            self.assertFalse(marker.exists())
+            self.assertIn(
+                "Unknown or stale execution-plan approval digest.",
+                payload["approval_errors"],
+            )
+
+    def test_tool_label_and_path_basename_never_authorise_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             trusted_bin = base / "trusted-bin"
@@ -377,15 +460,13 @@ class IntegrationTests(unittest.TestCase):
                     }
                 }
             }))
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "tool_integrations.py"),
+                "--format", "json",
+            ]
             result = subprocess.run(
-                [
-                    sys.executable,
-                    str(ROOT / "scripts" / "tool_integrations.py"),
-                    "--format",
-                    "json",
-                    "--allow-tool",
-                    "gitleaks",
-                ],
+                command,
                 cwd=root,
                 text=True,
                 capture_output=True,
@@ -394,14 +475,14 @@ class IntegrationTests(unittest.TestCase):
             )
             payload = json.loads(result.stdout)
             tool = next(item for item in payload["tools"] if item["tool"] == "gitleaks")
-            self.assertTrue(tool["approved"])
-            self.assertTrue(tool["executed"])
-            self.assertEqual(Path(tool["resolved_executable"]), executable.resolve())
+            self.assertFalse(tool["approved"])
+            self.assertFalse(tool["executed"])
+            self.assertEqual(Path(tool["plan"]["executable_path"]), executable.resolve())
+            self.assertFalse((root / "executed").exists())
             self.assertNotIn(secret, result.stdout)
-            self.assertNotIn("tool-output-secret", result.stdout)
             self.assertIn("REDACTED", result.stdout)
 
-    def test_known_tool_label_cannot_authorise_shell_symlink_or_renamed_runner(self) -> None:
+    def test_one_exact_tool_plan_cannot_authorise_other_executable_identities(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             root = base / "target"
@@ -416,6 +497,19 @@ class IntegrationTests(unittest.TestCase):
             renamed.chmod(0o755)
             candidates.append(renamed)
             marker = root / "executed"
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "tool_integrations.py"),
+                "--format", "json",
+            ]
+            (root / ".ai-review" / "local.json").write_text(json.dumps({
+                "security_review": {
+                    "tool_commands": {
+                        "gitleaks": {"argv": ["/usr/bin/true"]},
+                    }
+                }
+            }))
+            first_approval = planned_digest(command, root, "tools", "gitleaks")
             for candidate in candidates:
                 with self.subTest(candidate=str(candidate)):
                     (root / ".ai-review" / "local.json").write_text(json.dumps({
@@ -428,14 +522,7 @@ class IntegrationTests(unittest.TestCase):
                         }
                     }))
                     result = subprocess.run(
-                        [
-                            sys.executable,
-                            str(ROOT / "scripts" / "tool_integrations.py"),
-                            "--format",
-                            "json",
-                            "--allow-tool",
-                            "gitleaks",
-                        ],
+                        [*command, "--approve-plan", first_approval],
                         cwd=root,
                         text=True,
                         capture_output=True,
@@ -448,7 +535,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertFalse(tool["approved"])
                     self.assertFalse(tool["executed"])
                     self.assertFalse(marker.exists())
-                    self.assertIn("identity", tool["output"].lower())
+                    self.assertTrue(json.loads(result.stdout)["approval_errors"])
 
     def test_review_script_does_not_run_repository_commands_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -475,7 +562,7 @@ class IntegrationTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(marker.exists())
-            self.assertIn("were not executed", result.stdout)
+            self.assertIn("Planned but not executed", result.stdout)
 
     def test_approved_review_command_output_and_plan_are_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -489,15 +576,20 @@ class IntegrationTests(unittest.TestCase):
                     "build": f"printf 'password={secret}'",
                 },
             }))
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "review_commands.py"),
+                "--scope", "full", "--format", "json",
+            ]
+            approval = planned_digest(command, root, "commands", "full:root:test")
             result = subprocess.run(
-                ["bash", str(ROOT / "scripts" / "review.sh")],
+                [*command, "--approve-plan", approval],
                 cwd=root,
                 text=True,
                 capture_output=True,
                 check=False,
                 env={
                     **os.environ,
-                    "AI_REVIEW_ALLOWED_COMMANDS": "test",
                     "PATH": (
                         f"{Path(shutil.which('python3.11') or sys.executable).parent}:"
                         f"{os.environ.get('PATH', '')}"
@@ -510,7 +602,39 @@ class IntegrationTests(unittest.TestCase):
                 "review command output leaked credential",
             )
             self.assertIn("REDACTED", result.stdout)
-            self.assertIn("[not approved] build", result.stdout)
+            payload = json.loads(result.stdout)
+            build = next(item for item in payload["commands"] if item["name"] == "full:root:build")
+            self.assertFalse(build["executed"])
+
+    def test_review_command_approval_cannot_cross_categories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".ai-review").mkdir()
+            test_marker = root / "test-executed"
+            build_marker = root / "build-executed"
+            (root / ".ai-review" / "local.json").write_text(json.dumps({
+                "commands": {
+                    "test": f"touch {test_marker}",
+                    "build": f"touch {build_marker}",
+                },
+            }))
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "review_commands.py"),
+                "--scope", "full", "--format", "json",
+            ]
+            approval = planned_digest(command, root, "commands", "full:root:test")
+            result = subprocess.run(
+                [*command, "--approve-plan", approval],
+                cwd=root, text=True, capture_output=True, check=False,
+            )
+            payload = json.loads(result.stdout)
+            test = next(item for item in payload["commands"] if item["name"] == "full:root:test")
+            build = next(item for item in payload["commands"] if item["name"] == "full:root:build")
+            self.assertTrue(test["executed"])
+            self.assertFalse(build["executed"])
+            self.assertTrue(test_marker.exists())
+            self.assertFalse(build_marker.exists())
 
 
 if __name__ == "__main__":

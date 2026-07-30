@@ -1,302 +1,251 @@
 #!/usr/bin/env python3
-"""Run explicitly configured local review tools and report every decision."""
+"""Plan or execute repository-configured tools through exact-plan approval."""
 from __future__ import annotations
 
 import argparse
-from functools import lru_cache
-import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 
 if sys.version_info < (3, 11):
     raise SystemExit("Dissect requires Python 3.11 or newer.")
 
-from dissect_checks.redaction import redact_argv, redact_sensitive_text
-
-
-KNOWN_TOOL_EXECUTABLES = {
-    "gitleaks": frozenset({"gitleaks"}),
-    "trufflehog": frozenset({"trufflehog"}),
-    "semgrep": frozenset({"semgrep"}),
-    "trivy": frozenset({"trivy"}),
-    "pip-audit": frozenset({"pip-audit"}),
-}
-KNOWN_TOOLS = tuple(KNOWN_TOOL_EXECUTABLES)
-SHELL_AND_RUNNER_BASENAMES = frozenset({
-    "bash", "bun", "cargo", "cmd", "cmd.exe", "deno", "env", "node", "npm",
-    "npx", "perl", "php", "pnpm", "powershell", "pwsh", "python", "python3",
-    "ruby", "sh", "yarn", "zsh",
-})
-RUNNER_FINGERPRINT_CANDIDATES = (
-    "sh", "bash", "zsh", "python", "python3", "node", "env",
+from dissect_checks.execution_plan import (
+    ExecutionPlan,
+    build_execution_plan,
+    execute_approved_plan,
+    valid_approval_digest,
 )
+from dissect_checks.redaction import redact_sensitive_text
+
+
+KNOWN_TOOLS = ("gitleaks", "trufflehog", "semgrep", "trivy", "pip-audit")
 
 
 def load_config() -> dict:
     try:
-        return json.loads((Path.cwd() / ".ai-review" / "local.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (Path.cwd() / ".ai-review" / "local.json").read_text(encoding="utf-8")
+        )
     except (OSError, ValueError):
         return {}
 
 
-def _basename(path: Path) -> str:
-    name = path.name.lower()
-    return name[:-4] if name.endswith(".exe") else name
+def _configured_tools(config: dict) -> dict:
+    configured = (config.get("security_review") or {}).get("tool_commands") or {}
+    return configured if isinstance(configured, dict) else {}
 
 
-def _resolve_executable(value: str) -> Path | None:
-    detected = shutil.which(value)
-    if not detected:
-        return None
-    try:
-        return Path(detected).resolve(strict=True)
-    except OSError:
-        return None
-
-
-def _executable_fingerprint(path: Path) -> str | None:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
-        return None
-    return digest.hexdigest()
-
-
-@lru_cache(maxsize=1)
-def _runner_fingerprints() -> frozenset[str]:
-    fingerprints = set()
-    for name in RUNNER_FINGERPRINT_CANDIDATES:
-        resolved = _resolve_executable(name)
-        if resolved:
-            fingerprint = _executable_fingerprint(resolved)
-            if fingerprint:
-                fingerprints.add(fingerprint)
-    return frozenset(fingerprints)
-
-
-def _known_identity_error(name: str, configured: str, resolved: Path | None) -> str | None:
-    if name not in KNOWN_TOOL_EXECUTABLES:
-        return "Custom executable requires --allow-custom-tool NAME=RESOLVED_PATH."
-    configured_name = _basename(Path(configured))
-    resolved_name = _basename(resolved) if resolved else ""
-    allowed = KNOWN_TOOL_EXECUTABLES[name]
-    if configured_name not in allowed or resolved_name not in allowed:
-        return (
-            f"Configured executable identity does not match known tool {name!r}; "
-            "shells, generic runners, symlinks to another executable, and renamed commands "
-            "are not accepted."
+def _parse_tool(
+    name: str,
+    raw_config: object,
+) -> tuple[list[str], set[int], str | None]:
+    if raw_config is None:
+        return [], set(), None
+    if not isinstance(raw_config, dict):
+        return [], set(), (
+            "use an object with a non-empty string argv array; "
+            "shell command strings are rejected"
         )
-    if configured_name in SHELL_AND_RUNNER_BASENAMES or resolved_name in SHELL_AND_RUNNER_BASENAMES:
-        return "Shell interpreters and generic command runners are not accepted as known tools."
-    if resolved and _executable_fingerprint(resolved) in _runner_fingerprints():
-        return (
-            "Configured executable is byte-identical to a shell interpreter or generic runner; "
-            "renaming or copying a runner does not establish a known-tool identity."
-        )
-    if resolved:
-        try:
-            resolved.relative_to(Path.cwd().resolve())
-        except ValueError:
-            pass
-        else:
-            return (
-                "Repository-local executables cannot establish a known-tool identity; "
-                "use a separately installed tool or an exact custom-tool approval."
-            )
-    return None
+    raw_argv = raw_config.get("argv")
+    if not (
+        isinstance(raw_argv, list)
+        and raw_argv
+        and all(isinstance(value, str) and value for value in raw_argv)
+    ):
+        return [], set(), "execution plan requires a non-empty string argv array"
+    finding_exit_codes = {
+        int(code)
+        for code in raw_config.get("finding_exit_codes", [])
+        if isinstance(code, int) or (isinstance(code, str) and code.isdigit())
+    }
+    return list(raw_argv), finding_exit_codes, None
 
 
-def _custom_approvals(values: list[str]) -> dict[str, Path]:
-    approvals = {}
-    for value in values:
-        name, separator, executable = value.partition("=")
-        if not separator or not name or not executable:
+def build_tool_plans(config: dict) -> tuple[dict[str, ExecutionPlan], dict[str, str]]:
+    plans = {}
+    errors = {}
+    for name, raw_config in _configured_tools(config).items():
+        argv, finding_exit_codes, parse_error = _parse_tool(str(name), raw_config)
+        if parse_error:
+            errors[str(name)] = parse_error
             continue
-        resolved = _resolve_executable(executable)
-        if resolved:
-            approvals[name] = resolved
-    return approvals
+        plan, plan_error = build_execution_plan(
+            kind="tool",
+            name=str(name),
+            argv=argv,
+            working_directory=Path.cwd(),
+            finding_exit_codes=finding_exit_codes,
+        )
+        if plan_error:
+            errors[str(name)] = plan_error
+        elif plan:
+            plans[str(name)] = plan
+    return plans, errors
+
+
+def _base_result(
+    name: str,
+    *,
+    configured: bool,
+    detected: bool,
+) -> dict:
+    return {
+        "tool": redact_sensitive_text(name),
+        "detected": detected,
+        "configured": configured,
+        "plan": None,
+        "approved": False,
+        "executed": False,
+        "execution_completed": False,
+        "exit_code": None,
+        "complete": False,
+        "passed": None,
+        "findings_produced": None,
+        "coverage_complete": None,
+        "output": "",
+    }
+
+
+def _execute_current_plan(
+    name: str,
+    approval: str,
+) -> tuple[ExecutionPlan | None, object | None, str | None]:
+    # Reload repository configuration and rebuild every execution-affecting field.
+    current_plans, current_errors = build_tool_plans(load_config())
+    if name in current_errors:
+        return None, None, current_errors[name]
+    plan = current_plans.get(name)
+    if plan is None:
+        return None, None, "approved tool plan no longer exists"
+    completed, execution_error = execute_approved_plan(plan, approval)
+    return plan, completed, execution_error
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument(
-        "--allow-tool",
+        "--approve-plan",
         action="append",
         default=[],
-        metavar="NAME",
-        help="Explicitly allow one named trusted local tool; repeat for multiple tools.",
-    )
-    parser.add_argument(
-        "--allow-custom-tool",
-        action="append",
-        default=[],
-        metavar="NAME=RESOLVED_PATH",
-        help=(
-            "Explicitly allow one custom tool bound to its executable identity; "
-            "repeat for multiple tools."
-        ),
+        metavar="SHA256",
+        help="Execute only a currently configured plan with this exact approval digest.",
     )
     args = parser.parse_args()
-    allowed_known = set(args.allow_tool)
-    allowed_custom = _custom_approvals(args.allow_custom_tool)
-    config = load_config()
-    configured = (config.get("security_review") or {}).get("tool_commands") or {}
-    results = []
+    approvals = set(args.approve_plan)
+    approvals.update(
+        value.strip()
+        for value in os.environ.get("AI_REVIEW_APPROVED_PLANS", "").split(",")
+        if value.strip()
+    )
+    malformed = sorted(value for value in approvals if not valid_approval_digest(value))
 
-    for name in sorted(set(KNOWN_TOOLS) | set(configured)):
-        raw_config = configured.get(name)
-        if isinstance(raw_config, dict):
-            raw_argv = raw_config.get("argv")
-            execution_argv = (
-                [str(value) for value in raw_argv]
-                if isinstance(raw_argv, list) and raw_argv
-                and all(isinstance(value, str) and value for value in raw_argv)
-                else []
+    config = load_config()
+    configured = _configured_tools(config)
+    plans, plan_errors = build_tool_plans(config)
+    known_or_configured = sorted(set(KNOWN_TOOLS) | set(configured))
+    results = []
+    matched_approvals = set()
+
+    for name in known_or_configured:
+        configured_entry = name in configured
+        plan = plans.get(name)
+        detected = bool(
+            plan
+            or (
+                not configured_entry
+                and shutil.which(name)
             )
-            finding_exit_codes = {
-                int(code) for code in raw_config.get("finding_exit_codes", [])
-                if isinstance(code, int) or (isinstance(code, str) and code.isdigit())
-            }
-        else:
-            execution_argv = []
-            finding_exit_codes = set()
-        configured_entry = raw_config is not None
-        display_name = redact_sensitive_text(name)
-        executable = execution_argv[0] if execution_argv else name.split()[0]
-        resolved_executable = _resolve_executable(executable) if executable else None
-        detected = resolved_executable is not None
-        identity_error = (
-            _known_identity_error(name, executable, resolved_executable)
-            if execution_argv and name in KNOWN_TOOL_EXECUTABLES
-            else None
         )
-        custom_approved = (
-            name in allowed_custom
-            and resolved_executable is not None
-            and allowed_custom[name] == resolved_executable
+        result = _base_result(
+            name,
+            configured=configured_entry,
+            detected=detected,
         )
-        approved = (
-            name in KNOWN_TOOL_EXECUTABLES
-            and name in allowed_known
-            and identity_error is None
-        ) or (
-            name not in KNOWN_TOOL_EXECUTABLES
-            and custom_approved
-        )
-        displayed_argv = (
-            [str(resolved_executable), *execution_argv[1:]]
-            if resolved_executable and execution_argv
-            else execution_argv
-        )
-        result = {
-            "tool": display_name,
-            "detected": detected,
-            "configured": configured_entry,
-            "argv": redact_argv(displayed_argv),
-            "resolved_executable": (
-                redact_sensitive_text(str(resolved_executable))
-                if resolved_executable else None
-            ),
-            "approved": approved,
-            "executed": False,
-            "execution_completed": False,
-            "exit_code": None,
-            "complete": False,
-            "passed": None,
-            "findings_produced": None,
-            "coverage_complete": None,
-            "output": "",
-        }
-        if configured_entry and not execution_argv:
-            result["output"] = (
-                "Configured check was not run: use an object with a non-empty string argv array; "
-                "shell command strings are rejected."
+        if plan:
+            result["plan"] = plan.redacted_payload()
+        if name in plan_errors:
+            result["output"] = f"Configured check was not run: {plan_errors[name]}."
+        elif plan and plan.approval_digest in approvals:
+            matched_approvals.add(plan.approval_digest)
+            current_plan, completed, execution_error = _execute_current_plan(
+                name,
+                plan.approval_digest,
             )
-        elif execution_argv and identity_error:
-            result["output"] = f"Configured check was not run: {identity_error}"
-        elif execution_argv and not approved:
-            result["output"] = (
-                "Configured check was not run: review the complete argv and resolved executable, "
-                + (
-                    f"then pass --allow-tool {display_name} from a trusted local invocation."
-                    if name in KNOWN_TOOL_EXECUTABLES
-                    else (
-                        "then pass --allow-custom-tool "
-                        f"{display_name}=RESOLVED_PATH from a trusted local invocation."
-                    )
+            if current_plan:
+                result["plan"] = current_plan.redacted_payload()
+            if execution_error:
+                result["output"] = (
+                    f"Configured check was not run: {redact_sensitive_text(execution_error)}."
                 )
-            )
-        elif execution_argv:
-            if not detected:
-                result["output"] = "Configured check was not run because the tool was not detected."
-            else:
-                execution_plan = [
-                    str(resolved_executable),
-                    *execution_argv[1:],
-                ]
-                completed = subprocess.run(
-                    execution_plan,
-                    shell=False,
-                    cwd=Path.cwd(),
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
+            elif completed is not None and current_plan is not None:
+                finding_codes = set(current_plan.finding_exit_codes)
                 result.update({
+                    "approved": True,
                     "executed": True,
                     "execution_completed": True,
                     "exit_code": completed.returncode,
                     "complete": True,
                     "passed": completed.returncode == 0,
                     "findings_produced": (
-                        completed.returncode in finding_exit_codes
-                        if finding_exit_codes
+                        completed.returncode in finding_codes
+                        if finding_codes
                         else (False if completed.returncode == 0 else None)
                     ),
                     "coverage_complete": (
                         completed.returncode == 0
-                        or completed.returncode in finding_exit_codes
+                        or completed.returncode in finding_codes
                     ),
                     "output": redact_sensitive_text(
                         (completed.stdout + completed.stderr).strip()
                     )[-4000:],
                 })
+        elif plan:
+            result["output"] = (
+                "Planned but not executed. Review the redacted canonical plan, then pass "
+                f"--approve-plan {plan.approval_digest} from a trusted local invocation."
+            )
         elif detected:
             result["output"] = (
-                "Detected but not executed; configure a trusted argv entry and invoke "
-                "--allow-tool NAME explicitly."
+                "Detected but not executed; configure an argv array to generate a reviewable plan."
             )
         results.append(result)
 
+    approval_errors = [
+        "Malformed execution-plan approval digest."
+        for _value in malformed
+    ]
+    approval_errors.extend(
+        "Unknown or stale execution-plan approval digest."
+        for _value in sorted(approvals - matched_approvals - set(malformed))
+    )
+
     if args.format == "json":
-        print(json.dumps({"tools": results}, indent=2, sort_keys=True))
+        print(json.dumps(
+            {"tools": results, "approval_errors": approval_errors},
+            indent=2,
+            sort_keys=True,
+        ))
     else:
         for result in results:
             if not result["detected"] and not result["configured"]:
                 continue
             print(
                 f"[tool] {result['tool']}: detected={str(result['detected']).lower()} "
-                f"configured={str(result['configured']).lower()} approved={str(result['approved']).lower()} "
+                f"configured={str(result['configured']).lower()} "
+                f"approved={str(result['approved']).lower()} "
                 f"executed={str(result['executed']).lower()} "
-                f"exit={result['exit_code'] if result['exit_code'] is not None else 'n/a'} "
-                f"execution_completed={str(result['execution_completed']).lower()} "
-                f"passed={result['passed']} findings={result['findings_produced']} "
-                f"coverage_complete={result['coverage_complete']}"
+                f"exit={result['exit_code'] if result['exit_code'] is not None else 'n/a'}"
             )
-            if result["argv"]:
-                print(f"  argv: {json.dumps(result['argv'])}")
-            if result["resolved_executable"]:
-                print(f"  resolved executable: {result['resolved_executable']}")
+            if result["plan"]:
+                print(f"  plan: {json.dumps(result['plan'], sort_keys=True)}")
             if result["output"]:
                 print(f"  output: {result['output']}")
+        for error in approval_errors:
+            print(f"[approval rejected] {error}")
     return 0
 
 

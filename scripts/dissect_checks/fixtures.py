@@ -3,16 +3,12 @@ from __future__ import annotations
 import ast
 from functools import lru_cache
 import hashlib
+import json
 from pathlib import Path
 
 
-_MANIFEST_VERSION = 1
-_PROJECT_ANCHORS = (
-    "LICENSE",
-    "config/rules.yaml",
-    "reference/check-families.md",
-    "reference/taxonomy-ai.md",
-)
+_MANIFEST_VERSION = 2
+_SELF_REVIEW_DOMAIN = b"dissect-trusted-self-review-v2\0"
 _STRUCTURED_RULE_PATH = "scripts/dissect_checks/rules.py"
 _LEGACY_RULE_PATH = "scripts/dissect_checks/legacy.py"
 _FIXTURE_REGISTRY_PATH = "scripts/dissect_checks/fixtures.py"
@@ -34,54 +30,122 @@ def _skill_root() -> Path:
 def _trusted_fixture_manifest() -> dict:
     """Build the versioned fixture manifest from the executing skill copy."""
     root = _skill_root()
-    anchors = {}
-    for path in _PROJECT_ANCHORS:
-        try:
-            anchors[path] = _sha256((root / path).read_bytes())
-        except OSError:
-            return {}
-
     fixture_paths = {
         _STRUCTURED_RULE_PATH,
         _LEGACY_RULE_PATH,
         _FIXTURE_REGISTRY_PATH,
         *(
             path.relative_to(root).as_posix()
-            for path in (root / "tests").glob("*.py")
+            for path in (root / "tests").rglob("*.py")
             if path.is_file()
         ),
     }
     fixtures = {}
     for path in sorted(fixture_paths):
         try:
-            tree = ast.parse((root / path).read_text(encoding="utf-8"))
+            raw = (root / path).read_bytes()
+            tree = ast.parse(raw.decode("utf-8"))
         except (OSError, SyntaxError):
             continue
-        digests = {
+        node_digests = {
             _sha256(ast.dump(node, include_attributes=False).encode("utf-8"))
             for node in _fixture_nodes(path, tree)
         }
-        if digests:
-            fixtures[path] = frozenset(digests)
+        if node_digests:
+            fixtures[path] = {
+                "file_sha256": _sha256(raw),
+                "ast_sha256": _sha256(
+                    ast.dump(tree, include_attributes=False).encode("utf-8")
+                ),
+                "node_digests": frozenset(node_digests),
+            }
     return {
         "version": _MANIFEST_VERSION,
-        "anchors": anchors,
         "fixtures": fixtures,
     }
 
 
-def is_owned_dissect_root(root: Path) -> bool:
-    """Authenticate a checkout against the executing skill's trusted anchors."""
+def _manifest_digest(manifest: dict) -> str:
+    serializable = {
+        "version": manifest.get("version"),
+        "fixtures": {
+            path: {
+                "file_sha256": values["file_sha256"],
+                "ast_sha256": values["ast_sha256"],
+                "node_digests": sorted(values["node_digests"]),
+            }
+            for path, values in sorted((manifest.get("fixtures") or {}).items())
+        },
+    }
+    encoded = json.dumps(
+        serializable,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return _sha256(encoded)
+
+
+def _checkout_identity(root: Path) -> dict | None:
+    try:
+        resolved_root = root.resolve(strict=True)
+        git_marker = resolved_root / ".git"
+        marker_stat = git_marker.stat()
+        root_stat = resolved_root.stat()
+    except OSError:
+        return None
+    return {
+        "root": str(resolved_root),
+        "root_device": root_stat.st_dev,
+        "root_inode": root_stat.st_ino,
+        "git_marker_device": marker_stat.st_dev,
+        "git_marker_inode": marker_stat.st_ino,
+        "git_marker_kind": "directory" if git_marker.is_dir() else "file",
+    }
+
+
+def trusted_self_review_plan(root: Path) -> dict | None:
+    """Bind explicit self-review approval to this checkout and fixture file state."""
     manifest = _trusted_fixture_manifest()
     if manifest.get("version") != _MANIFEST_VERSION:
-        return False
+        return None
+    identity = _checkout_identity(root)
+    if identity is None:
+        return None
+    target_files = {}
     try:
-        return all(
-            _sha256((root / path).read_bytes()) == digest
-            for path, digest in manifest["anchors"].items()
-        )
-    except (KeyError, OSError):
-        return False
+        for path in manifest["fixtures"]:
+            target_files[path] = _sha256((root / path).read_bytes())
+    except OSError:
+        return None
+    return {
+        "schema_version": _MANIFEST_VERSION,
+        "manifest_sha256": _manifest_digest(manifest),
+        "checkout": identity,
+        "target_fixture_files": target_files,
+    }
+
+
+def trusted_self_review_digest(root: Path) -> str | None:
+    plan = trusted_self_review_plan(root)
+    if plan is None:
+        return None
+    encoded = json.dumps(
+        plan,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(_SELF_REVIEW_DOMAIN + encoded).hexdigest()
+
+
+def is_trusted_self_review(root: Path, approval_digest: str) -> bool:
+    expected = trusted_self_review_digest(root)
+    return bool(
+        expected
+        and len(approval_digest) == 64
+        and approval_digest == expected
+    )
 
 
 def _call_name(node: ast.Call) -> str:
@@ -130,13 +194,19 @@ def _character_offset(lines: list[str], line: int, byte_column: int) -> int:
     )
 
 
-def mask_owned_fixture_spans(root: Path, path: str, text: str) -> str:
+def mask_owned_fixture_spans(
+    root: Path,
+    path: str,
+    text: str,
+    approval_digest: str = "",
+) -> str:
     """Blank only AST-proven fixture literals owned by Dissect itself."""
-    if not is_owned_dissect_root(root):
+    if not is_trusted_self_review(root, approval_digest):
         return text
-    allowed_digests = _trusted_fixture_manifest().get("fixtures", {}).get(path)
-    if not allowed_digests:
+    fixture_entry = _trusted_fixture_manifest().get("fixtures", {}).get(path)
+    if not fixture_entry:
         return text
+    allowed_digests = fixture_entry["node_digests"]
     try:
         tree = ast.parse(text)
     except SyntaxError:

@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 import fnmatch
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 
-from .fixtures import is_owned_dissect_root, mask_owned_fixture_spans
+from .fixtures import is_trusted_self_review, mask_owned_fixture_spans
 from .legacy import scan_legacy
 from .model import Finding, HistoricalSource
 from .python_dependencies import (
@@ -58,6 +59,7 @@ class ScanOptions:
     ignore: tuple[str, ...] = ()
     generated_paths: tuple[str, ...] = ()
     python_import_aliases: tuple[tuple[str, str], ...] = ()
+    self_review_approval: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,7 +93,13 @@ def _configured(root: Path) -> dict:
         return {}
 
 
-def options_from_environment(root: Path, *, include_generated: bool = False, include_history: bool = False) -> ScanOptions:
+def options_from_environment(
+    root: Path,
+    *,
+    include_generated: bool = False,
+    include_history: bool = False,
+    self_review_approval: str = "",
+) -> ScanOptions:
     config = _configured(root)
     paths = config.get("paths") or {}
     security = config.get("security_review") or {}
@@ -99,7 +107,11 @@ def options_from_environment(root: Path, *, include_generated: bool = False, inc
     source = os.environ.get("AI_REVIEW_FILE_LIST", "").strip()
     if source:
         try:
-            file_list = Path(source).read_text(encoding="utf-8").splitlines()
+            file_list = [
+                value.decode("utf-8", errors="surrogateescape")
+                for value in Path(source).read_bytes().split(b"\0")
+                if value
+            ]
         except OSError:
             file_list = []
     try:
@@ -111,7 +123,7 @@ def options_from_environment(root: Path, *, include_generated: bool = False, inc
         include_generated=include_generated or bool(security.get("scan_generated_bundles")),
         include_history=include_history or bool(security.get("scan_git_history")),
         history_depth=history_depth,
-        file_list=tuple(_normalise(item) for item in file_list if item.strip()),
+        file_list=tuple(_normalise(item) for item in file_list if item),
         ignore=tuple(_normalise(item) for item in paths.get("ignore", [])),
         generated_paths=tuple(dict.fromkeys(
             _normalise(item)
@@ -121,6 +133,7 @@ def options_from_environment(root: Path, *, include_generated: bool = False, inc
             (str(module), str(distribution))
             for module, distribution in (security.get("python_import_aliases") or {}).items()
         ),
+        self_review_approval=self_review_approval,
     )
 
 
@@ -133,7 +146,10 @@ def _matches_prefix_or_glob(rel: str, patterns: tuple[str, ...]) -> bool:
 
 
 def _ignored(rel: str, options: ScanOptions) -> bool:
-    if is_owned_dissect_root(options.root) and rel in DISSECT_FIXTURE_EXCLUSIONS:
+    if (
+        is_trusted_self_review(options.root, options.self_review_approval)
+        and rel in DISSECT_FIXTURE_EXCLUSIONS
+    ):
         return True
     parts = Path(rel).parts
     for part in parts:
@@ -178,7 +194,59 @@ def scan_text(path: str, text: str, source: str = "working-tree") -> list[Findin
     for rule in RULES:
         findings.extend(rule.scan(path, text, source))
     findings.extend(scan_legacy(path, text, source))
-    return findings
+    lines = text.splitlines()
+    ordinals: dict[tuple[str, str, str], int] = {}
+    annotated = []
+    for finding in findings:
+        index = max(0, min(len(lines) - 1, finding.line - 1)) if lines else 0
+        current = lines[index].strip() if lines else ""
+        after = [
+            value.strip()
+            for value in lines[index + 1:index + 5]
+            if value.strip()
+        ][:2]
+        symbol = ""
+        for candidate in reversed(lines[:index + 1]):
+            stripped = candidate.strip()
+            if re.match(
+                r"(?:async\s+)?(?:def|class|function)\s+[\w$]+|"
+                r"(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\(",
+                stripped,
+            ):
+                symbol = stripped
+                break
+        context_payload = json.dumps(
+            {
+                "symbol": symbol,
+                "current": current,
+                "after": after,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        context_fingerprint = hashlib.sha256(
+            context_payload.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:16]
+        base = (
+            finding.check_id,
+            finding.match_fingerprint,
+            context_fingerprint,
+        )
+        ordinal = ordinals.get(base, 0)
+        ordinals[base] = ordinal + 1
+        occurrence_id = hashlib.sha256(
+            "\0".join((*base, str(ordinal))).encode(
+                "utf-8",
+                errors="surrogatepass",
+            )
+        ).hexdigest()[:20]
+        annotated.append(replace(
+            finding,
+            context_fingerprint=context_fingerprint,
+            occurrence_id=occurrence_id,
+        ))
+    return annotated
 
 
 def _scan_owned_text(
@@ -188,7 +256,12 @@ def _scan_owned_text(
     text: str,
     source: str,
 ) -> list[Finding]:
-    masked = mask_owned_fixture_spans(options.root, original_path, text)
+    masked = mask_owned_fixture_spans(
+        options.root,
+        original_path,
+        text,
+        options.self_review_approval,
+    )
     return scan_text(reviewed_path, masked, source)
 
 
@@ -453,7 +526,16 @@ def _scan_history(options: ScanOptions) -> tuple[list[Finding], list[str]]:
                 findings.append(replace(
                     finding,
                     historical_sources=(
-                        HistoricalSource(source, original_path, finding.line),
+                        HistoricalSource(
+                            source=source,
+                            path=original_path,
+                            line=finding.line,
+                            commit=revision,
+                            provenance_type=provenance.split(":", 1)[0],
+                            match_fingerprint=finding.match_fingerprint,
+                            context_fingerprint=finding.context_fingerprint,
+                            occurrence_id=finding.occurrence_id,
+                        ),
                     ),
                 ))
     return findings, errors
@@ -648,47 +730,97 @@ def _lockfile_findings(options: ScanOptions, files: list[str], manifests: dict[P
 
 
 def _aggregate_findings(findings: list[Finding]) -> tuple[Finding, ...]:
-    """Prefer current evidence while retaining every historical provenance record."""
-    groups: dict[tuple, dict[str, list[Finding]]] = {}
+    """Correlate only stable, unambiguous occurrences and retain all provenance."""
+    current_by_occurrence: dict[tuple, list[Finding]] = {}
+    history_by_occurrence: dict[tuple, list[Finding]] = {}
+    current_by_context: dict[tuple, set[str]] = {}
+    history_by_context: dict[tuple, set[str]] = {}
+
     for item in findings:
-        identity = (
+        occurrence = (
             item.check_id,
-            item.category,
-            item.severity,
-            item.confidence,
             item.path,
+            item.match_fingerprint,
+            item.context_fingerprint,
+            item.occurrence_id,
             item.evidence,
-            item.explanation,
-            item.remediation,
-            item.disposition,
         )
-        bucket = groups.setdefault(identity, {"working": [], "history": []})
-        bucket["working" if item.source == "working-tree" else "history"].append(item)
+        context = (
+            item.check_id,
+            item.path,
+            item.match_fingerprint,
+            item.context_fingerprint,
+            item.evidence,
+        )
+        if item.source == "working-tree":
+            current_by_occurrence.setdefault(occurrence, []).append(item)
+            current_by_context.setdefault(context, set()).add(item.occurrence_id)
+        else:
+            history_by_occurrence.setdefault(occurrence, []).append(item)
+            history_by_context.setdefault(context, set()).add(item.occurrence_id)
 
     aggregated = []
-    for bucket in groups.values():
+    consumed_history = set()
+    for occurrence, current_items in current_by_occurrence.items():
+        context = (
+            occurrence[0],
+            occurrence[1],
+            occurrence[2],
+            occurrence[3],
+            occurrence[5],
+        )
+        historical_items = history_by_occurrence.get(occurrence, [])
+        unambiguous = (
+            len(current_by_context.get(context, ())) == 1
+            and len(history_by_context.get(context, ())) == 1
+        )
         provenance = {}
-        for item in bucket["history"]:
+        for item in historical_items if unambiguous else ():
             sources = item.historical_sources or (
                 HistoricalSource(item.source, item.path, item.line),
             )
             for source in sources:
-                provenance[(source.source, source.path, source.line)] = source
+                provenance[
+                    (
+                        source.source,
+                        source.path,
+                        source.line,
+                        source.occurrence_id,
+                    )
+                ] = source
         historical_sources = tuple(provenance.values())
+        current = {
+            (item.line, item.source, item.occurrence_id): item
+            for item in current_items
+        }
+        aggregated.extend(
+            replace(item, historical_sources=historical_sources)
+            for item in current.values()
+        )
+        if historical_items and unambiguous:
+            consumed_history.add(occurrence)
 
-        if bucket["working"]:
-            current = {}
-            for item in bucket["working"]:
-                current[(item.line, item.source)] = item
-            aggregated.extend(
-                replace(item, historical_sources=historical_sources)
-                for item in current.values()
+    for occurrence, historical_items in history_by_occurrence.items():
+        if occurrence in consumed_history:
+            continue
+        provenance = {}
+        for item in historical_items:
+            sources = item.historical_sources or (
+                HistoricalSource(item.source, item.path, item.line),
             )
-        elif bucket["history"]:
-            aggregated.append(replace(
-                bucket["history"][0],
-                historical_sources=historical_sources,
-            ))
+            for source in sources:
+                provenance[
+                    (
+                        source.source,
+                        source.path,
+                        source.line,
+                        source.occurrence_id,
+                    )
+                ] = source
+        aggregated.append(replace(
+            historical_items[0],
+            historical_sources=tuple(provenance.values()),
+        ))
 
     return tuple(sorted(
         aggregated,

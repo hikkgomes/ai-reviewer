@@ -146,33 +146,38 @@ Generated bundles and recent Git history are disabled by default:
 
 Installed tools are detected but never execute from repository configuration
 alone. Tool entries must use argument arrays (shell command strings are
-rejected), and a trusted local caller must approve execution explicitly:
+rejected). First generate and inspect the redacted canonical plan:
 
 ```bash
-python3 scripts/tool_integrations.py --allow-tool gitleaks
+python3 scripts/tool_integrations.py --format json
 ```
 
-Known tool labels are bound to matching resolved executable identities.
-Repository-local executables, shell interpreters, generic runners, symlinks to a
-different executable, and byte-identical renamed runner binaries are rejected.
-Custom integrations use a separate trusted-local approval that includes the
-resolved executable path:
+The plan includes the configuration name, fully resolved symlink target,
+executable SHA-256, complete argv, working directory, and finding exit codes.
+Its approval digest is calculated over the unredacted canonical plan. A trusted
+local caller can execute that one plan:
 
 ```bash
-python3 scripts/tool_integrations.py \
-  --allow-custom-tool company-scanner=/opt/company/bin/company-scanner
+python3 scripts/tool_integrations.py --approve-plan <approval-digest>
 ```
+
+The configuration is reloaded and the path, bytes, argv, directory, and exit
+semantics are revalidated immediately before execution. A tool-like filename or
+PATH entry conveys no trust. Changing any execution-affecting field invalidates
+approval. `AI_REVIEW_APPROVED_PLANS` is available to trusted local automation;
+it contains comma-separated exact plan digests and must not be sourced from the
+reviewed repository.
 
 External stdout and stderr are centrally redacted before they enter text or JSON
 results. Reports include whether each tool was detected, its argument array,
 exit code, relevant redacted output, and separate fields for execution
 completion, pass/fail, finding-producing exits, and coverage completeness.
 
-The main review scripts likewise do not run commands discovered from the
-repository unless a trusted local caller names command categories in
-`AI_REVIEW_ALLOWED_COMMANDS`, for example `lint,typecheck`. Unapproved commands
-are displayed but remain inert. This allow-list cannot be enabled by repository
-configuration.
+The main review scripts use the same two-phase model for exact install, lint,
+typecheck, test, build, and format shell plans. Run `review_commands.py --scope
+full --format json`, inspect each plan, then pass its digest with
+`--approve-plan` or `AI_REVIEW_APPROVED_PLANS`. Approval of a category name or
+an earlier command string is never sufficient.
 
 `python_import_aliases` maps import name to declared distribution name. Dissect
 also uses installed package metadata and a tested built-in map for common names
@@ -187,16 +192,32 @@ Git history is parsed with NUL-delimited status records. Rename ancestry follows
 the old path backward while findings retain the reviewed path. Copies follow
 the detected source ancestry only when the copied destination is in scope.
 Merge commits inspect every parent. Rename aliases share a canonical logical
-lineage, while copy ancestry stays separate. Duplicate evidence reached through
-aliases or parents is aggregated without discarding provenance. When an issue
-still exists, working-tree evidence is primary and historical paths, commits,
-and lines are attached in `historical_sources`.
+lineage, while copy ancestry stays separate. Occurrences carry match,
+surrounding-code, and stable occurrence fingerprints. History is attached only
+when correlation is unique; ambiguous evidence remains a separate history-only
+finding. Working-tree evidence remains primary, and historical paths, commits,
+lines, provenance types, and fingerprints are attached in
+`historical_sources`.
 
-Self-review fixture handling authenticates the target checkout against a
-versioned manifest derived from the executing skill copy's trusted project
-anchors. Only matching AST fixture nodes are masked. Installed Codex copies can
-therefore review the source checkout without broad exclusions, while filenames,
-comments, or copied marker text in another repository cannot enable masking.
+Self-review fixture handling is never automatic. An installed skill first emits
+a trusted plan bound to its versioned full fixture-owner manifest, the target
+checkout identity, and every fixture-owning file:
+
+```bash
+python3 /trusted/skill/scripts/scan_ai_gotchas.py --plan-self-review
+python3 /trusted/skill/scripts/scan_ai_gotchas.py \
+  --approve-self-review <approval-digest> --format json
+```
+
+Only exact manifest-owned AST nodes are masked. Copied public anchors, copied
+fixture files, repository configuration, comments, and target-controlled
+environment cannot enable the mode. Changes outside an owned node do not
+broaden masking; changes inside one make that node ineligible. Approval is also
+bound to the canonical checkout and its Git marker.
+
+Diff scope uses one canonical NUL-delimited file list from Git through display,
+language detection, and scanning. Human output JSON-quotes paths so tabs and
+newlines cannot impersonate additional files.
 
 ## CI and JSON Output
 
@@ -209,11 +230,11 @@ python3 scripts/scan_ai_gotchas.py --format json --fail-on high > dissect.json
 
 Or configure `review_options.deterministic_output` and
 `review_options.fail_on_severity`. Exit code `2` means at least one finding met
-the threshold. JSON schema `2.0` adds structured `historical_sources` to each
-finding and makes current-versus-historical evidence explicit. The contract is
-versioned with `schema_version`. Its
-`complete` flag becomes false and `coverage_errors` explains the gap when files,
-commits, or dependency manifests could not be inspected.
+the threshold. JSON schema `3.0` adds occurrence fingerprints and richer
+structured `historical_sources`, making current-versus-historical evidence
+explicit. The contract is versioned with `schema_version`. Its `complete` flag
+becomes false and `coverage_errors` explains the gap when files, commits, or
+dependency manifests could not be inspected.
 
 Run the offline regression suite with:
 

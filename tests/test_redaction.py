@@ -108,6 +108,24 @@ class RedactionTests(unittest.TestCase):
                 }
             }
             (config_dir / "local.json").write_text(json.dumps(config))
+            planning = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "tool_integrations.py"),
+                    "--format",
+                    "json",
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(planning.returncode, 0, planning.stderr)
+            planned = next(
+                item for item in json.loads(planning.stdout)["tools"]
+                if item["tool"] == "fixture"
+            )
+            approval = planned["plan"]["approval_digest"]
             for output_format in ("text", "json"):
                 result = subprocess.run(
                     [
@@ -115,8 +133,8 @@ class RedactionTests(unittest.TestCase):
                         str(ROOT / "scripts" / "tool_integrations.py"),
                         "--format",
                         output_format,
-                        "--allow-tool",
-                        "fixture",
+                        "--approve-plan",
+                        approval,
                     ],
                     cwd=root,
                     text=True,

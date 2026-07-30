@@ -36,6 +36,93 @@ def secret_findings(report):
 
 
 class HistoryLineageTests(unittest.TestCase):
+    def test_identical_secret_occurrences_receive_only_their_own_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            target = root / "app.ts"
+            target.write_text(
+                f"function oldPlace() {{\n  const key = '{SECRET}';\n  return 1;\n}}\n"
+            )
+            commit(root, "first occurrence")
+            target.write_text(target.read_text() + (
+                f"\nfunction newPlace() {{\n  const key = '{SECRET}';\n  return 2;\n}}\n"
+            ))
+            report = scan_report(ScanOptions(root=root, include_history=True))
+            findings = secret_findings(report)
+            self.assertEqual(len(findings), 2)
+            old, new = sorted(findings, key=lambda item: item.line)
+            self.assertTrue(old.historical_sources)
+            self.assertEqual(new.historical_sources, ())
+            self.assertNotEqual(old.occurrence_id, new.occurrence_id)
+
+    def test_two_history_only_occurrences_remain_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            target = root / "app.ts"
+            target.write_text(
+                f"function one() {{\n const key = '{SECRET}';\n return 1;\n}}\n"
+                f"function two() {{\n const key = '{SECRET}';\n return 2;\n}}\n"
+            )
+            commit(root, "two occurrences")
+            target.write_text("const safe = true;\n")
+            commit(root, "remove both")
+            findings = secret_findings(scan_report(
+                ScanOptions(root=root, include_history=True)
+            ))
+            self.assertEqual(len(findings), 2)
+            self.assertEqual(len({item.context_fingerprint for item in findings}), 2)
+
+    def test_removed_occurrence_does_not_contaminate_remaining_occurrence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            target = root / "app.ts"
+            target.write_text(
+                f"function stays() {{\n const key = '{SECRET}';\n return 1;\n}}\n"
+                f"function removed() {{\n const key = '{SECRET}';\n return 2;\n}}\n"
+            )
+            commit(root, "both")
+            target.write_text(
+                f"function stays() {{\n const key = '{SECRET}';\n return 1;\n}}\n"
+            )
+            commit(root, "remove one")
+            findings = secret_findings(scan_report(
+                ScanOptions(root=root, include_history=True)
+            ))
+            self.assertEqual(len(findings), 2)
+            current = next(item for item in findings if item.source == "working-tree")
+            history_only = next(item for item in findings if item.source != "working-tree")
+            self.assertTrue(current.historical_sources)
+            self.assertNotEqual(
+                current.context_fingerprint,
+                history_only.context_fingerprint,
+            )
+
+    def test_ambiguous_identical_context_preserves_history_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            target = root / "app.ts"
+            block = (
+                f"const key = '{SECRET}';\n"
+                "const tail = true;\n"
+                "const tailTwo = true;\n"
+            )
+            target.write_text(block + "\n" + block)
+            commit(root, "ambiguous twins")
+            target.write_text(block)
+            commit(root, "remove indistinguishable twin")
+            findings = secret_findings(scan_report(
+                ScanOptions(root=root, include_history=True)
+            ))
+            current = [item for item in findings if item.source == "working-tree"]
+            history_only = [item for item in findings if item.source != "working-tree"]
+            self.assertEqual(len(current), 1)
+            self.assertEqual(current[0].historical_sources, ())
+            self.assertTrue(history_only)
+
     def test_secret_removed_during_rename_follows_old_lineage_for_both_scopes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

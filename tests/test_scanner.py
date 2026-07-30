@@ -62,7 +62,7 @@ class ScannerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["schema_version"], "2.0")
+            self.assertEqual(payload["schema_version"], "3.0")
             self.assertEqual(
                 set(payload),
                 {

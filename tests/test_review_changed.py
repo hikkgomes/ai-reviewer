@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import importlib.util
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,8 +10,19 @@ import sys
 import tempfile
 import unittest
 
+from fixture_support import synthetic
+
 
 ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "dissect_diff_file_list",
+    ROOT / "scripts" / "diff_file_list.py",
+)
+diff_file_list = importlib.util.module_from_spec(spec)
+assert spec.loader
+spec.loader.exec_module(diff_file_list)
+changed_paths = diff_file_list.changed_paths
+read_file_list = diff_file_list.read_file_list
 
 
 def initialise(root: Path) -> None:
@@ -54,6 +67,74 @@ def detected_languages(output: str) -> set[str]:
 
 
 class ReviewChangedLanguageTests(unittest.TestCase):
+    def test_unusual_git_filenames_remain_exact_and_nul_delimited(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            old = "old name\tpart.py"
+            deleted = "delete\nme.sql"
+            (root / old).write_text("value = 1\n")
+            (root / deleted).write_text("select 1;\n")
+            base = commit(root, "unusual base")
+            new = "renamed\n\u00fcnicode.py"
+            (root / old).rename(root / new)
+            (root / deleted).unlink()
+            names = [
+                new,
+                deleted,
+                "space name.ts",
+                "tab\tname.go",
+                "line\nbreak.py",
+                "-leading.rs",
+                "\u96ea.c",
+            ]
+            for name in names[2:]:
+                content = (
+                    f"secret = '{synthetic('sk_' + 'live_ZYXWVUTSRQPONMLK987654321')}'\n"
+                    if name == "line\nbreak.py"
+                    else "value = 1\n"
+                )
+                (root / name).write_text(content)
+
+            raw_paths = changed_paths(root, f"{base}...HEAD")
+            decoded = {
+                value.decode("utf-8", errors="surrogateescape")
+                for value in raw_paths
+            }
+            expected_paths = set(names) | {old}
+            self.assertEqual(decoded, expected_paths)
+            file_list = root / "paths.bin"
+            file_list.write_bytes(b"\0".join(raw_paths) + b"\0")
+            self.assertEqual(set(read_file_list(file_list)), expected_paths)
+
+            result = review(root, base)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in expected_paths:
+                self.assertIn(json.dumps(name, ensure_ascii=True), result.stdout)
+            self.assertEqual(
+                detected_languages(result.stdout),
+                {"python", "sql", "typescript", "go", "rust", "cpp"},
+            )
+
+            scan = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "scan_ai_gotchas.py"),
+                    "--format", "json",
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "AI_REVIEW_FILE_LIST": str(file_list)},
+            )
+            payload = json.loads(scan.stdout)
+            matching = [
+                item for item in payload["findings"]
+                if item["check_id"] == "SEC-SECRETS-002"
+            ]
+            self.assertEqual([item["path"] for item in matching], ["line\nbreak.py"])
+
     def test_clean_committed_diff_uses_generated_file_list(self) -> None:
         for filename, expected in (("app.py", "python"), ("app.ts", "typescript")):
             with self.subTest(filename=filename):
