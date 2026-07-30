@@ -23,6 +23,8 @@ assert spec.loader
 spec.loader.exec_module(diff_file_list)
 changed_paths = diff_file_list.changed_paths
 read_file_list = diff_file_list.read_file_list
+changed_entries = diff_file_list.changed_entries
+serialize_entries = diff_file_list.serialize_entries
 
 
 def initialise(root: Path) -> None:
@@ -200,6 +202,51 @@ class ReviewChangedLanguageTests(unittest.TestCase):
             self.assertNotIn("[INCOMPLETE]", result.stderr)
             self.assertIn("deleted-base", result.stdout)
             self.assertNotIn(secret, result.stdout)
+
+    def test_unstaged_deletions_read_index_backed_blobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            (root / "README.md").write_text("base\n")
+            base = commit(root, "base")
+            secret = synthetic("sk_live_1234567890abcdefghij")
+            added = "added\nfrom-index.ts"
+            (root / added).write_text(f"const key='{secret}';\n")
+            subprocess.run(["git", "add", added], cwd=root, check=True)
+            (root / added).unlink()
+            entries = changed_entries(root, f"{base}...HEAD")
+            deletion = next(item for item in entries if item.status.startswith("D") and item.old_path == added)
+            self.assertEqual(deletion.source_kind, "index")
+            self.assertEqual(deletion.index_stage, 0)
+            transport = root / "scope.bin"
+            transport.write_bytes(serialize_entries(entries))
+            scan = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "scan_ai_gotchas.py"), "--format", "json"],
+                cwd=root, text=True, capture_output=True, check=False,
+                env={**os.environ, "AI_REVIEW_FILE_LIST": str(transport)},
+            )
+            self.assertEqual(scan.returncode, 0, scan.stderr)
+            payload = json.loads(scan.stdout)
+            self.assertTrue(payload["complete"], payload["coverage_errors"])
+            self.assertTrue(any(
+                item["path"] == added and item["source"].startswith("git:index:0")
+                for item in payload["findings"]
+            ))
+
+    def test_staged_rename_then_unstaged_deletion_preserves_index_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            old, new = "old.py", "new\nname.py"
+            (root / old).write_text("value = 1\n")
+            commit(root, "base")
+            (root / old).rename(root / new)
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            (root / new).unlink()
+            entries = changed_entries(root)
+            self.assertTrue(any(item.status.startswith("R") and item.new_path == new for item in entries))
+            deletion = next(item for item in entries if item.status.startswith("D") and item.old_path == new)
+            self.assertEqual((deletion.source_kind, deletion.index_stage), ("index", 0))
 
 
 if __name__ == "__main__":

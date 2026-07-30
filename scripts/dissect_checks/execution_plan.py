@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import Callable, Mapping
 
@@ -203,15 +202,11 @@ def _copy_snapshot(source_fd: int, directory: Path, name: str) -> tuple[Path, in
 
 def _run_snapshot(plan: ExecutionPlan, executable_snapshot: Path, interpreter_snapshot: Path | None) -> subprocess.CompletedProcess[str]:
     if interpreter_snapshot is not None:
-        # macOS can refuse to execute a copied, platform-signed system binary. The
-        # script bytes still come only from the verified private snapshot; bind and
-        # re-verify the system interpreter immediately before this narrow fallback.
-        interpreter = plan.interpreter_path if sys.platform == "darwin" else str(interpreter_snapshot)
-        command = [interpreter, str(executable_snapshot), *plan.argv[1:]]
-        executable = interpreter
+        command = [str(interpreter_snapshot), str(executable_snapshot), *plan.argv[1:]]
+        executable = str(interpreter_snapshot)
     else:
-        executable = plan.executable_path if sys.platform == "darwin" else str(executable_snapshot)
-        command = [executable, *plan.argv[1:]]
+        command = [str(executable_snapshot), *plan.argv[1:]]
+        executable = str(executable_snapshot)
     return subprocess.run(command, executable=executable, shell=False, cwd=plan.working_directory, env=plan.environment_dict, text=True, capture_output=True, check=False)
 
 
@@ -253,11 +248,11 @@ def execute_approved_plan(plan: ExecutionPlan, approval_digest: str, *, runner: 
                 if runner is not None:
                     completed = runner(plan, snapshot_fd)
                 else:
-                    if sys.platform == "darwin" and not plan.interpreter_path and _sha256_file(Path(plan.executable_path)) != plan.executable_sha256:
-                        return None, "executable bytes changed before execution"
-                    if sys.platform == "darwin" and plan.interpreter_path and _sha256_file(Path(plan.interpreter_path)) != plan.interpreter_sha256:
-                        return None, "script interpreter bytes changed before execution"
                     completed = _run_snapshot(plan, snapshot, interpreter_snapshot)
+                    # macOS may kill an unsigned copied platform binary. Never retry
+                    # the mutable original path: a failed snapshot is a failed plan.
+                    if completed.returncode < 0:
+                        return None, "approved executable snapshot could not be executed safely"
                 return completed, None
             finally:
                 if 'interpreter_fd' in locals() and interpreter_fd is not None:

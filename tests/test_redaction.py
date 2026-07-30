@@ -52,6 +52,24 @@ class RedactionTests(unittest.TestCase):
                 self.assertIn(visible, rendered)
                 self.assertIn("REDACTED", rendered) if secret else self.assertNotIn("[REDACTED type=environment-secret", rendered)
 
+    def test_shell_sensitive_options_keep_substitutions_and_operators_visible(self) -> None:
+        cases = {
+            "tool --token literal-secret": ("literal-secret", "--token [REDACTED"),
+            "tool --token=$(dangerous-command)": ("", "--token=$(dangerous-command)"),
+            "tool --token $(dangerous-command)": ("", "--token $(dangerous-command)"),
+            "tool --token `dangerous-command`": ("", "--token `dangerous-command`"),
+            "tool --password \"$(dangerous-command)\"": ("", "--password \"$(dangerous-command)\""),
+            "tool --api-key=literal-secret; next && final | tee out > log": (
+                "literal-secret", "; next && final | tee out > log",
+            ),
+        }
+        for command, (secret, visible) in cases.items():
+            with self.subTest(command=command):
+                rendered = redact_shell_command(command)
+                if secret:
+                    self.assertNotIn(secret, rendered)
+                self.assertIn(visible, rendered)
+
     def test_urls_private_keys_jwt_and_auth_headers(self) -> None:
         password = "url-password"
         self.assert_redacted(f"https://user:{password}@example.com/path", password)

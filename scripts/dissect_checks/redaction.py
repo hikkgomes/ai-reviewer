@@ -129,14 +129,73 @@ def _shell_word_redaction(value: str) -> str:
             end = len(value) if end < 0 else end + 1
             pieces.append(value[index:end])
             index = end
+        elif value[index] in "'\"":
+            # Quotes delimit data but can surround substitutions; keep them so the
+            # reviewer can see the command's nesting structure.
+            pieces.append(value[index])
+            index += 1
         else:
             end = index + 1
-            while end < len(value) and not value.startswith(("$(", "<(", ">("), end) and value[end] != "`":
+            while end < len(value) and not value.startswith(("$(", "<(", ">("), end) and value[end] not in "`'\"":
                 end += 1
             literal = value[index:end]
             pieces.append(_replacement(literal, "environment-secret") if literal else literal)
             index = end
     return "".join(pieces)
+
+
+def _shell_word_end(command: str, start: int) -> int:
+    """Return the end of one shell word without evaluating it."""
+    index, quote, depth = start, "", 0
+    while index < len(command):
+        char = command[index]
+        if quote:
+            if char == quote and (index == start or command[index - 1] != "\\"):
+                quote = ""
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+        elif command.startswith(("$(", "<(", ">("), index):
+            depth += 1
+            index += 2
+            continue
+        elif char == ")" and depth:
+            depth -= 1
+        elif depth == 0 and (char.isspace() or char in ";|&<>"):
+            break
+        index += 1
+    return index
+
+
+def _protect_sensitive_shell_options(command: str) -> tuple[str, dict[str, str]]:
+    """Replace sensitive option words before generic redaction can hide syntax."""
+    names = "|".join(re.escape(value) for value in sorted(
+        SENSITIVE_OPTIONS | SENSITIVE_SHORT_OPTIONS, key=len, reverse=True
+    ))
+    option = re.compile(rf"(?<![A-Za-z0-9_-])(?P<name>{names})(?P<join>=|\s+)", re.I)
+    rendered: list[str] = []
+    replacements: dict[str, str] = {}
+    position = 0
+    ordinal = 0
+    while match := option.search(command, position):
+        rendered.append(command[position:match.start()])
+        end = _shell_word_end(command, match.end())
+        if end == match.end():
+            # An option without a value is left visible and is not guessed at.
+            rendered.append(command[match.start():match.end()])
+            position = match.end()
+            continue
+        marker = f"__DISSECT_SHELL_SECRET_{ordinal}__"
+        ordinal += 1
+        replacements[marker] = (
+            f"{match.group('name')}{match.group('join')}"
+            f"{_shell_word_redaction(command[match.end():end])}"
+        )
+        rendered.append(marker)
+        position = end
+    rendered.append(command[position:])
+    return "".join(rendered), replacements
 
 
 def redact_shell_command(command: str) -> str:
@@ -146,19 +205,20 @@ def redact_shell_command(command: str) -> str:
     assignment word and stops at shell separators, so substitutions, redirects, pipes,
     and subsequent commands always stay in the approval display.
     """
+    protected, replacements = _protect_sensitive_shell_options(command)
     assignment = re.compile(
         rf"(?i)(?<![A-Za-z0-9_])([A-Z_]*(?:{_SENSITIVE_LABEL.upper()})[A-Z0-9_]*=)"
     )
     output: list[str] = []
     position = 0
-    for match in assignment.finditer(command):
-        output.append(redact_sensitive_text(command[position:match.start()]))
+    for match in assignment.finditer(protected):
+        output.append(redact_sensitive_text(protected[position:match.start()]))
         output.append(match.group(1))
         index = match.end()
         quote = ""
         depth = 0
-        while index < len(command):
-            char = command[index]
+        while index < len(protected):
+            char = protected[index]
             if quote:
                 if char == quote and (index == 0 or command[index - 1] != "\\"):
                     quote = ""
@@ -166,7 +226,7 @@ def redact_shell_command(command: str) -> str:
                 continue
             if char in "'\"":
                 quote = char
-            elif command.startswith(("$(", "<(", ">("), index):
+            elif protected.startswith(("$(", "<(", ">("), index):
                 depth += 1
                 index += 2
                 continue
@@ -175,10 +235,13 @@ def redact_shell_command(command: str) -> str:
             elif depth == 0 and (char.isspace() or char in ";|&<>"):
                 break
             index += 1
-        output.append(_shell_word_redaction(command[match.end():index]))
+        output.append(_shell_word_redaction(protected[match.end():index]))
         position = index
-    output.append(redact_sensitive_text(command[position:]))
-    return "".join(output)
+    output.append(redact_sensitive_text(protected[position:]))
+    value = "".join(output)
+    for marker, replacement in replacements.items():
+        value = value.replace(marker, replacement)
+    return value
 
 
 def redact_argv(argv: list[str]) -> list[str]:

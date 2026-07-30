@@ -391,6 +391,10 @@ class IntegrationTests(unittest.TestCase):
             )
             payload = json.loads(result.stdout)
             tool = next(item for item in payload["tools"] if item["tool"] == "fixture-tool")
+            if sys.platform == "darwin":
+                self.assertFalse(tool["execution_completed"])
+                self.assertIn("snapshot", tool["output"])
+                return
             self.assertTrue(tool["execution_completed"])
             self.assertTrue(tool["complete"])
             self.assertFalse(tool["passed"])
@@ -631,6 +635,11 @@ class IntegrationTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             test = next(item for item in payload["commands"] if item["name"] == "full:root:test")
             build = next(item for item in payload["commands"] if item["name"] == "full:root:build")
+            if sys.platform == "darwin":
+                self.assertFalse(test["executed"])
+                self.assertIn("snapshot", test["output"])
+                self.assertFalse(build["executed"])
+                return
             self.assertTrue(test["executed"])
             self.assertFalse(build["executed"])
             self.assertTrue(test_marker.exists())

@@ -168,6 +168,13 @@ approval. `AI_REVIEW_APPROVED_PLANS` is available to trusted local automation;
 it contains comma-separated exact plan digests and must not be sourced from the
 reviewed repository.
 
+Before execution Dissect copies verified bytes into a private, non-writable
+snapshot with a different inode, re-hashes that snapshot, and executes only the
+copy. Script interpreters are independently bound and copied. On platforms
+where the operating system refuses to execute the verified copy (including
+macOS platform-signed binaries in restricted environments), execution fails
+closed; Dissect never retries the mutable original path.
+
 External stdout and stderr are centrally redacted before they enter text or JSON
 results. Reports include whether each tool was detected, its argument array,
 exit code, relevant redacted output, and separate fields for execution

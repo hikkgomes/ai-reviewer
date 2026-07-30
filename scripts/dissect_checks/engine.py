@@ -56,7 +56,7 @@ class ScanOptions:
     include_history: bool = False
     history_depth: int = 20
     file_list: tuple[str, ...] = ()
-    diff_entries: tuple[tuple[str, str, str, bool, str], ...] = ()
+    diff_entries: tuple[tuple[str, str, str, bool, str, str, int | None], ...] = ()
     ignore: tuple[str, ...] = ()
     generated_paths: tuple[str, ...] = ()
     python_import_aliases: tuple[tuple[str, str], ...] = ()
@@ -118,8 +118,12 @@ def options_from_environment(
                     old_path = _normalise(str(entry["old_path"]))
                     new_path = _normalise(str(entry["new_path"]))
                     exists = bool(entry["exists_in_worktree"])
-                    base = str(entry.get("base_revision", ""))
-                    diff_entries.append((status, old_path, new_path, exists, base))
+                    source_kind = str(entry.get("source_kind", "commit"))
+                    commit_revision = str(entry.get("commit_revision", entry.get("base_revision", "")))
+                    index_stage = entry.get("index_stage")
+                    if index_stage is not None and not isinstance(index_stage, int):
+                        raise ValueError("invalid index stage")
+                    diff_entries.append((status, old_path, new_path, exists, source_kind, commit_revision, index_stage))
                     if exists:
                         file_list.append(new_path)
                 except (KeyError, TypeError, ValueError, UnicodeDecodeError):
@@ -190,7 +194,7 @@ def _is_text_path(rel: str) -> bool:
 
 def _candidate_files(options: ScanOptions) -> list[str]:
     if options.diff_entries:
-        candidates = [new for _status, _old, new, exists, _base in options.diff_entries if exists]
+        candidates = [new for _status, _old, new, exists, _kind, _commit, _stage in options.diff_entries if exists]
     elif options.file_list:
         candidates = list(options.file_list)
     else:
@@ -370,6 +374,25 @@ def _read_history_blob(
     if result.returncode:
         return None, (
             f"git history: could not read {path!r} at {revision[:12]} "
+            f"(exit {result.returncode})"
+        )
+    return result.stdout.decode("utf-8", errors="ignore"), None
+
+
+def _read_index_blob(
+    options: ScanOptions,
+    stage: int,
+    path: str,
+) -> tuple[str | None, str | None]:
+    result = subprocess.run(
+        ["git", "show", f":{stage}:{path}"],
+        cwd=options.root,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        return None, (
+            f"git index: could not read {path!r} at stage {stage} "
             f"(exit {result.returncode})"
         )
     return result.stdout.decode("utf-8", errors="ignore"), None
@@ -860,18 +883,25 @@ def scan_report(options: ScanOptions) -> ScanReport:
     # A deletion has no current file to open. Its base blob is nevertheless useful
     # evidence and, unlike a failed current read, is not a coverage failure when it
     # can be read successfully.
-    for status, old_path, _new_path, _exists, base_revision in options.diff_entries:
+    for status, old_path, _new_path, _exists, source_kind, commit_revision, index_stage in options.diff_entries:
         if not status.startswith("D") or _ignored(old_path, options) or not _is_text_path(old_path):
             continue
-        if not base_revision:
-            errors.append(f"diff scope: deleted {old_path!r} has no applicable base revision")
+        if source_kind == "index":
+            if index_stage is None:
+                errors.append(f"diff scope: deleted {old_path!r} has no index stage")
+                continue
+            text, read_error = _read_index_blob(options, index_stage, old_path)
+            source = f"git:index:{index_stage}:deleted-base"
+        elif source_kind == "commit" and commit_revision:
+            text, read_error = _read_history_blob(options, commit_revision, old_path)
+            source = f"git:{commit_revision[:12]}:deleted-base"
+        else:
+            errors.append(f"diff scope: deleted {old_path!r} has no applicable evidence source")
             continue
-        text, read_error = _read_history_blob(options, base_revision, old_path)
         if read_error:
             errors.append(read_error)
             continue
         assert text is not None
-        source = f"git:{base_revision[:12]}:deleted-base"
         findings.extend(_scan_owned_text(options, old_path, old_path, text, source))
 
     manifests, manifest_errors = _load_package_manifests(options)

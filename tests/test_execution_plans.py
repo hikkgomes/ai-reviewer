@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,10 @@ class ExecutionPlanTests(unittest.TestCase):
             self.assertIn("REDACTED", display)
 
             completed, error = execute_approved_plan(plan, plan.approval_digest)
+            if sys.platform == "darwin":
+                self.assertIsNone(completed)
+                self.assertIn("snapshot", error or "")
+                return
             self.assertIsNone(error)
             assert completed
             self.assertEqual(completed.stdout, "original-secret-value")
@@ -186,6 +191,10 @@ class ExecutionPlanTests(unittest.TestCase):
             self.assertIsNone(error)
             assert plan
             completed, execution_error = execute_approved_plan(plan, plan.approval_digest)
+            if sys.platform == "darwin":
+                self.assertIsNone(completed)
+                self.assertIn("snapshot", execution_error or "")
+                return
             self.assertIsNone(execution_error)
             assert completed
             self.assertEqual(completed.stdout, "approved")
@@ -207,9 +216,31 @@ class ExecutionPlanTests(unittest.TestCase):
             thread.start()
             completed, execution_error = execute_approved_plan(plan, plan.approval_digest)
             thread.join()
+            if sys.platform == "darwin":
+                self.assertIsNone(completed)
+                self.assertIn("snapshot", execution_error or "")
+                return
             self.assertIsNone(execution_error)
             assert completed
             self.assertEqual(completed.stdout, "approved")
+
+    def test_snapshot_execution_never_falls_back_to_mutable_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = self._script(root)
+            plan, error = build_execution_plan(
+                kind="tool", name="snapshot", argv=[str(executable)], working_directory=root,
+            )
+            self.assertIsNone(error)
+            assert plan
+            failed_snapshot = subprocess.CompletedProcess([], -9, "", "")
+            with patch("dissect_checks.execution_plan._run_snapshot", return_value=failed_snapshot) as run:
+                completed, execution_error = execute_approved_plan(plan, plan.approval_digest)
+            self.assertIsNone(completed)
+            self.assertIn("snapshot", execution_error or "")
+            _called_plan, executable_snapshot, interpreter_snapshot = run.call_args.args
+            self.assertNotEqual(executable_snapshot, executable)
+            self.assertNotEqual(str(interpreter_snapshot), plan.interpreter_path)
 
     def test_malformed_unknown_and_cross_plan_approvals_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
