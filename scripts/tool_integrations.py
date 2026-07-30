@@ -41,11 +41,11 @@ def _configured_tools(config: dict) -> dict:
 def _parse_tool(
     name: str,
     raw_config: object,
-) -> tuple[list[str], set[int], str | None]:
+) -> tuple[list[str], set[int], dict[str, str], str | None]:
     if raw_config is None:
-        return [], set(), None
+        return [], set(), {}, None
     if not isinstance(raw_config, dict):
-        return [], set(), (
+        return [], set(), {}, (
             "use an object with a non-empty string argv array; "
             "shell command strings are rejected"
         )
@@ -55,20 +55,29 @@ def _parse_tool(
         and raw_argv
         and all(isinstance(value, str) and value for value in raw_argv)
     ):
-        return [], set(), "execution plan requires a non-empty string argv array"
+        return [], set(), {}, "execution plan requires a non-empty string argv array"
     finding_exit_codes = {
         int(code)
         for code in raw_config.get("finding_exit_codes", [])
         if isinstance(code, int) or (isinstance(code, str) and code.isdigit())
     }
-    return list(raw_argv), finding_exit_codes, None
+    environment = raw_config.get("environment", {})
+    if not isinstance(environment, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in environment.items()
+    ):
+        return [], set(), {}, "tool environment must be a string-to-string object"
+    return list(raw_argv), finding_exit_codes, dict(environment), None
 
 
 def build_tool_plans(config: dict) -> tuple[dict[str, ExecutionPlan], dict[str, str]]:
     plans = {}
     errors = {}
+    base_environment = (config.get("security_review") or {}).get("execution_environment", {})
+    if not isinstance(base_environment, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in base_environment.items()):
+        return {}, {str(name): "execution_environment must be a string-to-string object" for name in _configured_tools(config)}
     for name, raw_config in _configured_tools(config).items():
-        argv, finding_exit_codes, parse_error = _parse_tool(str(name), raw_config)
+        argv, finding_exit_codes, configured_environment, parse_error = _parse_tool(str(name), raw_config)
         if parse_error:
             errors[str(name)] = parse_error
             continue
@@ -78,6 +87,7 @@ def build_tool_plans(config: dict) -> tuple[dict[str, ExecutionPlan], dict[str, 
             argv=argv,
             working_directory=Path.cwd(),
             finding_exit_codes=finding_exit_codes,
+            environment={**base_environment, **configured_environment},
         )
         if plan_error:
             errors[str(name)] = plan_error

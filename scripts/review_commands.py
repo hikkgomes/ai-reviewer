@@ -74,6 +74,22 @@ def _resolved_commands(
     return commands
 
 
+def _execution_environment(*scopes: dict) -> tuple[dict[str, str], str | None]:
+    environment: dict[str, str] = {}
+    for scope in scopes:
+        configured = (
+            (scope.get("review_options") or {}).get("execution_environment", {})
+            if isinstance(scope, dict) else {}
+        )
+        if not isinstance(configured, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in configured.items()
+        ):
+            return {}, "execution_environment must be a string-to-string object"
+        environment.update(configured)
+    return environment, None
+
+
 def build_review_plans(
     *,
     root: Path,
@@ -106,6 +122,12 @@ def build_review_plans(
         scopes.append((name, root / rel_root, local_scope, detected_scope))
 
     for label, cwd, local_scope, detected_scope in scopes:
+        environment, environment_error = _execution_environment(
+            detected, local, detected_scope, local_scope,
+        )
+        if environment_error:
+            errors.append(f"{scope}:{label}: {environment_error}")
+            continue
         commands = _resolved_commands(
             local_scope,
             detected_scope,
@@ -122,6 +144,7 @@ def build_review_plans(
                 name=name,
                 argv=["/bin/sh", "-c", command],
                 working_directory=cwd,
+                environment=environment,
             )
             if error:
                 errors.append(f"{name}: {error}")

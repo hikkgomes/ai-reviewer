@@ -199,9 +199,10 @@ finding. Working-tree evidence remains primary, and historical paths, commits,
 lines, provenance types, and fingerprints are attached in
 `historical_sources`.
 
-Self-review fixture handling is never automatic. An installed skill first emits
-a trusted plan bound to its versioned full fixture-owner manifest, the target
-checkout identity, and every fixture-owning file:
+Self-review fixture handling is never automatic. It is a caller-authorized,
+checkout-specific fixture override, not authentication of a repository. An
+installed skill emits a plan bound to its versioned full fixture-owner manifest,
+the target checkout identity, and every fixture-owning file:
 
 ```bash
 python3 /trusted/skill/scripts/scan_ai_gotchas.py --plan-self-review
@@ -209,11 +210,21 @@ python3 /trusted/skill/scripts/scan_ai_gotchas.py \
   --approve-self-review <approval-digest> --format json
 ```
 
-Only exact manifest-owned AST nodes are masked. Copied public anchors, copied
-fixture files, repository configuration, comments, and target-controlled
-environment cannot enable the mode. Changes outside an owned node do not
-broaden masking; changes inside one make that node ineligible. Approval is also
-bound to the canonical checkout and its Git marker.
+Only exact manifest-owned AST nodes are masked. The caller supplying the digest
+authorizes masking for that named local checkout and exact file state. Copied
+public anchors, copied fixture files, repository configuration, comments, and
+target-controlled environment cannot enable the mode. Changes outside an owned
+node do not broaden masking; changes inside one make that node ineligible. Git
+metadata and public repository files do not prove checkout authenticity.
+
+Every optional command plan also contains the complete child environment. The
+default is only a controlled `PATH`; no inherited loader, shell-startup,
+interpreter, package-manager, home-directory, or language runtime variable is
+passed through. Add a string-to-string `execution_environment` object under
+`review_options` (review commands) or `security_review` (tools), or an
+`environment` object on a tool, only when a value is required. Both its name
+and original value are approval-digest-bound; secret-labelled values are
+redacted in text and JSON plan displays.
 
 Diff scope uses one canonical NUL-delimited file list from Git through display,
 language detection, and scanning. Human output JSON-quotes paths so tabs and

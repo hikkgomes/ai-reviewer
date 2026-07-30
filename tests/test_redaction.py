@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from dissect_checks.engine import scan_text
-from dissect_checks.redaction import redact_argv, redact_sensitive_text
+from dissect_checks.redaction import redact_argv, redact_sensitive_text, redact_shell_command
 
 
 class RedactionTests(unittest.TestCase):
@@ -35,6 +35,22 @@ class RedactionTests(unittest.TestCase):
         for secret in (separate, assigned, environment, short_value):
             self.assertFalse(secret in rendered, "credential leaked from argv")
         self.assertIn("--verbose", argv)
+
+    def test_shell_assignment_redaction_keeps_executable_structure_visible(self) -> None:
+        cases = {
+            "TOKEN=literal-credential-value npm test": ("literal-credential-value", "npm test"),
+            "TOKEN=$(dangerous-command) npm test": ("", "$(dangerous-command) npm test"),
+            "PASSWORD=literal-password-value; rm -rf target": ("literal-password-value", "; rm -rf target"),
+            "TOKEN=literal-credential-value npm test | tee output > log": ("literal-credential-value", "| tee output > log"),
+            "TOKEN=`dangerous-command` npm test": ("", "`dangerous-command` npm test"),
+        }
+        for command, (secret, visible) in cases.items():
+            with self.subTest(command=command):
+                rendered = redact_shell_command(command)
+                if secret:
+                    self.assertNotIn(secret, rendered)
+                self.assertIn(visible, rendered)
+                self.assertIn("REDACTED", rendered) if secret else self.assertNotIn("[REDACTED type=environment-secret", rendered)
 
     def test_urls_private_keys_jwt_and_auth_headers(self) -> None:
         password = "url-password"

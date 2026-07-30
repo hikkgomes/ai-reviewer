@@ -186,6 +186,21 @@ class ReviewChangedLanguageTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(detected_languages(result.stdout), set())
 
+    def test_deleted_secret_is_scanned_from_base_without_incomplete_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initialise(root)
+            deleted = "deleted\ncredential.ts"
+            secret = synthetic("sk_live_1234567890abcdefghij")
+            (root / deleted).write_text(f"const key='{secret}';\n")
+            base = commit(root, "base credential")
+            (root / deleted).unlink()
+            result = review(root, base)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("[INCOMPLETE]", result.stderr)
+            self.assertIn("deleted-base", result.stdout)
+            self.assertNotIn(secret, result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

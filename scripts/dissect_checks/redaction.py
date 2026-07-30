@@ -95,6 +95,92 @@ def redact_sensitive_text(text: str) -> str:
     return redacted
 
 
+def redact_environment(entries: tuple[tuple[str, str], ...]) -> list[dict[str, str]]:
+    """Render environment values without ever changing the canonical plan values."""
+    result = []
+    for name, value in entries:
+        sensitive = re.fullmatch(rf"(?i)[A-Z0-9_]*{_SENSITIVE_LABEL}[A-Z0-9_]*", name)
+        result.append({
+            "name": name,
+            "value": _replacement(value, "environment-secret") if sensitive else redact_sensitive_text(value),
+        })
+    return result
+
+
+def _shell_word_redaction(value: str) -> str:
+    """Redact literal assignment data, leaving syntax capable of executing visible."""
+    pieces: list[str] = []
+    index = 0
+    while index < len(value):
+        if value.startswith("$(", index) or value.startswith("<(", index) or value.startswith(">(", index):
+            opener = value[index:index + 2]
+            depth = 1
+            end = index + 2
+            while end < len(value) and depth:
+                if value[end] == "(":
+                    depth += 1
+                elif value[end] == ")":
+                    depth -= 1
+                end += 1
+            pieces.append(value[index:end])
+            index = end
+        elif value[index] == "`":
+            end = value.find("`", index + 1)
+            end = len(value) if end < 0 else end + 1
+            pieces.append(value[index:end])
+            index = end
+        else:
+            end = index + 1
+            while end < len(value) and not value.startswith(("$(", "<(", ">("), end) and value[end] != "`":
+                end += 1
+            literal = value[index:end]
+            pieces.append(_replacement(literal, "environment-secret") if literal else literal)
+            index = end
+    return "".join(pieces)
+
+
+def redact_shell_command(command: str) -> str:
+    """Conservative shell rendering: assignment values are redacted, syntax remains shown.
+
+    This intentionally does not try to evaluate shell.  It only identifies a sensitive
+    assignment word and stops at shell separators, so substitutions, redirects, pipes,
+    and subsequent commands always stay in the approval display.
+    """
+    assignment = re.compile(
+        rf"(?i)(?<![A-Za-z0-9_])([A-Z_]*(?:{_SENSITIVE_LABEL.upper()})[A-Z0-9_]*=)"
+    )
+    output: list[str] = []
+    position = 0
+    for match in assignment.finditer(command):
+        output.append(redact_sensitive_text(command[position:match.start()]))
+        output.append(match.group(1))
+        index = match.end()
+        quote = ""
+        depth = 0
+        while index < len(command):
+            char = command[index]
+            if quote:
+                if char == quote and (index == 0 or command[index - 1] != "\\"):
+                    quote = ""
+                index += 1
+                continue
+            if char in "'\"":
+                quote = char
+            elif command.startswith(("$(", "<(", ">("), index):
+                depth += 1
+                index += 2
+                continue
+            elif char == ")" and depth:
+                depth -= 1
+            elif depth == 0 and (char.isspace() or char in ";|&<>"):
+                break
+            index += 1
+        output.append(_shell_word_redaction(command[match.end():index]))
+        position = index
+    output.append(redact_sensitive_text(command[position:]))
+    return "".join(output)
+
+
 def redact_argv(argv: list[str]) -> list[str]:
     """Redact argv with option/value relationships intact."""
     result = []

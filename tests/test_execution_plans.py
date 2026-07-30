@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 
@@ -102,7 +105,7 @@ class ExecutionPlanTests(unittest.TestCase):
             self.assertIsNone(completed)
             self.assertIn("bytes changed", error or "")
 
-    def test_time_of_check_mutation_is_detected(self) -> None:
+    def test_snapshot_is_independent_when_original_mutates_after_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             executable = self._script(root)
@@ -115,9 +118,10 @@ class ExecutionPlanTests(unittest.TestCase):
             self.assertIsNone(error)
             assert plan
 
-            def mutate_then_return(_plan, _fd):
+            def mutate_then_return(_plan, snapshot_fd):
                 executable.write_text("#!/bin/sh\nprintf mutated\n")
                 executable.chmod(0o755)
+                self.assertNotEqual(os.fstat(snapshot_fd).st_ino, executable.stat().st_ino)
                 return subprocess.CompletedProcess(
                     args=list(_plan.argv),
                     returncode=0,
@@ -130,8 +134,82 @@ class ExecutionPlanTests(unittest.TestCase):
                 plan.approval_digest,
                 runner=mutate_then_return,
             )
-            self.assertIsNone(completed)
-            self.assertIn("during execution", error or "")
+            self.assertIsNone(error)
+            self.assertIsNotNone(completed)
+
+    def test_controlled_environment_is_bound_redacted_and_passed_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = self._script(root)
+            plan, error = build_execution_plan(
+                kind="tool", name="environment", argv=[str(executable), "$TOKEN"],
+                working_directory=root, environment={"TOKEN": "original-secret", "LANG": "C"},
+            )
+            self.assertIsNone(error)
+            assert plan
+            changed = replace(plan, environment=(("LANG", "C"), ("PATH", "/bin:/usr/bin"), ("TOKEN", "changed")))
+            self.assertNotEqual(plan.approval_digest, changed.approval_digest)
+            displayed = json.dumps(plan.redacted_payload())
+            self.assertNotIn("original-secret", displayed)
+            self.assertIn("REDACTED", displayed)
+
+            captured: dict[str, str] = {}
+            def inspect(child_plan, snapshot_fd):
+                captured.update(child_plan.environment_dict)
+                self.assertNotIn("LD_PRELOAD", captured)
+                self.assertNotIn("PYTHONPATH", captured)
+                self.assertNotIn("UNAPPROVED", captured)
+                self.assertEqual(os.fstat(snapshot_fd).st_mode & 0o222, 0)
+                return subprocess.CompletedProcess([], 0, "", "")
+            previous = os.environ.copy()
+            os.environ.update({"LD_PRELOAD": "evil", "PYTHONPATH": "evil", "UNAPPROVED": "evil"})
+            try:
+                completed, error = execute_approved_plan(plan, plan.approval_digest, runner=inspect)
+            finally:
+                os.environ.clear(); os.environ.update(previous)
+            self.assertIsNone(error)
+            self.assertIsNotNone(completed)
+            self.assertEqual(captured["TOKEN"], "original-secret")
+
+    def test_shell_uses_approved_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            tool = bin_dir / "chosen"
+            tool.write_text("#!/bin/sh\nprintf approved\n")
+            tool.chmod(0o755)
+            plan, error = build_execution_plan(
+                kind="review-command", name="shell", argv=["/bin/sh", "-c", "chosen"],
+                working_directory=root, environment={"PATH": str(bin_dir)},
+            )
+            self.assertIsNone(error)
+            assert plan
+            completed, execution_error = execute_approved_plan(plan, plan.approval_digest)
+            self.assertIsNone(execution_error)
+            assert completed
+            self.assertEqual(completed.stdout, "approved")
+
+    def test_real_concurrent_mutation_cannot_change_snapshot_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "slow"
+            executable.write_text("#!/bin/sh\nsleep 0.05\nprintf approved\n")
+            executable.chmod(0o755)
+            plan, error = build_execution_plan(kind="tool", name="slow", argv=[str(executable)], working_directory=root)
+            self.assertIsNone(error)
+            assert plan
+            def mutate() -> None:
+                time.sleep(0.01)
+                executable.write_text("#!/bin/sh\nprintf malicious\n")
+                executable.chmod(0o755)
+            thread = threading.Thread(target=mutate)
+            thread.start()
+            completed, execution_error = execute_approved_plan(plan, plan.approval_digest)
+            thread.join()
+            self.assertIsNone(execution_error)
+            assert completed
+            self.assertEqual(completed.stdout, "approved")
 
     def test_malformed_unknown_and_cross_plan_approvals_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

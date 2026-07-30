@@ -1,53 +1,102 @@
 #!/usr/bin/env python3
-"""Build and consume Dissect's canonical NUL-delimited diff file list."""
-from __future__ import annotations
-
+"""Build and consume a status-aware, NUL-delimited diff scope."""
 import argparse
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import subprocess
 import sys
 
 
-def _git_paths(root: Path, arguments: list[str]) -> list[bytes]:
-    result = subprocess.run(
-        ["git", *arguments],
-        cwd=root,
-        capture_output=True,
-        check=False,
-    )
+@dataclass(frozen=True)
+class DiffEntry:
+    status: str
+    old_path: str
+    new_path: str
+    exists_in_worktree: bool
+    base_revision: str = ""
+
+
+def _git(root: Path, arguments: list[str]) -> bytes:
+    result = subprocess.run(["git", *arguments], cwd=root, capture_output=True, check=False)
     if result.returncode:
         message = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(message or f"git {' '.join(arguments)} failed")
-    return [value for value in result.stdout.split(b"\0") if value]
+    return result.stdout
+
+
+def _name_status(root: Path, arguments: list[str], base_revision: str = "") -> list[DiffEntry]:
+    values = [item for item in _git(root, arguments).split(b"\0") if item]
+    entries: list[DiffEntry] = []
+    index = 0
+    while index < len(values):
+        status = values[index].decode("ascii", errors="replace")
+        index += 1
+        count = 2 if status.startswith(("R", "C")) else 1
+        if index + count > len(values):
+            raise RuntimeError(f"truncated name-status record for {status!r}")
+        paths = [value.decode("utf-8", errors="surrogateescape") for value in values[index:index + count]]
+        index += count
+        old_path, new_path = (paths[0], paths[-1])
+        entries.append(DiffEntry(
+            status=status,
+            old_path=old_path,
+            new_path=new_path,
+            exists_in_worktree=not status.startswith("D") and (root / new_path).is_file(),
+            base_revision=base_revision,
+        ))
+    return entries
+
+
+def changed_entries(root: Path, committed_range: str = "") -> list[DiffEntry]:
+    entries: list[DiffEntry] = []
+    if committed_range:
+        base = committed_range.split("...", 1)[0]
+        entries.extend(_name_status(root, ["diff", "--name-status", "-z", "-M", "-C", "--find-copies-harder", committed_range], base))
+    entries.extend(_name_status(root, ["diff", "--cached", "--name-status", "-z", "-M", "-C", "--find-copies-harder"], "HEAD"))
+    entries.extend(_name_status(root, ["diff", "--name-status", "-z", "-M", "-C", "--find-copies-harder"], "HEAD"))
+    for raw in [value for value in _git(root, ["ls-files", "-z", "--others", "--exclude-standard"]).split(b"\0") if value]:
+        path = raw.decode("utf-8", errors="surrogateescape")
+        entries.append(DiffEntry("A", path, path, (root / path).is_file(), ""))
+    # Identical records from staged + worktree are redundant, but differently sourced
+    # records remain because their historical base can be different.
+    return sorted(set(entries), key=lambda item: (item.new_path, item.old_path, item.status, item.base_revision))
 
 
 def changed_paths(root: Path, committed_range: str = "") -> list[bytes]:
-    paths = []
-    if committed_range:
-        paths.extend(_git_paths(
-            root,
-            ["diff", "--name-only", "-z", committed_range],
-        ))
-    paths.extend(_git_paths(root, ["diff", "--name-only", "-z", "--cached"]))
-    paths.extend(_git_paths(root, ["diff", "--name-only", "-z"]))
-    paths.extend(_git_paths(
-        root,
-        ["ls-files", "-z", "--others", "--exclude-standard"],
-    ))
-    return sorted(set(paths))
+    """Compatibility view used by integrations that only need path names."""
+    paths = {path for entry in changed_entries(root, committed_range) for path in (entry.old_path, entry.new_path)}
+    return sorted(path.encode("utf-8", errors="surrogateescape") for path in paths)
 
 
-def read_file_list(path: Path) -> list[str]:
+def serialize_entries(entries: list[DiffEntry]) -> bytes:
+    return b"\0".join(
+        json.dumps(asdict(entry), ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        for entry in entries
+    ) + (b"\0" if entries else b"")
+
+
+def read_diff_entries(path: Path) -> list[DiffEntry]:
     try:
         raw = path.read_bytes()
     except OSError:
         return []
-    return [
-        value.decode("utf-8", errors="surrogateescape")
-        for value in raw.split(b"\0")
-        if value
-    ]
+    entries: list[DiffEntry] = []
+    for value in raw.split(b"\0"):
+        if not value:
+            continue
+        try:
+            data = json.loads(value.decode("utf-8"))
+            entries.append(DiffEntry(**data))
+        except (TypeError, ValueError):
+            # Legacy files remain accepted; they describe a current path only.
+            name = value.decode("utf-8", errors="surrogateescape")
+            entries.append(DiffEntry("M", name, name, True, ""))
+    return entries
+
+
+def read_file_list(path: Path) -> list[str]:
+    return sorted({path for entry in read_diff_entries(path) for path in (entry.old_path, entry.new_path)})
 
 
 def main() -> int:
@@ -56,16 +105,14 @@ def main() -> int:
     parser.add_argument("--display", type=Path)
     args = parser.parse_args()
     if args.display:
-        for path in read_file_list(args.display):
-            print(json.dumps(path, ensure_ascii=True))
+        for entry in read_diff_entries(args.display):
+            print(json.dumps(asdict(entry), ensure_ascii=True, sort_keys=True))
         return 0
     try:
-        paths = changed_paths(Path.cwd(), args.committed_range)
+        sys.stdout.buffer.write(serialize_entries(changed_entries(Path.cwd(), args.committed_range)))
     except RuntimeError as error:
         print(f"Could not build diff file list: {error}", file=sys.stderr)
         return 1
-    if paths:
-        sys.stdout.buffer.write(b"\0".join(paths) + b"\0")
     return 0
 
 

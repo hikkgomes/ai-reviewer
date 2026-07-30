@@ -12,9 +12,9 @@ if sys.version_info < (3, 11):
 
 from dissect_checks.engine import options_from_environment, scan_report
 from dissect_checks.fixtures import (
-    is_trusted_self_review,
-    trusted_self_review_digest,
-    trusted_self_review_plan,
+    is_explicit_fixture_override,
+    explicit_fixture_override_digest,
+    explicit_fixture_override_plan,
 )
 from dissect_checks.redaction import redact_sensitive_text
 
@@ -32,13 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plan-self-review",
         action="store_true",
-        help="Print an inert trusted-self-review plan and approval digest, then exit.",
+        help="Print an inert caller-authorized fixture-override plan and digest, then exit.",
     )
     parser.add_argument(
         "--approve-self-review",
         default="",
         metavar="SHA256",
-        help="Enable exact fixture masking only for the matching checkout-bound plan.",
+        help="Enable caller-authorized fixture masking only for the matching checkout plan.",
     )
     return parser.parse_args()
 
@@ -47,11 +47,11 @@ def main() -> int:
     args = parse_args()
     root = Path.cwd()
     if args.plan_self_review:
-        plan = trusted_self_review_plan(root)
-        digest = trusted_self_review_digest(root)
+        plan = explicit_fixture_override_plan(root)
+        digest = explicit_fixture_override_digest(root)
         if plan is None or digest is None:
             print(json.dumps({
-                "self_review_plan": None,
+                "fixture_override_plan": None,
                 "error": "Target is not a complete Git checkout matching the installed fixture manifest.",
             }, indent=2, sort_keys=True))
             return 1
@@ -61,6 +61,7 @@ def main() -> int:
             str(plan["checkout"]["root"])
         )
         print(json.dumps({
+            "fixture_override_plan": safe_plan,
             "self_review_plan": safe_plan,
             "approval_digest": digest,
             "executed": False,
@@ -81,7 +82,7 @@ def main() -> int:
         args.approve_self_review
         or os.environ.get("DISSECT_SELF_REVIEW_APPROVAL", "")
     )
-    self_review_enabled = is_trusted_self_review(root, self_review_approval)
+    self_review_enabled = is_explicit_fixture_override(root, self_review_approval)
     options = options_from_environment(
         root,
         include_generated=args.include_generated,
@@ -102,6 +103,7 @@ def main() -> int:
                 "generated_bundles": options.include_generated,
                 "git_history": options.include_history,
                 "git_history_depth": options.history_depth if options.include_history else 0,
+                "caller_authorized_fixture_override": self_review_enabled,
                 "trusted_self_review": self_review_enabled,
             },
             "summary": {

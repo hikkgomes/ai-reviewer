@@ -7,7 +7,8 @@
   "review_options": {
     "run_install_on_review": false,
     "deterministic_output": "text",
-    "fail_on_severity": "none"
+    "fail_on_severity": "none",
+    "execution_environment": {}
   },
   "commands": {
     "install": "",
@@ -53,6 +54,7 @@
     "approved_production_urls": [],
     "allowed_runtime_checks": [],
     "python_import_aliases": {},
+    "execution_environment": {},
     "tool_commands": {}
   },
   "risk": {

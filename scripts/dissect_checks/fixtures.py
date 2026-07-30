@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 
 
-_MANIFEST_VERSION = 2
-_SELF_REVIEW_DOMAIN = b"dissect-trusted-self-review-v2\0"
+_MANIFEST_VERSION = 3
+_SELF_REVIEW_DOMAIN = b"dissect-fixture-override-v3\0"
 _STRUCTURED_RULE_PATH = "scripts/dissect_checks/rules.py"
 _LEGACY_RULE_PATH = "scripts/dissect_checks/legacy.py"
 _FIXTURE_REGISTRY_PATH = "scripts/dissect_checks/fixtures.py"
@@ -104,8 +104,12 @@ def _checkout_identity(root: Path) -> dict | None:
     }
 
 
-def trusted_self_review_plan(root: Path) -> dict | None:
-    """Bind explicit self-review approval to this checkout and fixture file state."""
+def explicit_fixture_override_plan(root: Path) -> dict | None:
+    """Describe a caller-authorized, checkout-specific fixture masking override.
+
+    This is deliberately not repository authentication: the caller supplying the
+    digest accepts fixture masking for this exact local checkout and file state.
+    """
     manifest = _trusted_fixture_manifest()
     if manifest.get("version") != _MANIFEST_VERSION:
         return None
@@ -120,14 +124,15 @@ def trusted_self_review_plan(root: Path) -> dict | None:
         return None
     return {
         "schema_version": _MANIFEST_VERSION,
+        "trust_model": "caller-authorized-checkout-specific-fixture-override",
         "manifest_sha256": _manifest_digest(manifest),
         "checkout": identity,
         "target_fixture_files": target_files,
     }
 
 
-def trusted_self_review_digest(root: Path) -> str | None:
-    plan = trusted_self_review_plan(root)
+def explicit_fixture_override_digest(root: Path) -> str | None:
+    plan = explicit_fixture_override_plan(root)
     if plan is None:
         return None
     encoded = json.dumps(
@@ -139,13 +144,21 @@ def trusted_self_review_digest(root: Path) -> str | None:
     return hashlib.sha256(_SELF_REVIEW_DOMAIN + encoded).hexdigest()
 
 
-def is_trusted_self_review(root: Path, approval_digest: str) -> bool:
-    expected = trusted_self_review_digest(root)
+def is_explicit_fixture_override(root: Path, approval_digest: str) -> bool:
+    expected = explicit_fixture_override_digest(root)
     return bool(
         expected
         and len(approval_digest) == 64
         and approval_digest == expected
     )
+
+
+# Compatibility aliases for integrations predating the honest Option B naming.
+# They retain identical restrictive behavior; public CLI/documentation uses the
+# explicit fixture-override terminology.
+trusted_self_review_plan = explicit_fixture_override_plan
+trusted_self_review_digest = explicit_fixture_override_digest
+is_trusted_self_review = is_explicit_fixture_override
 
 
 def _call_name(node: ast.Call) -> str:
@@ -201,7 +214,7 @@ def mask_owned_fixture_spans(
     approval_digest: str = "",
 ) -> str:
     """Blank only AST-proven fixture literals owned by Dissect itself."""
-    if not is_trusted_self_review(root, approval_digest):
+    if not is_explicit_fixture_override(root, approval_digest):
         return text
     fixture_entry = _trusted_fixture_manifest().get("fixtures", {}).get(path)
     if not fixture_entry:

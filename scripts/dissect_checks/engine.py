@@ -56,6 +56,7 @@ class ScanOptions:
     include_history: bool = False
     history_depth: int = 20
     file_list: tuple[str, ...] = ()
+    diff_entries: tuple[tuple[str, str, str, bool, str], ...] = ()
     ignore: tuple[str, ...] = ()
     generated_paths: tuple[str, ...] = ()
     python_import_aliases: tuple[tuple[str, str], ...] = ()
@@ -104,14 +105,26 @@ def options_from_environment(
     paths = config.get("paths") or {}
     security = config.get("security_review") or {}
     file_list = []
+    diff_entries = []
     source = os.environ.get("AI_REVIEW_FILE_LIST", "").strip()
     if source:
         try:
-            file_list = [
-                value.decode("utf-8", errors="surrogateescape")
-                for value in Path(source).read_bytes().split(b"\0")
-                if value
-            ]
+            for value in Path(source).read_bytes().split(b"\0"):
+                if not value:
+                    continue
+                try:
+                    entry = json.loads(value.decode("utf-8"))
+                    status = str(entry["status"])
+                    old_path = _normalise(str(entry["old_path"]))
+                    new_path = _normalise(str(entry["new_path"]))
+                    exists = bool(entry["exists_in_worktree"])
+                    base = str(entry.get("base_revision", ""))
+                    diff_entries.append((status, old_path, new_path, exists, base))
+                    if exists:
+                        file_list.append(new_path)
+                except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+                    # Compatibility with previous NUL-delimited path-only transport.
+                    file_list.append(value.decode("utf-8", errors="surrogateescape"))
         except OSError:
             file_list = []
     try:
@@ -124,6 +137,7 @@ def options_from_environment(
         include_history=include_history or bool(security.get("scan_git_history")),
         history_depth=history_depth,
         file_list=tuple(_normalise(item) for item in file_list if item),
+        diff_entries=tuple(diff_entries),
         ignore=tuple(_normalise(item) for item in paths.get("ignore", [])),
         generated_paths=tuple(dict.fromkeys(
             _normalise(item)
@@ -175,7 +189,9 @@ def _is_text_path(rel: str) -> bool:
 
 
 def _candidate_files(options: ScanOptions) -> list[str]:
-    if options.file_list:
+    if options.diff_entries:
+        candidates = [new for _status, _old, new, exists, _base in options.diff_entries if exists]
+    elif options.file_list:
         candidates = list(options.file_list)
     else:
         candidates = [
@@ -840,6 +856,23 @@ def scan_report(options: ScanOptions) -> ScanReport:
                 errors.append(f"working tree: could not read {rel}")
             continue
         findings.extend(_scan_owned_text(options, rel, rel, text, "working-tree"))
+
+    # A deletion has no current file to open. Its base blob is nevertheless useful
+    # evidence and, unlike a failed current read, is not a coverage failure when it
+    # can be read successfully.
+    for status, old_path, _new_path, _exists, base_revision in options.diff_entries:
+        if not status.startswith("D") or _ignored(old_path, options) or not _is_text_path(old_path):
+            continue
+        if not base_revision:
+            errors.append(f"diff scope: deleted {old_path!r} has no applicable base revision")
+            continue
+        text, read_error = _read_history_blob(options, base_revision, old_path)
+        if read_error:
+            errors.append(read_error)
+            continue
+        assert text is not None
+        source = f"git:{base_revision[:12]}:deleted-base"
+        findings.extend(_scan_owned_text(options, old_path, old_path, text, source))
 
     manifests, manifest_errors = _load_package_manifests(options)
     errors.extend(manifest_errors)
