@@ -64,6 +64,12 @@ The core methodology lives in `reference/methodology.md`:
 5. System Awareness
 6. Test Quality
 
+The canonical operational workflow is `reference/review-workflow.md`. It
+establishes intent, builds behavioural units, derives contracts, expands scope
+deliberately, generates candidates, falsifies them, verifies survivors, and
+reports only evidence-backed findings. The context and candidate ledger are
+internal review artifacts stored outside the reviewed checkout.
+
 Reference materials include human and AI error taxonomies, empirical risk weights, a report template, and language modules for TypeScript, JavaScript, Python, SQL, Java/C#, Go, Rust, C++, and PHP.
 
 The six layers remain the primary reasoning model. Stable coverage families in

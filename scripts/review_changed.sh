@@ -60,6 +60,12 @@ else
   python3 "$SCRIPT_DIR/diff_file_list.py" --display "$CHANGED_FILE_LIST"
 fi
 
+CONTEXT_PATH="${AI_REVIEW_CONTEXT_PATH:-$(mktemp /tmp/ai_review_context.XXXXXX 2>/dev/null || mktemp -t ai_review_context)}"
+python3 "$SCRIPT_DIR/build_review_context.py" \
+  --root "$ROOT" --mode diff --base "${MERGE_BASE:-$BASE_REF}" \
+  --file-list "$CHANGED_FILE_LIST" --output "$CONTEXT_PATH" >/dev/null
+echo "Review context: $CONTEXT_PATH"
+
 echo
 echo "== Detected languages =="
 python3 - <<'PY'

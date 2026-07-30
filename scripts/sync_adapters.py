@@ -9,7 +9,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCES = (ROOT / "reference" / "methodology.md", ROOT / "reference" / "check-families.md")
+SOURCES = (ROOT / "reference" / "review-workflow.md", ROOT / "reference" / "report-template.md")
 TARGETS = {
     "codex-instructions.md": ("<!-- DISSECT-START -->", "<!-- DISSECT-END -->", "Codex/AGENTS.md"),
     "cursor-rules.md": ("", "", "Cursor"),

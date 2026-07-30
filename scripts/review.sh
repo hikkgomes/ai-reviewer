@@ -15,6 +15,11 @@ DETECTED_JSON="$(mktemp /tmp/ai_review_detected.XXXXXX.json 2>/dev/null || mktem
 trap 'rm -f "$DETECTED_JSON"' EXIT
 python3 "$SCRIPT_DIR/detect_commands.py" >"$DETECTED_JSON" 2>/dev/null || true
 
+CONTEXT_PATH="${AI_REVIEW_CONTEXT_PATH:-$(mktemp /tmp/ai_review_context.XXXXXX 2>/dev/null || mktemp -t ai_review_context)}"
+python3 "$SCRIPT_DIR/build_review_context.py" \
+  --root "$ROOT" --mode full --output "$CONTEXT_PATH" >/dev/null
+echo "Review context: $CONTEXT_PATH"
+
 echo "== Universal AI Review: full repo =="
 echo "Repo: $ROOT"
 echo

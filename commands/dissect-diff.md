@@ -4,24 +4,12 @@ This is the default command for change review. It must not review the whole repo
 
 Workflow:
 
-1. Locate the installed skill directory at `.claude/skills/dissect` in the target project or `~/.claude/skills/dissect`.
-2. Read `reference/methodology.md`, `reference/check-families.md`, `reference/risk-weights.md`, and `reference/report-template.md` from that skill directory.
-3. Read the target repository's `.ai-review/local.json` if present.
-4. Determine the diff scope from the prompt:
-   - If the user names a branch, compare against that branch.
-   - If reviewing a PR, compare against the PR base branch.
-   - If no base is named, infer the upstream/base branch from git.
-   - Include staged, unstaged, and untracked files in addition to committed branch diff changes.
-5. Detect languages in the changed files and read matching modules under `reference/lang/`.
-6. Run `scripts/review_changed.sh <base-branch>` from the skill directory when a base branch is known; otherwise run it without an argument.
-7. Review only the changed/new behavior. Open surrounding code only to understand contracts, callers, and invariants.
-8. Apply all six review layers to the diff:
-   - Requirement Fidelity
-   - Logic and Edge Cases
-   - API and Dependency Integrity
-   - Security Patterns
-   - System Awareness
-   - Test Quality
-9. Return the report using `reference/report-template.md`.
+1. Read `reference/review-workflow.md`, the report template, and relevant language/framework packs.
+2. Establish intent from the user request, PR, issue, local task documents, contracts, and tests; record unavailable intent as Not verified.
+3. Run `scripts/review_changed.sh <base-branch>` to create context outside the target checkout, including NUL-safe changed scope and architecture evidence.
+4. Build behavioural units, identify contracts/invariants, and trace direct callers, callees, schemas, persistence, middleware, configuration, and tests only along credible relationships.
+5. Generate semantic and deterministic candidates in the ledger. Falsify every candidate, record contradicting evidence, and discard disproved or duplicate candidates.
+6. Verify surviving candidates with focused tests, local definitions, control/data-flow proof, or authoritative version-specific evidence. Only verified candidates are findings.
+7. Report findings first using `reference/report-template.md`; include concise open questions, verification performed, and scope/residual risk. Do not report unrelated pre-existing defects or generic security boilerplate.
 
 Report only evidence-backed findings. If a risk is plausible but unverified, label it as residual risk or an open question.

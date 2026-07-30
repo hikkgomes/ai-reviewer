@@ -21,3 +21,10 @@ Activate for `.go`.
 
 - Deliberately ignored close errors on read-only cleanup when documented.
 - Panics in initialization for unrecoverable configuration failures.
+# Operational tracing playbook
+
+Inspect interfaces, handlers, callers, context cancellation, goroutine
+lifecycle, error wrapping, transactions, config and tests. Trace request data
+to SQL, filesystem and outbound clients, and verify module versions and local
+signatures. Use focused `go test` or static checks only when approved. Treat
+shared middleware and repository helpers as possible controls before reporting.

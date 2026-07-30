@@ -37,7 +37,9 @@ Check for:
 - Business-rule drift: defaults, thresholds, currencies, permissions, ownership, status transitions, or retention rules that differ from existing code.
 - Missing negative behavior: what the code must reject, preserve, or refuse to mutate.
 
-Empirical anchor: semantic intent/execution mismatches dominate missed review bugs; treat requirement fidelity as the highest-leverage layer (51% of bugs missed in review are semantic mismatches, SmartSHARK dataset).
+Treat requirement fidelity as the highest-leverage layer: a review cannot be
+accurate when it substitutes a generic implementation for the requested
+behaviour.
 
 ## Layer 2: Logic and Edge Cases
 
@@ -49,7 +51,8 @@ Check for:
 - Async ordering, retries, cancellation, timeouts, idempotency, and race conditions.
 - Exception handling paths, especially where user-visible behavior or data integrity depends on them.
 
-Risk weighting: apply 1.75x attention to logic errors (+75% in AI code) and 2.0x to error handling (36% of all missed semantic bugs are exception-handling related).
+Spend extra attention on logic and error paths because they commonly compile
+and pass shallow tests while violating behaviour.
 
 ## Layer 3: API and Dependency Integrity
 
@@ -74,7 +77,8 @@ Check for:
 - Unsafe deserialization, weak crypto, TLS disabled, permissive CORS/CSP, missing security headers.
 - Destructive operations without confirmation, authorization, audit, transactionality, or rollback path.
 
-Risk weighting: apply 2.74x attention to security-sensitive AI code (+274% security vulnerabilities vs human code).
+Security-sensitive boundaries deserve deliberate contextual tracing even when a
+change appears unrelated to security.
 
 ## Layer 5: System Awareness
 
@@ -99,7 +103,8 @@ Check for:
 - Fixtures represent realistic data and do not encode hallucinated schemas.
 - Mocks do not remove the behavior under review.
 
-Risk weighting: because AI code produces about 2x more error-handling issues, error-path tests deserve 2.0x attention.
+Error-path tests deserve deliberate attention; passing happy-path tests is not
+evidence that rollback, cancellation, or failure contracts hold.
 
 ## Severity Classification
 
@@ -112,16 +117,17 @@ Prefer fewer, stronger findings. Every finding needs file/line evidence, impact,
 
 ## AI-Specific Risk Weighting
 
-When code is AI-generated or likely AI-assisted, bias attention using these multipliers:
+When code is AI-generated or likely AI-assisted, bias attention toward these
+failure classes without converting them into automatic findings:
 
-| Category | Multiplier | Review implication |
-| --- | ---: | --- |
-| Security | 2.74x | Inspect even indirect trust boundaries and defaults. |
-| Error handling | 2.0x | Trace exceptions, retries, fallbacks, cleanup, and user-visible errors. |
-| Logic | 1.75x | Manually execute boundary and semantic cases. |
-| Readability/consistency | 3.0x frequency | Usually lower severity, but watch for misleading abstraction. |
-| Performance I/O | 8.0x frequency | Check loops, queries, fanout calls, sync I/O, and repeated serialization. |
-| Concurrency | 2.0x | Review lifecycle, shared state, cancellation, and resource leaks. |
+| Category | Review implication |
+| --- | --- |
+| Security | Inspect indirect trust boundaries and permissive defaults. |
+| Error handling | Trace exceptions, retries, fallbacks, cleanup, and user-visible errors. |
+| Logic | Manually execute boundary and semantic cases. |
+| Readability/consistency | Watch for misleading abstractions, but avoid style findings. |
+| Performance I/O | Check loops, queries, fanout calls, sync I/O, and repeated serialization. |
+| Concurrency | Review lifecycle, shared state, cancellation, and resource leaks. |
 
 ## Review Discipline
 

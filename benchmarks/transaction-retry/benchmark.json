@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "id": "transaction-retry-duplicate-email",
+  "intent": "Retry a failed order write without sending duplicate confirmation emails.",
+  "base": "base",
+  "proposed": "proposed",
+  "expected_findings": [{"id": "COR-RETRY-001", "location": "proposed/worker.py", "severity": "high"}],
+  "forbidden_findings": ["missing idempotency documentation", "style-only finding"],
+  "expected_severity": {"COR-RETRY-001": ["high", "medium"]},
+  "required_not_verified": ["provider delivery semantics"],
+  "corrected": "corrected"
+}

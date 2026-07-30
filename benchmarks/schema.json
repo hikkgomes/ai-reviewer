@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dissect.local/benchmarks.schema.json",
+  "type": "object",
+  "required": ["schema_version", "id", "intent", "base", "proposed", "expected_findings", "forbidden_findings", "expected_severity", "required_not_verified"],
+  "properties": {
+    "schema_version": {"const": "1.0"}, "id": {"type": "string"}, "intent": {"type": "string"},
+    "base": {"type": "string"}, "proposed": {"type": "string"},
+    "expected_findings": {"type": "array", "items": {"type": "object", "required": ["id", "location", "severity"]}},
+    "forbidden_findings": {"type": "array", "items": {"type": "string"}},
+    "expected_severity": {"type": "object"}, "required_not_verified": {"type": "array", "items": {"type": "string"}},
+    "corrected": {"type": ["string", "null"]}
+  }
+}

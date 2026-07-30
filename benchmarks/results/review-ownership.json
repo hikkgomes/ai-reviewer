@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "mode": "diff",
+  "findings": [{
+    "id": "SEC-AUTHZ-001", "severity": "critical", "confidence": "high", "location": "proposed/routes.py:2",
+    "contract": "The API must constrain invoice access to the authenticated user's tenant.",
+    "trigger_path": "An authenticated user supplies another tenant's invoice ID to the update endpoint.",
+    "impact": "The user can mutate a cross-tenant invoice.",
+    "evidence": ["The base uses invoice_for_tenant; the proposed route loads by unscoped ID before update."],
+    "fix": "Use a tenant-scoped update predicate or query the invoice through the authenticated tenant boundary.",
+    "verification": "Send an update with an invoice ID from another tenant and assert a not-found/forbidden result."
+  }],
+  "open_questions": [],
+  "not_verified": ["production identity provider configuration"],
+  "coverage": {"SEC-AUTHZ": {"state": "Finding"}}
+}

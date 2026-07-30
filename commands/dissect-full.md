@@ -4,15 +4,11 @@ Use this command for baseline audits, focused subsystem reviews, security sweeps
 
 Workflow:
 
-1. Locate the installed skill directory at `.claude/skills/dissect` in the target project or `~/.claude/skills/dissect`.
-2. Read `reference/methodology.md`, `reference/check-families.md`, `reference/risk-weights.md`, and `reference/report-template.md` from that skill directory.
-3. Read the target repository's `.ai-review/local.json` if present.
-4. Determine scope from the prompt:
-   - Whole repo if no narrower scope is requested.
-   - Specific paths, modules, features, languages, or risk domains if named.
-5. Detect languages in the selected scope and read matching modules under `reference/lang/`.
-6. Run `scripts/review.sh` from the skill directory with the target repository as the working directory.
-7. Apply all six review layers to the selected existing code, not just new changes.
-8. Return the report using `reference/report-template.md`.
+1. Read `reference/review-workflow.md`, the report template, and relevant language/framework packs.
+2. Establish intent and scope from the prompt, local instructions, public contracts, schemas, and tests; record unavailable requirements as Not verified.
+3. Run `scripts/review.sh` to build a complete context outside the target checkout and activate the architecture detector.
+4. Group the repository or selected subsystem into behavioural/system units. Identify contracts and invariants, then trace their credible callers, callees, persistence, routes, middleware, configuration, operations, and tests.
+5. Generate candidates from semantic tracing, deterministic checks, and approved external tools. Falsify every candidate and verify survivors with concrete evidence.
+6. Use the full report format when useful: system model, relevant coverage ledger, Not applicable and Not verified controls, operational evidence, and remediation priorities. Report only verified findings, material open questions, and honest residual risk.
 
 Prioritize correctness, security, API/schema validity, system integration, and meaningful tests over style.

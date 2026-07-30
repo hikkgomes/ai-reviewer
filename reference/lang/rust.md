@@ -21,3 +21,10 @@ Activate for `.rs`.
 
 - `expect` in tests and setup code.
 - `Rc<RefCell<T>>` in single-threaded graph/tree structures where mutation is explicit.
+# Operational tracing playbook
+
+Inspect trait contracts, callers, error types, async task cancellation,
+ownership/lifetimes, serialization, feature flags and tests. Trace external
+input into unsafe code, SQL, paths and network clients; verify crate versions
+from Cargo metadata. Use focused tests or compiler output when approved and
+distinguish an intentional `unsafe`/interior-mutability boundary from a bug.

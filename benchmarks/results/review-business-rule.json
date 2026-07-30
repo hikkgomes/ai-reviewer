@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "mode": "diff",
+  "findings": [{
+    "id": "COR-BUSINESS-001", "severity": "high", "confidence": "high", "location": "proposed/orders.py:3",
+    "contract": "Discount authority comes from the server-side membership record.",
+    "trigger_path": "A request sets member_is_active=true while the server-side member is inactive.",
+    "impact": "An ineligible member receives a discount.",
+    "evidence": ["The proposed function reads order.member_is_active; the base contract passes member.is_active."],
+    "fix": "Load and use the server-side membership record before calculating the discount.",
+    "verification": "Test an inactive member with a true client flag and assert no discount."
+  }],
+  "open_questions": [],
+  "not_verified": ["runtime membership data"],
+  "coverage": {"COR-BUSINESS": {"state": "Finding"}}
+}

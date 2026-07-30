@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dissect.local/review-result.schema.json",
+  "type": "object",
+  "required": ["schema_version", "mode", "findings", "open_questions", "not_verified", "coverage"],
+  "properties": {
+    "schema_version": {"const": "1.0"}, "mode": {"enum": ["diff", "full"]},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "open_questions": {"type": "array", "items": {"type": "string"}},
+    "not_verified": {"type": "array", "items": {"type": "string"}},
+    "coverage": {"type": "object"}
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": ["id", "severity", "confidence", "location", "contract", "trigger_path", "impact", "evidence", "fix", "verification"],
+      "properties": {
+        "id": {"type": "string"}, "severity": {"enum": ["critical", "high", "medium", "low"]}, "confidence": {"type": "string"},
+        "location": {"type": "string"}, "contract": {"type": "string"}, "trigger_path": {"type": "string"}, "impact": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}}, "fix": {"type": "string"}, "verification": {"type": "string"}
+      }
+    }
+  }
+}

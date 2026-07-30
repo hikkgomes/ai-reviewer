@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "id": "business-rule-discount",
+  "intent": "Members may use one discount per order; the discount must be derived from the server-side membership record.",
+  "base": "base",
+  "proposed": "proposed",
+  "expected_findings": [{"id": "COR-BUSINESS-001", "location": "proposed/orders.py", "severity": "high"}],
+  "forbidden_findings": ["missing tests", "style", "generic authorization"],
+  "expected_severity": {"COR-BUSINESS-001": ["high", "critical"]},
+  "required_not_verified": ["runtime membership data"],
+  "corrected": "corrected"
+}

@@ -21,3 +21,11 @@ Activate for `.java` and `.cs`.
 
 - Boundary adapters that intentionally translate exceptions.
 - Enumerables materialized deliberately to avoid repeated database queries.
+# Operational tracing playbook
+
+Inspect controllers, filters, service interfaces, DTO/schema definitions,
+transactions, async work, configuration and tests. Trace identity and input
+through ORM queries, serializers and exception handlers; verify dependency
+versions and generated clients locally. Use focused build/test/type checks when
+approved, and account for framework middleware before reporting a boundary
+failure.

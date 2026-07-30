@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "mode": "diff",
+  "findings": [{
+    "id": "COR-RETRY-001", "severity": "high", "confidence": "high", "location": "proposed/worker.py:5",
+    "contract": "Retrying fulfillment must not duplicate external side effects.",
+    "trigger_path": "The mail provider times out after accepting a send; the loop sends again.",
+    "impact": "A customer receives duplicate confirmation emails and the paid state is committed independently.",
+    "evidence": ["The proposed code calls mailer.send on every retry and has no idempotency key or transaction boundary."],
+    "fix": "Use an idempotent delivery record/key and coordinate the state transition with durable retry processing.",
+    "verification": "Inject a timeout after provider acceptance and assert one delivery."
+  }],
+  "open_questions": [],
+  "not_verified": ["provider delivery semantics"],
+  "coverage": {"COR-RETRY": {"state": "Finding"}}
+}
