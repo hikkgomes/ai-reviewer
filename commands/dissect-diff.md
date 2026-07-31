@@ -2,6 +2,10 @@ Review only new changes against a base branch, PR base, or explicitly requested 
 
 This is the default command for change review. It must not review the whole repository except as needed to understand the changed code.
 
+Resolve the `reference/` and `scripts/` paths below from the installed Dissect
+skill root (the directory containing the skill's `SKILL.md`), not from the
+repository under review.
+
 Workflow:
 
 1. Read `reference/review-workflow.md`, the report template, and relevant language/framework packs.

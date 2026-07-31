@@ -112,6 +112,9 @@ description: Diff review for AI-assisted code. Use to review new changes against
 
 # dissect-diff
 
+Resolve all `reference/` and `scripts/` paths below from the directory
+containing this installed `SKILL.md`, not from the repository under review.
+
 Use `reference/review-workflow.md` as the canonical workflow. Establish intent,
 build behavioural units, identify contracts, trace credible blast radius,
 generate candidates, falsify every candidate, verify survivors, and report only
@@ -126,6 +129,9 @@ description: Full review for AI-assisted code. Use to review the whole repositor
 ---
 
 # dissect-full
+
+Resolve all `reference/` and `scripts/` paths below from the directory
+containing this installed `SKILL.md`, not from the repository under review.
 
 Use `reference/review-workflow.md` as the canonical workflow. Establish intent
 and scope, build behavioural/system units, identify contracts, trace credible
