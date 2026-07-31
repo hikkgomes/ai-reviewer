@@ -1,0 +1,130 @@
+{
+  "vulnerable": [
+    {
+      "name": "frontend privileged secret exposure",
+      "path": "src/browser.ts",
+      "code": "export const key = import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY;",
+      "expected": ["SEC-SECRETS-001"]
+    },
+    {
+      "name": "credible live credential",
+      "path": "config/prod.ts",
+      "code": "export const stripeKey = 'sk_live_1234567890abcdefghij';",
+      "expected": ["SEC-SECRETS-002"]
+    },
+    {
+      "name": "ui only authentication",
+      "path": "src/Admin.tsx",
+      "code": "const ok = localStorage.getItem('isAdmin'); if (ok) return <Admin />;",
+      "expected": ["SEC-AUTHN-001"]
+    },
+    {
+      "name": "unprotected administrative route",
+      "path": "server/routes.ts",
+      "code": "router.get('/admin', async (request, response) => response.json(await users()));",
+      "expected": ["SEC-ROUTES-001"]
+    },
+    {
+      "name": "missing object ownership",
+      "path": "server/user.ts",
+      "code": "return db.user.findUnique({ where: { id: req.params.id } });",
+      "expected": ["SEC-AUTHZ-001"]
+    },
+    {
+      "name": "missing Supabase RLS",
+      "path": "supabase/migrations/001.sql",
+      "code": "create table records (id uuid, tenant_id uuid, body text);",
+      "expected": ["SEC-DATABASE-002"]
+    },
+    {
+      "name": "permissive Supabase RLS",
+      "path": "supabase/migrations/002.sql",
+      "code": "create policy all_rows on records for select using (true);",
+      "expected": ["SEC-DATABASE-001"]
+    },
+    {
+      "name": "credentialed wildcard CORS",
+      "path": "server/cors.ts",
+      "code": "app.use(cors({ origin: '*', credentials: true }));",
+      "expected": ["SEC-BROWSER-001"]
+    },
+    {
+      "name": "client controlled payment amount",
+      "path": "api/checkout.ts",
+      "code": "stripe.paymentIntents.create({ amount: req.body.amount });",
+      "expected": ["SEC-PAYMENTS-001"]
+    },
+    {
+      "name": "missing webhook verification",
+      "path": "api/stripe-webhook.ts",
+      "code": "export async function POST(req) { const event = await req.json(); return processPayment(event); }",
+      "expected": ["SEC-PAYMENTS-002"]
+    },
+    {
+      "name": "sensitive data logging",
+      "path": "api/session.ts",
+      "code": "logger.info('session', { token: session.token });",
+      "expected": ["SEC-DATA-001"]
+    },
+    {
+      "name": "unsafe dependency source",
+      "path": "package.json",
+      "code": "{\"dependencies\":{\"review-helper\":\"git://example.invalid/review-helper.git\"}}",
+      "expected": ["SUP-DEPENDENCY-001"]
+    },
+    {
+      "name": "destructive infrastructure",
+      "path": "infra/storage.tf",
+      "code": "resource \"bucket\" \"data\" { force_destroy = true }",
+      "expected": ["OPS-DESTRUCTIVE-001"]
+    },
+    {
+      "name": "public deployment resource",
+      "path": "infra/storage.tf",
+      "code": "resource \"bucket\" \"customer_exports\" { public = true }",
+      "expected": ["SEC-DEPLOY-001"]
+    }
+  ],
+  "safe": [
+    {
+      "name": "intended public Supabase identifier",
+      "path": "src/browser.ts",
+      "code": "export const key = import.meta.env.VITE_SUPABASE_ANON_KEY;"
+    },
+    {
+      "name": "server authentication and route authorisation",
+      "path": "server/routes.ts",
+      "code": "router.get('/admin', requireAdmin, async (req, res) => res.json([]));"
+    },
+    {
+      "name": "tenant-bound object access",
+      "path": "server/user.ts",
+      "code": "return db.user.findUnique({ where: { id: req.params.id, tenantId: req.user.tenantId } });"
+    },
+    {
+      "name": "RLS with ownership policy",
+      "path": "supabase/migrations/001.sql",
+      "code": "create table records (id uuid, user_id uuid); alter table records enable row level security; create policy own on records using (auth.uid() = user_id);"
+    },
+    {
+      "name": "explicit origin",
+      "path": "server/cors.ts",
+      "code": "app.use(cors({ origin: 'https://app.example.com', credentials: true }));"
+    },
+    {
+      "name": "server-derived payment and verified webhook",
+      "path": "api/stripe-webhook.ts",
+      "code": "export async function POST(req) { const event = stripe.webhooks.constructEvent(await req.text(), sig, secret); return processPayment(event); }"
+    },
+    {
+      "name": "normal locked dependency",
+      "path": "package.json",
+      "code": "{\"dependencies\":{\"review-helper\":\"1.2.3\"}}"
+    },
+    {
+      "name": "legitimate branded integration",
+      "path": "src/StripeConnect.tsx",
+      "code": "export function StripeConnect() { return <a href='/oauth/stripe'>Connect your Stripe account</a>; }"
+    }
+  ]
+}

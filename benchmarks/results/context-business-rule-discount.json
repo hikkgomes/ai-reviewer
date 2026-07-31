@@ -1,0 +1,403 @@
+{
+  "behavioural_units": [
+    {
+      "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
+      "before": "Base behaviour must be compared from the supplied diff/base revision.",
+      "callers": [],
+      "changed_symbols": [
+        "orders.py:checkout"
+      ],
+      "configuration": [],
+      "downstream_consumers": [],
+      "entry_points": [
+        "orders.py"
+      ],
+      "error_paths": [],
+      "external_side_effects": [],
+      "id": "unit-1",
+      "inputs": [],
+      "kind": "application behaviour",
+      "outputs": [
+        "return total_for_order(order, db.member_for_user(member.user_id))"
+      ],
+      "scope_reasons": {
+        "orders.py": []
+      },
+      "state_modified": [
+        "def checkout(order, member, db):",
+        "return total_for_order(order, db.member_for_user(member.user_id))"
+      ],
+      "state_read": [
+        "def checkout(order, member, db):",
+        "return total_for_order(order, db.member_for_user(member.user_id))"
+      ],
+      "tests": []
+    },
+    {
+      "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
+      "before": "Base behaviour must be compared from the supplied diff/base revision.",
+      "callers": [
+        {
+          "path": "orders.py",
+          "reason": "direct symbol reference",
+          "symbols": [
+            "total_for_order"
+          ]
+        }
+      ],
+      "changed_symbols": [
+        "app/pricing.py:total_for_order"
+      ],
+      "configuration": [],
+      "downstream_consumers": [
+        {
+          "path": "orders.py",
+          "reason": "direct symbol reference",
+          "symbols": [
+            "total_for_order"
+          ]
+        }
+      ],
+      "entry_points": [
+        "app/__init__.py",
+        "app/pricing.py"
+      ],
+      "error_paths": [],
+      "external_side_effects": [],
+      "id": "unit-2",
+      "inputs": [
+        "# The client supplies the convenient member flag in this request object."
+      ],
+      "kind": "application behaviour",
+      "outputs": [
+        "return order.subtotal * (1 - discount)"
+      ],
+      "scope_reasons": {
+        "app/__init__.py": [],
+        "app/pricing.py": []
+      },
+      "state_modified": [],
+      "state_read": [],
+      "tests": []
+    },
+    {
+      "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
+      "before": "Base behaviour must be compared from the supplied diff/base revision.",
+      "callers": [],
+      "changed_symbols": [
+        "tests/test_checkout.py:test_checkout_uses_server_member_record"
+      ],
+      "configuration": [],
+      "downstream_consumers": [],
+      "entry_points": [
+        "tests/test_checkout.py"
+      ],
+      "error_paths": [],
+      "external_side_effects": [],
+      "id": "unit-3",
+      "inputs": [
+        "# Mirrors the implementation and does not exercise the request boundary."
+      ],
+      "kind": "payment",
+      "outputs": [],
+      "scope_reasons": {
+        "tests/test_checkout.py": []
+      },
+      "state_modified": [],
+      "state_read": [],
+      "tests": [
+        "tests/test_checkout.py"
+      ]
+    }
+  ],
+  "candidates": [
+    {
+      "check_id": "SUP-DEPENDENCY-004",
+      "claim": "A Python import is not recognised as standard-library, repository-local, or a known ecosystem dependency.",
+      "confidence": "medium",
+      "contract": "Requires contextual semantic confirmation before reporting.",
+      "contradicting_evidence": [],
+      "explanation": "A Python import is not recognised as standard-library, repository-local, or a known ecosystem dependency.",
+      "falsification_attempts": [],
+      "id": "candidate-deterministic-1",
+      "impact": "Verify the package name and declare it in the nearest Python dependency manifest.",
+      "location": {
+        "line": 1,
+        "path": "app/pricing.py"
+      },
+      "remediation": "Verify the package name and declare it in the nearest Python dependency manifest.",
+      "semantic_confirmation_required": true,
+      "severity_suggestion": "medium",
+      "source": "deterministic",
+      "status": "candidate",
+      "supporting_evidence": [
+        {
+          "check_id": "SUP-DEPENDENCY-004",
+          "confidence": "medium",
+          "evidence": "fastapi"
+        }
+      ],
+      "trigger_path": [
+        "app/pricing.py:1"
+      ],
+      "verification_attempts": []
+    }
+  ],
+  "commands": [
+    {
+      "complete": true,
+      "executed": true,
+      "name": "git evidence collection"
+    },
+    {
+      "complete": true,
+      "executed": true,
+      "name": "architecture detection"
+    },
+    {
+      "complete": true,
+      "executed": true,
+      "name": "deterministic scanner"
+    }
+  ],
+  "coverage": {
+    "ABUSE-BRAND": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "GOV-AUDIT": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "GOV-REGRESSION": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "OPS-DESTRUCTIVE": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "OPS-OBSERVABILITY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "OPS-RECOVERY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-AUTHN": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-AUTHZ": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-BROWSER": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-DATA": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-DATABASE": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-DEPLOY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-PAYMENTS": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-ROUTES": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-SECRETS": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SUP-DEPENDENCY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    }
+  },
+  "intent": {
+    "ambiguities": [],
+    "constraints": [],
+    "negative_requirements": [],
+    "sources": [
+      {
+        "kind": "benchmark/task intent",
+        "path": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/business-rule/intent.md"
+      }
+    ],
+    "summary": "Members may use one discount per order; the discount must be derived from the server-side membership record.\n"
+  },
+  "limitations": [
+    "Semantic confirmation, falsification, and runtime evidence are performed by the reviewer."
+  ],
+  "mode": "full",
+  "repository": {
+    "architecture": {
+      "ai_refinement_needed": [
+        "Confirm architecture pattern classification",
+        "Add a concise project description from the codebase context",
+        "Identify domain-specific conventions not captured by heuristics",
+        "Verify key libraries and runtime integrations",
+        "Confirm required environment setup and local services"
+      ],
+      "config_files": [],
+      "docker_services": [],
+      "entry_points": [],
+      "env_keys": [],
+      "folder_structure": {
+        "app": "application entry points and routes",
+        "tests": "tests"
+      },
+      "key_libraries": {
+        "auth": [],
+        "database": [],
+        "framework": [],
+        "http": [],
+        "payments": [],
+        "state_management": [],
+        "styling": [],
+        "testing": [],
+        "validation": []
+      },
+      "naming": {
+        "components": "",
+        "files": "camelCase",
+        "tests": "test_*.py",
+        "variables": "camelCase"
+      },
+      "patterns": [
+        "app-router"
+      ],
+      "project_description": ""
+    },
+    "framework_packs": [
+      {
+        "loaded": true,
+        "name": "fastapi",
+        "path": "reference/frameworks/fastapi.md",
+        "sha256": "5959a55c67cf9d544104b2ec456b6cc474537db134124dd86624b9bfd4d378e1"
+      },
+      {
+        "loaded": true,
+        "name": "sqlalchemy",
+        "path": "reference/frameworks/sqlalchemy.md",
+        "sha256": "f6475e3d1a9465ba7b1890c5a6fa1cd4db535dcdae7bbf54fa1ef85e74bf324c"
+      }
+    ],
+    "frameworks": [
+      "fastapi",
+      "sqlalchemy"
+    ],
+    "instructions": [],
+    "languages": [
+      "python"
+    ],
+    "manifests": [],
+    "package_managers": [],
+    "test_commands": {
+      "build": "",
+      "format": "",
+      "install": "",
+      "lint": "",
+      "test": "",
+      "typecheck": ""
+    },
+    "touchpoints": {
+      "auth": [],
+      "infrastructure": [],
+      "payments": [
+        {
+          "path": "orders.py",
+          "reason": "path or source token matched"
+        },
+        {
+          "path": "tests/test_checkout.py",
+          "reason": "path or source token matched"
+        }
+      ],
+      "persistence": [
+        {
+          "path": "orders.py",
+          "reason": "path or source token matched"
+        }
+      ],
+      "routes": [
+        {
+          "path": "app/pricing.py",
+          "reason": "path or source token matched"
+        }
+      ]
+    }
+  },
+  "schema_version": "1.0",
+  "scope": {
+    "base": "",
+    "branch": "agent/dissect-evidence-first",
+    "entries": [
+      {
+        "blob_path": "orders.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "orders.py",
+        "old_path": "orders.py",
+        "reviewed_path": "orders.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "app/__init__.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "app/__init__.py",
+        "old_path": "app/__init__.py",
+        "reviewed_path": "app/__init__.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "app/pricing.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "app/pricing.py",
+        "old_path": "app/pricing.py",
+        "reviewed_path": "app/pricing.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "tests/test_checkout.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "tests/test_checkout.py",
+        "old_path": "tests/test_checkout.py",
+        "reviewed_path": "tests/test_checkout.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      }
+    ],
+    "files": [
+      "app/__init__.py",
+      "app/pricing.py",
+      "orders.py",
+      "tests/test_checkout.py"
+    ],
+    "head": "499c7b33495ff9eb7ec108e38073452926f59322",
+    "merge_base": "",
+    "root": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/business-rule/proposed"
+  }
+}

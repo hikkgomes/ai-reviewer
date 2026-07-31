@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "id": "ownership-cross-tenant-update",
+  "intent": "Users can update only invoices belonging to their tenant; the API is the enforcement boundary.",
+  "frameworks": ["express", "prisma"],
+  "base": "base",
+  "proposed": "proposed",
+  "expected_findings": [{"id": "SEC-AUTHZ-001", "location": "proposed/routes.py", "severity": "critical"}],
+  "forbidden_findings": ["UI is protected", "route name alone", "safe ownership fixture"],
+  "expected_severity": {"SEC-AUTHZ-001": ["critical", "high"]},
+  "required_not_verified": ["production identity provider configuration"],
+  "mutations": ["remove tenant predicate from invoice lookup"],
+  "corrected": "corrected"
+}

@@ -27,3 +27,16 @@ Activate for `.ts` and `.tsx`.
 
 - Intentional casts around well-contained framework limitations.
 - Generated client types with awkward optional fields.
+# Operational tracing playbook
+
+Inspect task/PR intent, public types, schemas, generated API clients, route
+callers, server/client boundaries, tests, and the package version before making
+an API claim. Trace values from runtime input through validation, persistence,
+serialization, and UI consumption. Check React lifecycle/stale state,
+Next.js routes and server actions, promise rejection/cancellation, exhaustive
+state machines, date/number serialization, and static types that do not exist
+at runtime. Verify APIs against local definitions or the installed package.
+Useful checks are the repository's typecheck, focused test, and a minimal
+runtime reproduction; never treat a clean TypeScript compile as runtime
+validation. Avoid false positives when a shared validator, middleware, or
+generated type supplies the control.

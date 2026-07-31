@@ -6,11 +6,12 @@ from pathlib import Path
 import argparse
 import json
 import re
+import sys
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None
+if sys.version_info < (3, 11):
+    raise SystemExit("Dissect requires Python 3.11 or newer.")
+
+import tomllib
 
 
 SKIP_DIRS = {
@@ -240,8 +241,6 @@ def read_json(path: Path) -> dict:
 
 
 def read_toml(path: Path) -> dict:
-    if tomllib is None:
-        return {}
     try:
         return tomllib.loads(path.read_text(encoding="utf-8"))
     except Exception:

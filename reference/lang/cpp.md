@@ -21,3 +21,10 @@ Activate for `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.h`, and `.c`.
 
 - Non-owning raw pointers where local conventions clearly use them as views.
 - Low-level code that intentionally avoids exceptions or heap allocation.
+# Operational tracing playbook
+
+Inspect ownership, lifetime, thread-safety, error/cleanup paths, ABI contracts,
+build configuration and tests. Trace untrusted input through parsers, memory
+and filesystem/network boundaries; verify compiler and dependency versions.
+Use focused compiler/sanitizer/tests only when approved. Distinguish an
+intentional low-level boundary from a reachable invalid-state path.

@@ -23,3 +23,13 @@ Activate for `.py`.
 
 - Sentinel defaults using `None` with explicit initialization.
 - Broad exceptions at process boundaries that log and re-raise or convert to a documented error.
+# Operational tracing playbook
+
+Inspect task intent, import declarations, callers, schemas, settings,
+transaction/session dependencies, tests and deployment configuration. Trace
+async cancellation and task lifecycle, context-manager cleanup, FastAPI/
+Pydantic or Django validation, exception translation, mutable defaults, and
+runtime/type mismatches. Confirm dependency declarations and import aliases in
+the nearest manifest. Use focused pytest/unittest, typechecker, or linter
+commands only when approved. Do not report an unhandled-looking exception when
+an outer boundary intentionally translates it; verify the complete call path.

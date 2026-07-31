@@ -1,0 +1,317 @@
+{
+  "behavioural_units": [
+    {
+      "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
+      "before": "Base behaviour must be compared from the supplied diff/base revision.",
+      "callers": [],
+      "changed_symbols": [
+        "mailer.py:Mailer",
+        "mailer.py:send",
+        "repository.py:OrderStore",
+        "repository.py:mark_paid",
+        "worker.py:fulfil"
+      ],
+      "configuration": [],
+      "downstream_consumers": [],
+      "entry_points": [
+        "mailer.py",
+        "repository.py",
+        "worker.py"
+      ],
+      "error_paths": [
+        "except TimeoutError:"
+      ],
+      "external_side_effects": [
+        "def send(self, address):",
+        "mailer.send(order.email)"
+      ],
+      "id": "unit-1",
+      "inputs": [],
+      "kind": "application behaviour",
+      "outputs": [
+        "return address",
+        "return order_id",
+        "return"
+      ],
+      "scope_reasons": {
+        "mailer.py": [],
+        "repository.py": [],
+        "worker.py": []
+      },
+      "state_modified": [
+        "def fulfil(order, store, mailer):",
+        "store.mark_paid(order.id)"
+      ],
+      "state_read": [
+        "def fulfil(order, store, mailer):",
+        "store.mark_paid(order.id)"
+      ],
+      "tests": []
+    },
+    {
+      "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
+      "before": "Base behaviour must be compared from the supplied diff/base revision.",
+      "callers": [],
+      "changed_symbols": [
+        "tests/test_worker.py:test_timeout_retry"
+      ],
+      "configuration": [],
+      "downstream_consumers": [],
+      "entry_points": [
+        "tests/test_worker.py"
+      ],
+      "error_paths": [
+        "def test_timeout_retry():"
+      ],
+      "external_side_effects": [],
+      "id": "unit-2",
+      "inputs": [],
+      "kind": "test",
+      "outputs": [],
+      "scope_reasons": {
+        "tests/test_worker.py": []
+      },
+      "state_modified": [],
+      "state_read": [],
+      "tests": [
+        "tests/test_worker.py"
+      ]
+    }
+  ],
+  "candidates": [],
+  "commands": [
+    {
+      "complete": true,
+      "executed": true,
+      "name": "git evidence collection"
+    },
+    {
+      "complete": true,
+      "executed": true,
+      "name": "architecture detection"
+    },
+    {
+      "complete": true,
+      "executed": true,
+      "name": "deterministic scanner"
+    }
+  ],
+  "coverage": {
+    "ABUSE-BRAND": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "GOV-AUDIT": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "GOV-REGRESSION": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "OPS-DESTRUCTIVE": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "OPS-OBSERVABILITY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "OPS-RECOVERY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-AUTHN": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-AUTHZ": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-BROWSER": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-DATA": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-DATABASE": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-DEPLOY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-PAYMENTS": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-ROUTES": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SEC-SECRETS": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    },
+    "SUP-DEPENDENCY": {
+      "reason": "Deterministic candidates require semantic confirmation.",
+      "state": "Not verified"
+    }
+  },
+  "intent": {
+    "ambiguities": [],
+    "constraints": [],
+    "negative_requirements": [],
+    "sources": [
+      {
+        "kind": "benchmark/task intent",
+        "path": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/intent.md"
+      }
+    ],
+    "summary": "Retry a failed order write without sending duplicate confirmation emails.\n"
+  },
+  "limitations": [
+    "Semantic confirmation, falsification, and runtime evidence are performed by the reviewer."
+  ],
+  "mode": "full",
+  "repository": {
+    "architecture": {
+      "ai_refinement_needed": [
+        "Confirm architecture pattern classification",
+        "Add a concise project description from the codebase context",
+        "Identify domain-specific conventions not captured by heuristics",
+        "Verify key libraries and runtime integrations",
+        "Confirm required environment setup and local services"
+      ],
+      "config_files": [],
+      "docker_services": [],
+      "entry_points": [],
+      "env_keys": [],
+      "folder_structure": {
+        "tests": "tests"
+      },
+      "key_libraries": {
+        "auth": [],
+        "database": [],
+        "framework": [],
+        "http": [],
+        "payments": [],
+        "state_management": [],
+        "styling": [],
+        "testing": [],
+        "validation": []
+      },
+      "naming": {
+        "components": "",
+        "files": "camelCase",
+        "tests": "test_*.py",
+        "variables": "camelCase"
+      },
+      "patterns": [],
+      "project_description": ""
+    },
+    "framework_packs": [
+      {
+        "loaded": true,
+        "name": "fastapi",
+        "path": "reference/frameworks/fastapi.md",
+        "sha256": "5959a55c67cf9d544104b2ec456b6cc474537db134124dd86624b9bfd4d378e1"
+      },
+      {
+        "loaded": true,
+        "name": "sqlalchemy",
+        "path": "reference/frameworks/sqlalchemy.md",
+        "sha256": "f6475e3d1a9465ba7b1890c5a6fa1cd4db535dcdae7bbf54fa1ef85e74bf324c"
+      }
+    ],
+    "frameworks": [
+      "fastapi",
+      "sqlalchemy"
+    ],
+    "instructions": [],
+    "languages": [
+      "python"
+    ],
+    "manifests": [],
+    "package_managers": [],
+    "test_commands": {
+      "build": "",
+      "format": "",
+      "install": "",
+      "lint": "",
+      "test": "",
+      "typecheck": ""
+    },
+    "touchpoints": {
+      "auth": [],
+      "infrastructure": [],
+      "payments": [],
+      "persistence": [],
+      "routes": []
+    }
+  },
+  "schema_version": "1.0",
+  "scope": {
+    "base": "",
+    "branch": "agent/dissect-evidence-first",
+    "entries": [
+      {
+        "blob_path": "worker.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "worker.py",
+        "old_path": "worker.py",
+        "reviewed_path": "worker.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "repository.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "repository.py",
+        "old_path": "repository.py",
+        "reviewed_path": "repository.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "mailer.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "mailer.py",
+        "old_path": "mailer.py",
+        "reviewed_path": "mailer.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "tests/test_worker.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "tests/test_worker.py",
+        "old_path": "tests/test_worker.py",
+        "reviewed_path": "tests/test_worker.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      }
+    ],
+    "files": [
+      "mailer.py",
+      "repository.py",
+      "tests/test_worker.py",
+      "worker.py"
+    ],
+    "head": "499c7b33495ff9eb7ec108e38073452926f59322",
+    "merge_base": "",
+    "root": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/proposed"
+  }
+}

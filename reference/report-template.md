@@ -1,82 +1,51 @@
-# AI Review Report
+# Dissect review report
 
-## Mental Model
+Routine diff reviews use this compact structure and do not emit unrelated
+coverage families.
 
-- Intent:
-- Modified layers:
-- Invariants:
-- Language modules:
-- Risk weighting:
+## Findings
 
-## Findings by Layer
+### [High] Title
+`path/file.ts:123`
+Confidence: High
 
-Report findings grouped by methodology layer first, then by severity within each layer.
+Explain the broken behaviour and the violated contract or invariant.
 
-### Layer 1: Requirement Fidelity
+**Failure scenario:** Concrete path from input to impact.
 
-- No issues found in this layer.
+**Evidence:** Changed code, relevant caller/schema/control, and verification performed.
 
-### Layer 2: Logic and Edge Cases
+**Fix:** Minimal actionable correction.
 
-- No issues found in this layer.
+**Verification:** Test or command that should prove the fix.
 
-### Layer 3: API and Dependency Integrity
+## Open Questions
 
-- No issues found in this layer.
+Include only questions that materially affect correctness or severity.
 
-### Layer 4: Security Patterns
+## Verification Performed
 
-- No issues found in this layer.
+List commands, local definitions, tests, reproductions, and whether output was
+complete. Approved external tools are optional and their results remain
+candidates until contextually confirmed.
 
-### Layer 5: System Awareness
+## Scope and Residual Risk
 
-- No issues found in this layer.
+State changed behaviour reviewed, credible expansion, excluded pre-existing
+areas, and honest Not verified evidence. A clean static review is not proof of
+production safety.
 
-### Layer 6: Test Quality
+## Full-review additions
 
-- No issues found in this layer.
+Full reviews may additionally include a system model, complete applicable-family
+ledger, Not applicable controls, Not verified controls, operational evidence,
+and remediation priorities. Every applicable family has exactly one state:
+Finding, Checked, Not applicable, or Not verified.
 
-When a finding exists, use this exact shape:
+## Finding requirements
 
-### [Severity] Title
-
-- Layer:
-- Location: `path:line`
-- Impact:
-- Evidence:
-- Fix:
-
-## Example Finding
-
-### [High] Retry Loop Ignores Cancellation Signal
-
-- Layer: Layer 2: Logic and Edge Cases
-- Location: `services/sync_worker.py:148`
-- Impact: Worker can continue issuing external writes after caller cancellation, causing duplicate side effects and delayed shutdown.
-- Evidence: `while True` loop catches timeout exceptions and retries without checking `ctx.cancelled` or equivalent cancellation token.
-- Fix: Check cancellation state at top of loop and before each retry; propagate cancellation error instead of retrying.
-
-## Verification
-
-Use this structure for automated checks and manual commands:
-
-- Command: `<command text>`
-- Exit code: `<numeric code>`
-- Relevant output: `<only the lines that matter>`
-- Interpretation: `<what this means for correctness/risk>`
-
-Also include:
-
-- Not run / not verified:
-
-## Residual Risk
-
-Mention remaining uncertainty, missing tests, or areas that need human product/security confirmation.
-
-## Guidance Notes
-
-- Tone: direct, evidence-based, and non-speculative.
-- Length: concise; prefer fewer high-signal findings over many weak findings.
-- Residual risk vs finding:
-  - Use a finding only when you have concrete file/line evidence and credible impact.
-  - Use residual risk when the concern is plausible but unverified due to missing context, missing runtime access, or missing tests.
+Every finding needs severity, confidence, exact location, violated contract,
+triggering path, concrete impact, evidence chain, minimal fix, and verification
+guidance. Do not output approval/rejection, risk scores, generic praise,
+style-only findings, speculative vulnerabilities, or missing-test findings
+without a demonstrated regression path.

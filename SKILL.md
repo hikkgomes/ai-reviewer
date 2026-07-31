@@ -13,14 +13,18 @@ Use dissect-diff for diff review. Compare new changes against the branch, PR bas
 
 Use dissect-full for whole-repo review or prompt-scoped review of existing code, regardless of whether it changed recently.
 
-For both modes:
+For both modes, use `reference/review-workflow.md` as the canonical semantic
+workflow. Load `reference/methodology.md`, `reference/check-families.md`,
+`reference/report-template.md`, and only the language/framework packs relevant
+to the evidence. Run the matching review script to build context outside the
+target checkout. Deterministic and optional-tool output enters the candidate
+ledger and must be falsified and verified before it can become a finding.
 
-1. Read `reference/methodology.md`.
-2. Read `reference/risk-weights.md` and `reference/report-template.md`.
-3. Read the target repository's `.ai-review/local.json` if present.
-4. Detect languages in scope and read matching modules in `reference/lang/`.
-5. Run `scripts/review_changed.sh <base>` for diff review, or `scripts/review.sh` for universal review.
-6. Apply the six-layer adversarial review and report findings first, ordered by severity.
+The operational order is: establish intent; build behavioural units; identify
+contracts and invariants; expand scope deliberately; generate candidates;
+falsify every candidate; verify survivors; report only verified findings. Use
+the concise diff report for pull requests and the fuller coverage ledger only
+for full reviews.
 
 ## Setup
 

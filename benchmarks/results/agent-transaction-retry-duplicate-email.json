@@ -1,0 +1,475 @@
+{
+  "candidates": [],
+  "coverage": {},
+  "findings": [],
+  "ledger": [],
+  "mode": "full",
+  "not_verified": [
+    "agent output"
+  ],
+  "open_questions": [
+    "Agent did not produce a final result"
+  ],
+  "provenance": {
+    "benchmark_fixture_manifest": [
+      {
+        "path": "mailer.py",
+        "sha256": "e0d9ee1798b2a15d86e8fc8960d4c749fbdf5f0bb4ab24be878b37ee703fbafa",
+        "size": 66
+      },
+      {
+        "path": "repository.py",
+        "sha256": "fb6e11fe43001de013c028bbcf26f8e27d92099dc42573a076752f7cfae85745",
+        "size": 77
+      },
+      {
+        "path": "tests/test_worker.py",
+        "sha256": "dc3b5ee1a9f68f85bf0daffa1abb5fc6c2fed1d39476dbb5404fa8aaeeb79b01",
+        "size": 42
+      },
+      {
+        "path": "worker.py",
+        "sha256": "8115b4d0df3836c6b0a1051a3e8f8e3e0e63939cb54177b782b62f6f7e155120",
+        "size": 212
+      }
+    ],
+    "benchmark_fixture_sha256": "dd86344119dc67713ac2dae0e1375e32717b738d73eb5fbf47e38024fe425b2d",
+    "benchmark_id": "transaction-retry-duplicate-email",
+    "benchmark_manifest_sha256": "8aada5af83df29fd2e21dcfaf091eb4fe51bff4c7a3d00773a91b42cc282c0bd",
+    "codex_executable": "/Users/henriquegomes/.vscode/extensions/openai.chatgpt-26.721.41059-darwin-arm64/bin/macos-aarch64/codex",
+    "codex_version": "codex-cli 0.146.0-alpha.3.1",
+    "completed_at": "2026-07-31T01:20:13.498724+00:00",
+    "context_path": "benchmarks/results/context-transaction-retry-duplicate-email.json",
+    "exit_code": 1,
+    "final_output_path": "benchmarks/results/agent-transaction-retry-duplicate-email.json",
+    "generator": "codex-cli",
+    "installed_skill_manifest": [
+      {
+        "path": "LICENSE",
+        "sha256": "1126322e2cc8d165adc4c792eeb195717de2bcc7b39be1ce77959d78e87ef685",
+        "size": 1056
+      },
+      {
+        "path": "README.md",
+        "sha256": "27c8f6443531db400b264d0988b99976925100865eb912b47d3ba6930f0fe5c9",
+        "size": 14135
+      },
+      {
+        "path": "SKILL.md",
+        "sha256": "0a46c34e3089e77f53700a350648749397ffcb0144abeae4eb4e2ffa2ec26683",
+        "size": 670
+      },
+      {
+        "path": "adapters/codex-instructions.md",
+        "sha256": "41648d259855384eb098da648e6da4669d061353d6dff448bb80835df1feea1d",
+        "size": 7225
+      },
+      {
+        "path": "adapters/cursor-rules.md",
+        "sha256": "130d2847ca5f8748a19af3ca4a2d1308e584540fdaf37e88cc8b69d38457d5e6",
+        "size": 7172
+      },
+      {
+        "path": "adapters/generic-instructions.md",
+        "sha256": "431d514ccc9a475ed216d0ca1e86198f320815d6c9a518429080e1d9cc847d8f",
+        "size": 7183
+      },
+      {
+        "path": "agents/universal-code-reviewer.md",
+        "sha256": "f6749119bea82620b3f43b165e41480d0186bbfc5f70ab6d8460e0252b1307b5",
+        "size": 1172
+      },
+      {
+        "path": "commands/dissect-diff.md",
+        "sha256": "169e3885c338e4f85906cef303e9921f0879d3d965db012e22b80e38e55bd8c6",
+        "size": 1519
+      },
+      {
+        "path": "commands/dissect-full.md",
+        "sha256": "0189c40bfc68d8759c6dbff99d41b8f94540cbcd8bbff78da31c002362b5c70f",
+        "size": 1427
+      },
+      {
+        "path": "config/local.json.template",
+        "sha256": "0d3758b17a21e8001502647799598220b710098f2dfbc2c33139fdc0131beb00",
+        "size": 2090
+      },
+      {
+        "path": "config/rules.yaml",
+        "sha256": "04d5ebf76a9c1741a8d4e83c5303eb674233dbcaa6a5e5e5d8d09acf3f5d2678",
+        "size": 2487
+      },
+      {
+        "path": "reference/check-families.md",
+        "sha256": "2a339e730fe1489bcbb005b933d4430b369f20e73557ddea15e6a0e36fe63df9",
+        "size": 7865
+      },
+      {
+        "path": "reference/frameworks/README.md",
+        "sha256": "ba2f7cac5e505c224ef914e0e5f35f60168066e5cd97281eca626c7428b13f49",
+        "size": 335
+      },
+      {
+        "path": "reference/frameworks/express.md",
+        "sha256": "39a819a47116c083583567f6a467f54fdc584233fa6c9b548527095b5cbccbe0",
+        "size": 927
+      },
+      {
+        "path": "reference/frameworks/fastapi.md",
+        "sha256": "5959a55c67cf9d544104b2ec456b6cc474537db134124dd86624b9bfd4d378e1",
+        "size": 939
+      },
+      {
+        "path": "reference/frameworks/nextjs.md",
+        "sha256": "84531c6a66d400327847a0aa74ffe2608800612f2f0866c096bc61f7a818888d",
+        "size": 992
+      },
+      {
+        "path": "reference/frameworks/postgresql.md",
+        "sha256": "1c90f1e316c5bf8902a6f295087afd5a90a736251adb61e8696ee2080c3fd6b5",
+        "size": 937
+      },
+      {
+        "path": "reference/frameworks/prisma.md",
+        "sha256": "cb4506b889d6dadb3754f8b0a68934c0d02633f98eb64fd0ec5aa42a1425de65",
+        "size": 934
+      },
+      {
+        "path": "reference/frameworks/sqlalchemy.md",
+        "sha256": "f6475e3d1a9465ba7b1890c5a6fa1cd4db535dcdae7bbf54fa1ef85e74bf324c",
+        "size": 970
+      },
+      {
+        "path": "reference/frameworks/stripe.md",
+        "sha256": "eb0c8cf9573d9f6ced806f0327fa867de443c7358084dbac3952897a1d2ce363",
+        "size": 1000
+      },
+      {
+        "path": "reference/frameworks/supabase.md",
+        "sha256": "b351e8803f2e3114f61db80d1d956df87fe1209036ef8463bfb5195f280a14d1",
+        "size": 997
+      },
+      {
+        "path": "reference/lang/cpp.md",
+        "sha256": "cb67a63c02a2237bf5f549543837ca1f52b31b3568dcbb16325eb2bf8b6c2034",
+        "size": 1241
+      },
+      {
+        "path": "reference/lang/go.md",
+        "sha256": "a9cc8ade9f13a7dc38e4d0076f2524b1afaad6a20350fd2b9a59ee78aaf943a4",
+        "size": 1225
+      },
+      {
+        "path": "reference/lang/java-csharp.md",
+        "sha256": "ed8d54cbc068f993932fae6b80c2f56be7de42a78593cdb4f717f595a49dad38",
+        "size": 1301
+      },
+      {
+        "path": "reference/lang/javascript.md",
+        "sha256": "5dd0532dd30b947cb22a38bb09c0d466fba58129f65e7b4e6478179721d3582e",
+        "size": 1365
+      },
+      {
+        "path": "reference/lang/php.md",
+        "sha256": "be84a397babccbfd8fc3d4b2d4ae8345ea56fd412e5547e18f78aac0950754b8",
+        "size": 1255
+      },
+      {
+        "path": "reference/lang/python.md",
+        "sha256": "92c9b7189aace6abd643fa8f74a20aa45ee2521002d48c5e25648641bc96fabf",
+        "size": 1524
+      },
+      {
+        "path": "reference/lang/rust.md",
+        "sha256": "f00d62a18311a9afe9cde65e697cfbf7282a0dfadf67adc42e3c7f358a0aae8a",
+        "size": 1136
+      },
+      {
+        "path": "reference/lang/sql.md",
+        "sha256": "b318545263aa77403d7d8307c93049a7029366f18aa90ed35826cdb83a62ac47",
+        "size": 1502
+      },
+      {
+        "path": "reference/lang/typescript.md",
+        "sha256": "7a49f3cd3654055feba54414de274117806ee174404849432f9b62cc931971b1",
+        "size": 1949
+      },
+      {
+        "path": "reference/methodology.md",
+        "sha256": "c3e54b57ba18e0d04ab65741fb126d41c5107a2aba169022fa788f3cf8ebbacd",
+        "size": 7992
+      },
+      {
+        "path": "reference/report-template.md",
+        "sha256": "0247619623e6bc7898f851f9628087bea724cbabf16ce09de905ba55265c1bc5",
+        "size": 1703
+      },
+      {
+        "path": "reference/review-context-schema.json",
+        "sha256": "ed497125196daee1c1cca8ac74b0f440b68f09ffce8ca840f69020ebf97a6806",
+        "size": 3600
+      },
+      {
+        "path": "reference/review-result-schema.json",
+        "sha256": "bb7b2fe4ba03d1122eadeac2813de6037f5c30e5e0d014310bac7f35eddd1cb0",
+        "size": 1850
+      },
+      {
+        "path": "reference/review-workflow.md",
+        "sha256": "a7d749f277c0eb33ec2d333b475002d4292535eabbe887ad1e1d3a5cd9b1bd15",
+        "size": 5299
+      },
+      {
+        "path": "reference/risk-weights.md",
+        "sha256": "632da92a34631884714296ef841759c609e65993b71152032256ea82c132ddaa",
+        "size": 1668
+      },
+      {
+        "path": "reference/taxonomy-ai.md",
+        "sha256": "9d6f2e69382da497836d73198e364dabc6632a90badf2ae2681c89006ee289f5",
+        "size": 2132
+      },
+      {
+        "path": "reference/taxonomy-human.md",
+        "sha256": "3db147cf11fde86f89ec55ec6e7d299538ebef6dfefaf7cf6c7a727258619ac1",
+        "size": 5554
+      },
+      {
+        "path": "scripts/build_review_context.py",
+        "sha256": "6801e2cdc28a47a66c4217380ca5ae3a34ab85c690410085e0a6013c709de795",
+        "size": 18521
+      },
+      {
+        "path": "scripts/compare_review_runs.py",
+        "sha256": "a9602f64f7788126e479a6ea73a602b0a66d2a72d8c4ebf1d8f9188bd2cabfc7",
+        "size": 2034
+      },
+      {
+        "path": "scripts/detect_architecture.py",
+        "sha256": "055b9a057010152d45cb227d7256dbd18caf475c9f04e74029ea8f5317c6711b",
+        "size": 18248
+      },
+      {
+        "path": "scripts/detect_commands.py",
+        "sha256": "6ea72985ba267c2ee80879a19d18dc8b013994d1ef7c063fe700cbec8f753865",
+        "size": 16785
+      },
+      {
+        "path": "scripts/diff_file_list.py",
+        "sha256": "e683c24e32a49ab9ccfc26c48a0eb0477c8e8aaf9b744742aff8fe5cd5ab4686",
+        "size": 8685
+      },
+      {
+        "path": "scripts/dissect_checks/__init__.py",
+        "sha256": "93a76eb2009d83b66844219f57fcd642b1ca8a7b5b6f1fa311bf1df1591b830d",
+        "size": 347
+      },
+      {
+        "path": "scripts/dissect_checks/engine.py",
+        "sha256": "74201b41a453e89defa2b17d1eb037953bfd0d392b53d77787af34036d668e10",
+        "size": 37515
+      },
+      {
+        "path": "scripts/dissect_checks/execution_plan.py",
+        "sha256": "97948f008e8d0f23a60236bc0cb252bad3f2839b182f5b1c0e9956bb20038bd4",
+        "size": 16736
+      },
+      {
+        "path": "scripts/dissect_checks/fixtures.py",
+        "sha256": "42f7ee2cfb1a6dd29fc4af7fc926cba53e8352d5466d1b2cd9bfa1e468a07d9c",
+        "size": 8107
+      },
+      {
+        "path": "scripts/dissect_checks/legacy.py",
+        "sha256": "288faa729c19257da3b5919848353f14436c4567cedcd80357861aa86655e900",
+        "size": 13338
+      },
+      {
+        "path": "scripts/dissect_checks/model.py",
+        "sha256": "1fadb704ab44cbd55e8d1bc972420757c3d8080738437130692fad334e286fce",
+        "size": 2450
+      },
+      {
+        "path": "scripts/dissect_checks/python_dependencies.py",
+        "sha256": "080bdd2eaf00f25700bd0cb8a4a27a1ad8c77e83964db6e9a8e2cfff609fb893",
+        "size": 9986
+      },
+      {
+        "path": "scripts/dissect_checks/redaction.py",
+        "sha256": "a0cb8a1078e541299ddd7ef9d249858d85334dced70d542e437b60a482a5c2c2",
+        "size": 15795
+      },
+      {
+        "path": "scripts/dissect_checks/rules.py",
+        "sha256": "185d5cacfa1ea759e5cfac07a0a19f3cab3524b89825ae43fca558fb0a95e38e",
+        "size": 16685
+      },
+      {
+        "path": "scripts/install.py",
+        "sha256": "71aaac85c64b27f77978500fed3279b8f4293e97ae9db1e4aac0305fb2ad9f69",
+        "size": 10865
+      },
+      {
+        "path": "scripts/review.sh",
+        "sha256": "7f95db7b0f96754dcfa5c702fea344cb349ba5a34228589c10408c8e3494d210",
+        "size": 2275
+      },
+      {
+        "path": "scripts/review_changed.sh",
+        "sha256": "bc68e0f8fb4a16f2bad7ac8fab959984f1251d4b53792fd791fc643cce4cf10e",
+        "size": 3629
+      },
+      {
+        "path": "scripts/review_commands.py",
+        "sha256": "ec175357d0a1ef6466765fb2772d408284d133c091e59836d19c574935e94411",
+        "size": 9061
+      },
+      {
+        "path": "scripts/review_ledger.py",
+        "sha256": "cf8049485a108f32eb5f3f4887ea9a6a22ec14d0f844c2c359bb6edf96ac3b14",
+        "size": 4527
+      },
+      {
+        "path": "scripts/run_benchmarks.py",
+        "sha256": "b70e4b559a7549a56f81cbf76ea2925a605ef88c6574fc80348aca162f7adb72",
+        "size": 13471
+      },
+      {
+        "path": "scripts/scan_ai_gotchas.py",
+        "sha256": "55135d0962f2500855ebb46931d1307ff01184b85cc7398c71d090fd94445321",
+        "size": 5721
+      },
+      {
+        "path": "scripts/score_review_results.py",
+        "sha256": "62dd89f5b318fae8d0aa67dff5615a148d0fc0fdddc541c701234888afeddfa5",
+        "size": 5082
+      },
+      {
+        "path": "scripts/sync_adapters.py",
+        "sha256": "e99ae4a5e494c903ee1a0207ca18f5b6ae9357579c7d6595b5b4f2f600fb3f85",
+        "size": 2061
+      },
+      {
+        "path": "scripts/tool_integrations.py",
+        "sha256": "92473c809e604c2d13def2d51028b064f99ee396fecccd1298dc323e6e6231d2",
+        "size": 9405
+      },
+      {
+        "path": "scripts/validate_benchmarks.py",
+        "sha256": "7c623347e43005981089f83f0cbbe3fe5ecac8abd6b274c63007962e4f06c0ff",
+        "size": 3477
+      },
+      {
+        "path": "scripts/validate_review_result.py",
+        "sha256": "20a25e8085e68a0ffeb2288d28d5c827be86d354b10c4a9da1172d50aec0660d",
+        "size": 4015
+      },
+      {
+        "path": "tests/fixture_support.py",
+        "sha256": "7da917f17a600edf10cc3dca9d273150cf90826a11be439435f7b5cdf2822d3d",
+        "size": 132
+      },
+      {
+        "path": "tests/fixtures/sample-review-result.json",
+        "sha256": "80f6dc8e80306c146ce4abbfc1f6c946b2302d6c5d2109dae1ffb0b5adb7f97a",
+        "size": 1024
+      },
+      {
+        "path": "tests/fixtures/security_cases.json",
+        "sha256": "9fb4faf8b6be149aed3e6dd2f2d9c6d23f3c9ab8b885bcc9084262bb1448d828",
+        "size": 4642
+      },
+      {
+        "path": "tests/test_execution_plans.py",
+        "sha256": "23b5da83b99debf06d827d4d86b8f701087ea2dace474b3e6a1bf1383e253db2",
+        "size": 13227
+      },
+      {
+        "path": "tests/test_history.py",
+        "sha256": "cefda272d9c27a98ea27759055f53b3ca426e3abbd5e7a7c00febefc01457268",
+        "size": 17557
+      },
+      {
+        "path": "tests/test_integration.py",
+        "sha256": "cd2c9743404a868387897f88ab4968e078f8a453e5500b953a0bc1281911a82a",
+        "size": 27470
+      },
+      {
+        "path": "tests/test_python_dependencies.py",
+        "sha256": "721fed36c222af08efc3b17237c6248e0b527c6eff6cde7001e7a622edbc2ca4",
+        "size": 8359
+      },
+      {
+        "path": "tests/test_redaction.py",
+        "sha256": "8d91cd6962a10c5418b4d1ad5915182041674044a026a5d9dd3a4c7d8d3785c9",
+        "size": 9690
+      },
+      {
+        "path": "tests/test_review_changed.py",
+        "sha256": "a7d11ab73db0d1823639c653b2ecf652cab8d37b1603e8c7b86eb83dfc972c6b",
+        "size": 13533
+      },
+      {
+        "path": "tests/test_review_workflow.py",
+        "sha256": "b040a94cb07cb459ea227fa17f72b42f86fc1ea8a3d3def78100fc7daa2a3b37",
+        "size": 11770
+      },
+      {
+        "path": "tests/test_rules.py",
+        "sha256": "2872a670343198b71c71ffe94948cc51886de1febf5a08d16cf98f5657050c8d",
+        "size": 5128
+      },
+      {
+        "path": "tests/test_scanner.py",
+        "sha256": "a9e62c78b099e1a93d3daf6054b160bf714a4f44431263230eefa90fa09c0f78",
+        "size": 16465
+      },
+      {
+        "path": "tests/test_self_review.py",
+        "sha256": "0809f46a8ccc1a6177a48beb2348d25738e6d8e61b4c1195a3487ed095031462",
+        "size": 4802
+      }
+    ],
+    "installed_skill_tree_sha256": "0537223700854080ec3c69990d311eb5bcc2ede5c9d8cc8dd35b65c14a6c83e1",
+    "intent_sha256": "4c31ceeed0cc571314cd77e354f382e94cf83dc1eef87996e07093dfa5fd0e2f",
+    "invocation": [
+      "/Users/henriquegomes/.vscode/extensions/openai.chatgpt-26.721.41059-darwin-arm64/bin/macos-aarch64/codex",
+      "exec",
+      "--ephemeral",
+      "--skip-git-repo-check",
+      "--sandbox",
+      "read-only",
+      "--json",
+      "--output-schema",
+      "/Users/henriquegomes/Git/ai-reviewer-template/reference/review-result-schema.json",
+      "-o",
+      "benchmarks/results/agent-transaction-retry-duplicate-email.json",
+      "-C",
+      "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/proposed",
+      "You are running the installed Dissect skill at /var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full.\nThe benchmark runner installed this exact entrypoint in the active Codex skill\ndiscovery root. Read /var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full/SKILL.md and the canonical workflow at\n/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full/reference/review-workflow.md before reviewing. Do not use any other Dissect installation.\n\nReview the proposed benchmark application at /Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/proposed against the intent in /Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/intent.md.\nUse the context at benchmarks/results/context-transaction-retry-duplicate-email.json. Read the relevant files, trace cross-file callers and controls, and follow reference/review-workflow.md.\n\nReturn JSON matching the review-result schema. Include a `provenance` object, a `candidates` array, and a `ledger` array. Every candidate must have status candidate, verified, disproved, not_verifiable, or duplicate, with falsification_attempts and verification_attempts. Every final finding must contain `candidate_id` equal to a ledger candidate whose status is verified. Do not guess expected IDs; use precise locations and evidence. For a clean case, return no findings and preserve Not verified areas.\n"
+    ],
+    "model_identifier": "gpt-5.6-luna",
+    "raw_output_path": "benchmarks/results/raw-transaction-retry-duplicate-email.jsonl",
+    "reviewer_source_commit": "499c7b33495ff9eb7ec108e38073452926f59322",
+    "reviewer_source_dirty": true,
+    "schema_version": "1.0",
+    "skill_discovery": {
+      "canonical_workflow_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full/reference/review-workflow.md",
+      "canonical_workflow_sha256": "a7d749f277c0eb33ec2d333b475002d4292535eabbe887ad1e1d3a5cd9b1bd15",
+      "codex_home": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79",
+      "entrypoint": "dissect-full",
+      "entrypoint_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full/SKILL.md",
+      "entrypoint_sha256": "0a46c34e3089e77f53700a350648749397ffcb0144abeae4eb4e2ffa2ec26683",
+      "isolated_home": true,
+      "method": "CODEX_HOME/skills",
+      "prompt_load_instruction": true,
+      "skill_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full"
+    },
+    "skill_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full",
+    "skill_sha256": "0a46c34e3089e77f53700a350648749397ffcb0144abeae4eb4e2ffa2ec26683",
+    "started_at": "2026-07-31T01:19:38.832009+00:00",
+    "stderr_output_path": "benchmarks/results/stderr-transaction-retry-duplicate-email.log"
+  },
+  "schema_version": "1.0",
+  "status": "agent_failed"
+}

@@ -1,0 +1,56 @@
+{
+  "agent_requested": true,
+  "installed_skill_tree_sha256": "0537223700854080ec3c69990d311eb5bcc2ede5c9d8cc8dd35b65c14a6c83e1",
+  "results": [
+    {
+      "benchmark_id": "business-rule-discount",
+      "generator": "codex-cli",
+      "status": "agent_failed"
+    },
+    {
+      "benchmark_id": "clean-valid-ownership",
+      "generator": "codex-cli",
+      "status": "agent_failed"
+    },
+    {
+      "benchmark_id": "ownership-cross-tenant-update",
+      "generator": "codex-cli",
+      "status": "agent_failed"
+    },
+    {
+      "benchmark_id": "transaction-retry-duplicate-email",
+      "generator": "codex-cli",
+      "status": "agent_failed"
+    }
+  ],
+  "runner": "scripts/run_benchmarks.py",
+  "schema_version": "1.0",
+  "scores": [
+    {
+      "benchmark_id": "business-rule-discount",
+      "provenance_present": true,
+      "reason": "agent_failed",
+      "status": "not_scorable"
+    },
+    {
+      "benchmark_id": "clean-valid-ownership",
+      "provenance_present": true,
+      "reason": "agent_failed",
+      "status": "not_scorable"
+    },
+    {
+      "benchmark_id": "ownership-cross-tenant-update",
+      "provenance_present": true,
+      "reason": "agent_failed",
+      "status": "not_scorable"
+    },
+    {
+      "benchmark_id": "transaction-retry-duplicate-email",
+      "provenance_present": true,
+      "reason": "agent_failed",
+      "status": "not_scorable"
+    }
+  ],
+  "skill_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full",
+  "skill_sha256": "0a46c34e3089e77f53700a350648749397ffcb0144abeae4eb4e2ffa2ec26683"
+}

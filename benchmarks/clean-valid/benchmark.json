@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "id": "clean-valid-ownership",
+  "intent": "Keep the API ownership check and return a redacted invoice summary.",
+  "frameworks": ["nextjs", "prisma"],
+  "base": "base",
+  "proposed": "proposed",
+  "expected_findings": [],
+  "forbidden_findings": ["cross-tenant access", "missing server auth", "unsafe SQL", "missing tests"],
+  "expected_severity": {},
+  "required_not_verified": ["production deployment reachability"],
+  "mutations": ["remove the ownership predicate; clean case must then become vulnerable"],
+  "corrected": null
+}

@@ -22,3 +22,13 @@ Activate for `.sql` and embedded query-heavy changes.
 
 - Intentional `NULL` exclusion documented by a predicate or constraint.
 - Window frame defaults where the aggregate is insensitive to frame choice.
+# Operational tracing playbook
+
+Read migration order, schema/model definitions, callers, policies, generated
+types, deployment sequencing, rollback material, and tests. For populated
+tables check nullability/default/backfill ordering, lock duration,
+transactional DDL, reversibility, index/constraint timing, RLS and ownership,
+and old/new application compatibility. Trace views, functions, grants and
+`SECURITY DEFINER` together with policies split across migrations. Verify with
+local SQL definitions or a disposable database and never infer safety from a
+single migration file.

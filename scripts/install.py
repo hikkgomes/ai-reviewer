@@ -24,9 +24,11 @@ SKILL_ITEMS = [
     "LICENSE",
     "commands",
     "agents",
+    "adapters",
     "reference",
     "scripts",
     "config",
+    "tests",
 ]
 
 
@@ -110,17 +112,13 @@ description: Diff review for AI-assisted code. Use to review new changes against
 
 # dissect-diff
 
-Review only new changes against a base branch, PR base, or explicitly requested diff scope.
-
-Workflow:
-
-1. Read `reference/methodology.md`, `reference/risk-weights.md`, and `reference/report-template.md` from this skill.
-2. Read the target repository's `.ai-review/local.json` if present.
-3. Determine the diff scope from the prompt: named branch, PR base, upstream/base branch, staged/unstaged files, or untracked files.
-4. Detect languages in changed files and read matching modules under `reference/lang/`.
-5. Run `scripts/review_changed.sh <base-branch>` when a base branch is known; otherwise run it without an argument.
-6. Review only changed/new behavior, opening surrounding code only for contracts, callers, and invariants.
-7. Apply all six methodology layers and report findings first.
+Use `reference/review-workflow.md` as the canonical workflow. Establish intent,
+build behavioural units, identify contracts, trace credible blast radius,
+generate candidates, falsify every candidate, verify survivors, and report only
+verified findings. Run `scripts/review_changed.sh <base-branch>` to create
+context outside the checkout. Load only relevant language/framework packs and
+use the concise diff report. Deterministic matches are candidates, not
+findings; exclude unrelated pre-existing defects.
 """
     return """---
 name: dissect-full
@@ -129,16 +127,12 @@ description: Full review for AI-assisted code. Use to review the whole repositor
 
 # dissect-full
 
-Review the whole repository, or the repo areas named in the prompt, regardless of whether the code is new.
-
-Workflow:
-
-1. Read `reference/methodology.md`, `reference/risk-weights.md`, and `reference/report-template.md` from this skill.
-2. Read the target repository's `.ai-review/local.json` if present.
-3. Determine scope from the prompt: whole repo, specific paths, modules, features, languages, or risk domains.
-4. Detect languages in scope and read matching modules under `reference/lang/`.
-5. Run `scripts/review.sh` from this skill.
-6. Apply all six methodology layers to selected existing code and report findings first.
+Use `reference/review-workflow.md` as the canonical workflow. Establish intent
+and scope, build behavioural/system units, identify contracts, trace credible
+blast radius, generate and falsify candidates, verify survivors, and report
+only verified findings. Run `scripts/review.sh` to create context outside the
+checkout and activate the architecture detector. Use the full report additions
+only when useful; distinguish findings, open questions, and Not verified areas.
 """
 
 

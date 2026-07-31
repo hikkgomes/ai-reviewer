@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dissect.local/review-context.schema.json",
+  "title": "Dissect review context",
+  "type": "object",
+  "required": ["schema_version", "mode", "scope", "intent", "repository", "behavioural_units", "candidates", "commands", "coverage", "limitations"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "mode": {"enum": ["diff", "full"]},
+    "scope": {"type": "object"},
+    "intent": {"$ref": "#/$defs/intent"},
+    "repository": {"type": "object"},
+    "behavioural_units": {"type": "array", "items": {"$ref": "#/$defs/unit"}},
+    "candidates": {"type": "array", "items": {"$ref": "#/$defs/candidate"}},
+    "commands": {"type": "array", "items": {"type": "object"}},
+    "coverage": {"type": "object"},
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "intent": {
+      "type": "object",
+      "required": ["sources", "summary", "constraints", "negative_requirements", "ambiguities"],
+      "properties": {
+        "sources": {"type": "array", "items": {"type": "object"}},
+        "summary": {"type": "string"},
+        "constraints": {"type": "array", "items": {"type": "string"}},
+        "negative_requirements": {"type": "array", "items": {"type": "string"}},
+        "ambiguities": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "unit": {
+      "type": "object",
+      "required": ["id", "kind", "entry_points", "changed_symbols", "inputs", "outputs", "state_read", "state_modified", "external_side_effects", "error_paths", "callers", "downstream_consumers", "configuration", "tests", "before", "after"],
+      "properties": {
+        "id": {"type": "string"}, "kind": {"type": "string"},
+        "entry_points": {"type": "array", "items": {"type": "string"}},
+        "changed_symbols": {"type": "array", "items": {"type": "string"}},
+        "inputs": {"type": "array", "items": {"type": "string"}},
+        "outputs": {"type": "array", "items": {"type": "string"}},
+        "state_read": {"type": "array", "items": {"type": "string"}},
+        "state_modified": {"type": "array", "items": {"type": "string"}},
+        "external_side_effects": {"type": "array", "items": {"type": "string"}},
+        "error_paths": {"type": "array", "items": {"type": "string"}},
+        "callers": {"type": "array", "items": {"type": "string"}},
+        "downstream_consumers": {"type": "array", "items": {"type": "string"}},
+        "configuration": {"type": "array", "items": {"type": "string"}},
+        "tests": {"type": "array", "items": {"type": "string"}},
+        "before": {"type": "string"}, "after": {"type": "string"}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["id", "source", "claim", "contract", "trigger_path", "impact", "supporting_evidence", "contradicting_evidence", "verification_attempts", "falsification_attempts", "status"],
+      "properties": {
+        "id": {"type": "string"}, "source": {"type": "string"}, "claim": {"type": "string"}, "contract": {"type": "string"},
+        "trigger_path": {"type": "array", "items": {"type": "string"}}, "impact": {"type": "string"},
+        "supporting_evidence": {"type": "array", "items": {"type": "object"}}, "contradicting_evidence": {"type": "array", "items": {"type": "object"}},
+        "verification_attempts": {"type": "array", "items": {"type": "object"}}, "falsification_attempts": {"type": "array", "items": {"type": "object"}},
+        "status": {"enum": ["candidate", "verified", "disproved", "not_verifiable", "duplicate"]}
+      }
+    }
+  }
+}

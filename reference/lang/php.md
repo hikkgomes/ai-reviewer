@@ -21,3 +21,11 @@ Activate for `.php`.
 
 - Legacy files in non-strict codebases where local convention has not migrated.
 - Intentional loose comparisons in compatibility shims.
+# Operational tracing playbook
+
+Inspect framework route/middleware order, request validation, session/CSRF
+configuration, ORM queries, templates, callers and tests. Trace data through
+serialization, redirects, filesystem and command boundaries; verify Composer
+versions and local method signatures. Use focused tests or static analysis
+when approved. A dynamic-looking value is a candidate until the framework
+validator and escaping boundary are confirmed.

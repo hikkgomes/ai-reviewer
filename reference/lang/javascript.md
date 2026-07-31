@@ -21,3 +21,13 @@ Activate for `.js`, `.jsx`, `.mjs`, and `.cjs`.
 
 - Loose equality used intentionally for nullish checks when local style permits it.
 - Framework-generated globals in legacy code.
+# Operational tracing playbook
+
+Read route/bootstrap files, validators, callers, tests, package manifests and
+the runtime version. Follow untrusted values across server/client boundaries,
+serialization, async error paths, React effects and cache state. Check promise
+rejection, cancellation, stale closures, unsafe HTML, redirects, filesystem
+paths, generated clients, and package-version signatures. Verify with local
+definitions and focused lint/test commands when approved. A suspicious token
+is only a candidate until wrappers, middleware, validators, and reachability
+are inspected.
