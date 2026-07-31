@@ -6,6 +6,11 @@ adapters. Evidence collection prepares context; it does not declare a semantic
 vulnerability. Deterministic and external-tool output is candidate evidence,
 not a final finding.
 
+Paths beginning with `reference/` or `scripts/` are relative to the installed
+Dissect skill root—the directory containing this workflow and the skill's
+`SKILL.md`—not to the repository under review. Repository-relative paths are
+only those explicitly identified as review scope or repository-local evidence.
+
 ## Phase 1 — Establish intent
 
 Read the strongest available sources in this order: user request, PR title and

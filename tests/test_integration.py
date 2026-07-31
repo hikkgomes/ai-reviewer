@@ -152,6 +152,8 @@ class IntegrationTests(unittest.TestCase):
                 installed = base / "skills" / name
                 skill = (installed / "SKILL.md").read_text()
                 self.assertIn(f"name: {name}", skill)
+                self.assertIn("Resolve all `reference/` and `scripts/` paths", skill)
+                self.assertIn("not from the repository under review", skill)
                 self.assertTrue((installed / "reference" / "check-families.md").exists())
                 project = base / f"project-{name}"
                 project.mkdir()

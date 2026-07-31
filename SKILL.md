@@ -13,6 +13,11 @@ Use dissect-diff for diff review. Compare new changes against the branch, PR bas
 
 Use dissect-full for whole-repo review or prompt-scoped review of existing code, regardless of whether it changed recently.
 
+All package-relative paths in this skill (including `reference/` and `scripts/`)
+resolve from the directory containing this `SKILL.md`, not from the repository
+under review. Use the target checkout only for files explicitly described as
+review scope or repository-local evidence.
+
 For both modes, use `reference/review-workflow.md` as the canonical semantic
 workflow. Load `reference/methodology.md`, `reference/check-families.md`,
 `reference/report-template.md`, and only the language/framework packs relevant

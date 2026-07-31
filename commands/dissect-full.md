@@ -2,6 +2,10 @@ Review the whole repository, or the repo areas named in the prompt, regardless o
 
 Use this command for baseline audits, focused subsystem reviews, security sweeps, architecture reviews, or review of a path/module that may not be part of a current diff.
 
+Resolve the `reference/` and `scripts/` paths below from the installed Dissect
+skill root (the directory containing the skill's `SKILL.md`), not from the
+repository under review.
+
 Workflow:
 
 1. Read `reference/review-workflow.md`, the report template, and relevant language/framework packs.
