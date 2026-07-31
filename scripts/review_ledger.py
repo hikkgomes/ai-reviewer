@@ -73,7 +73,7 @@ def validate_ledger(data: dict[str, Any]) -> list[str]:
         if not isinstance(candidate, dict):
             errors.append("candidate must be an object")
             continue
-        errors.extend(f"{candidate.get('id', '<unknown>')}: {error}" for error in validate_candidate(candidate))
+        errors.extend(f"{candidate.get('id', '<unknown>')}: {error}" for error in validate_candidate(candidate, require_verified_evidence=True))
         if candidate.get("id") in ids:
             errors.append(f"duplicate candidate id: {candidate['id']}")
         ids.add(candidate.get("id"))

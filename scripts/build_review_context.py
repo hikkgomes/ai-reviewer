@@ -31,7 +31,9 @@ EXTENSIONS = {
     ".rb": "ruby", ".tf": "terraform", ".yml": "yaml", ".yaml": "yaml",
 }
 INSTRUCTION_NAMES = {"AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md"}
-INTENT_NAMES = {"TASK.md", "task.md", "PR.md", "pull-request.md", "DESIGN.md", "design.md", "ISSUE.md", "issue.md"}
+INTENT_NAMES = {"TASK.md", "task.md", "PR.md", "pull-request.md", "DESIGN.md", "design.md", "ISSUE.md", "issue.md", "intent.md", "intent.txt", "requirements.md"}
+TEXT_SUFFIXES = set(EXTENSIONS) | {".json", ".toml", ".md", ".txt", ".yaml", ".yml"}
+FRAMEWORK_PACKS = {"nextjs": "nextjs", "express": "express", "supabase": "supabase", "postgres": "postgresql", "postgresql": "postgresql", "prisma": "prisma", "stripe": "stripe", "fastapi": "fastapi", "sqlalchemy": "sqlalchemy"}
 KIND_RULES = (
     ("migration", ("migration", "migrations", ".sql")),
     ("payment", ("payment", "billing", "stripe", "checkout", "webhook")),
@@ -81,8 +83,12 @@ def source_paths(root: Path, entries: list[DiffEntry], mode: str) -> list[str]:
     return sorted({entry.reviewed_path for entry in entries if entry.exists_in_worktree and entry.reviewed_path})
 
 
-def intent(root: Path) -> dict[str, Any]:
+def intent(root: Path, intent_file: Path | None = None) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
+    if intent_file and intent_file.exists():
+        value = read(intent_file)
+        if value:
+            sources.append({"path": str(intent_file), "kind": "benchmark/task intent", "content": value})
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.name not in INTENT_NAMES:
             continue
@@ -131,12 +137,80 @@ def symbols(text: str) -> list[str]:
     return list(dict.fromkeys(found))[:80]
 
 
-def behavioural_units(root: Path, paths: list[str], entries: list[DiffEntry]) -> list[dict[str, Any]]:
-    groups: dict[str, list[str]] = {}
+def symbols_with_lines(text: str, path: str) -> list[dict[str, Any]]:
+    found = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        for name in symbols(line):
+            found.append({"name": name, "path": path, "line": line_number, "kind": "declaration"})
+    return found
+
+
+def evidence_lines(text: str, patterns: tuple[str, ...]) -> list[str]:
+    return [line.strip() for line in text.splitlines() if any(re.search(pattern, line, re.I) for pattern in patterns)][:20]
+
+
+def all_text_paths(root: Path) -> list[str]:
+    return sorted(rel(path, root) for path in root.rglob("*") if path.is_file() and ".git" not in path.parts and path.suffix.lower() in TEXT_SUFFIXES)
+
+
+def expanded_paths(root: Path, changed: list[str], mode: str) -> tuple[list[str], dict[str, list[dict[str, str]]]]:
+    if mode == "full":
+        return all_text_paths(root), {}
+    candidates = all_text_paths(root)
+    changed_symbols = [name for path in changed for name in symbols(read(root / path))]
+    selected = set(changed)
+    reasons: dict[str, list[dict[str, str]]] = {path: [{"reason": "changed scope"}] for path in changed}
+    for path in candidates:
+        if path in selected:
+            continue
+        text = read(root / path)
+        referenced = [name for name in changed_symbols if re.search(rf"\b{re.escape(name)}\b", text)]
+        companion = any(token in path.lower() for token in ("middleware", "schema", "model", "migration", "config", "test", "spec", "route", "handler"))
+        if referenced or companion and any(Path(item).stem in path for item in changed):
+            selected.add(path)
+            reasons[path] = [{"reason": "direct symbol reference" if referenced else "credible companion path", "symbols": ", ".join(referenced)}]
+    return sorted(selected), reasons
+
+
+def detected_repository(root: Path) -> dict[str, Any]:
+    try:
+        result = subprocess.run([sys.executable, str(ROOT / "scripts" / "detect_commands.py")], cwd=root, text=True, capture_output=True, check=False)
+        return json.loads(result.stdout) if result.returncode == 0 else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def loaded_framework_packs(root: Path, architecture_data: dict[str, Any], paths: list[str], requested: tuple[str, ...] = ()) -> list[dict[str, str]]:
+    names = set()
+    for value in requested:
+        normalized = value.lower()
+        names.add(FRAMEWORK_PACKS.get(normalized, "nextjs" if normalized == "next" else normalized))
+    for value in (architecture_data.get("key_libraries") or {}).get("framework", []):
+        for token, name in (*FRAMEWORK_PACKS.items(), ("next", "nextjs")):
+            if token in value.lower():
+                names.add(name)
+    text = "\n".join(read(root / path) for path in paths)
+    for token, name in FRAMEWORK_PACKS.items():
+        if re.search(rf"\b{re.escape(token)}\b", text, re.I):
+            names.add(name)
+    if re.search(r"next\.config|from\s+['\"]next/|require\(['\"]next", text, re.I):
+        names.add("nextjs")
+    packs = []
+    for name in sorted(names):
+        pack = ROOT / "reference" / "frameworks" / f"{name}.md"
+        if pack.exists():
+            packs.append({"name": name, "path": str(pack.relative_to(ROOT)), "sha256": hashlib.sha256(pack.read_bytes()).hexdigest(), "loaded": True})
+    return packs
+
+
+def behavioural_units(root: Path, paths: list[str], entries: list[DiffEntry], scope_reasons: dict[str, list[dict[str, str]]]) -> list[dict[str, Any]]:
+    groups: dict[str, tuple[str, list[str]]] = {}
     for path in paths:
-        groups.setdefault(classify(path), []).append(path)
+        kind = classify(path)
+        key = f"{kind}:{Path(path).parent.as_posix()}"
+        groups.setdefault(key, (kind, []))[1].append(path)
     units = []
-    for index, (kind, members) in enumerate(sorted(groups.items()), 1):
+    for index, (_key, (kind, members)) in enumerate(sorted(groups.items()), 1):
         changed_symbols: list[str] = []
         tests: list[str] = []
         configuration: list[str] = []
@@ -147,22 +221,40 @@ def behavioural_units(root: Path, paths: list[str], entries: list[DiffEntry]) ->
                 tests.append(member)
             if any(token in member.lower() for token in ("config", ".env", "workflow", "docker", "terraform")):
                 configuration.append(member)
+        unit_text = "\n".join(read(root / member) for member in members)
+        declarations = [item for member in members for item in symbols_with_lines(read(root / member), member)]
+        names = [item["name"] for item in declarations]
+        callers = []
+        for candidate in paths:
+            if candidate in members:
+                continue
+            candidate_text = read(root / candidate)
+            referenced = [name for name in names if re.search(rf"\b{re.escape(name)}\b", candidate_text)]
+            if referenced:
+                callers.append({"path": candidate, "symbols": referenced, "reason": "direct symbol reference"})
         units.append({
             "id": f"unit-{index}", "kind": kind, "entry_points": members,
-            "changed_symbols": list(dict.fromkeys(changed_symbols)), "inputs": [], "outputs": [],
-            "state_read": [], "state_modified": [], "external_side_effects": [], "error_paths": [],
-            "callers": [], "downstream_consumers": [], "configuration": configuration,
-            "tests": tests, "before": "Not collected by the evidence collector; compare the base or prior contract.",
-            "after": "Review changed symbols and their reachable callers/callees in the semantic phase.",
+            "changed_symbols": list(dict.fromkeys(changed_symbols)),
+            "inputs": evidence_lines(unit_text, (r"request", r"input", r"payload", r"body", r"params", r"argv")),
+            "outputs": evidence_lines(unit_text, (r"return", r"response", r"status", r"serialize", r"render")),
+            "state_read": evidence_lines(unit_text, (r"\b(?:get|find|load|select|query|fetch)\b", r"\b(?:db|session|cache|store)\b")),
+            "state_modified": evidence_lines(unit_text, (r"\b(?:create|insert|update|delete|save|commit|rollback|set)\b", r"\b(?:db|session|cache|store)\b")),
+            "external_side_effects": evidence_lines(unit_text, (r"send|publish|enqueue|charge|refund|fetch\(|requests?\.|http",)),
+            "error_paths": evidence_lines(unit_text, (r"except|catch|throw|raise|timeout|retry|fallback|rollback|finally")),
+            "callers": callers, "downstream_consumers": callers, "configuration": configuration,
+            "tests": tests, "scope_reasons": {path: scope_reasons.get(path, []) for path in members},
+            "before": "Base behaviour must be compared from the supplied diff/base revision.",
+            "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
         })
     return units
 
 
 def candidates(root: Path, entries: list[DiffEntry], paths: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
-    options = ScanOptions(root=root, file_list=tuple(paths), diff_entries=tuple(
-        (entry.status, entry.old_path, entry.new_path, entry.exists_in_worktree, entry.source_kind, entry.commit_revision, entry.index_stage, entry.blob_path)
-        for entry in entries
-    ))
+    # The deterministic scanner follows the deliberately expanded semantic
+    # scope here. Git history remains bounded by the original diff entries in
+    # the review script; companion inspection must not silently collapse back
+    # to changed filenames only.
+    options = ScanOptions(root=root, file_list=tuple(paths))
     report = scan_report(options)
     output = []
     for index, finding in enumerate(report.findings, 1):
@@ -180,14 +272,26 @@ def candidates(root: Path, entries: list[DiffEntry], paths: list[str]) -> tuple[
     return output, list(report.coverage_errors)
 
 
-def build(root: Path, mode: str, base: str, file_list: Path | None) -> dict[str, Any]:
+def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file: Path | None = None, requested_frameworks: tuple[str, ...] = ()) -> dict[str, Any]:
     entries = changed_entries(root, mode, file_list, base)
-    paths = source_paths(root, entries, mode)
+    changed = source_paths(root, entries, mode)
+    paths, scope_reasons = expanded_paths(root, changed, mode)
     candidate_values, coverage_errors = candidates(root, entries, paths)
     instructions = [rel(path, root) for path in root.rglob("*") if path.is_file() and path.name in INSTRUCTION_NAMES]
     manifests = [path for path in paths if Path(path).name in {"package.json", "pyproject.toml", "go.mod", "Cargo.toml", "composer.json", "pom.xml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}]
     languages = sorted({EXTENSIONS[Path(path).suffix.lower()] for path in paths if Path(path).suffix.lower() in EXTENSIONS})
     arch = architecture(root)
+    detected = detected_repository(root)
+    touchpoint_tokens = {
+        "auth": ("auth", "session", "role", "permission", "middleware"),
+        "payments": ("stripe", "payment", "billing", "checkout", "refund", "webhook"),
+        "persistence": ("db", "database", "model", "schema", "migration", "prisma", "sql", "supabase"),
+        "routes": ("route", "api", "handler", "controller", "endpoint", "action"),
+        "infrastructure": ("docker", "terraform", "workflow", "deploy", "bucket", "storage"),
+    }
+    touchpoints = {}
+    for category, tokens in touchpoint_tokens.items():
+        touchpoints[category] = [{"path": path, "reason": "path or source token matched"} for path in paths if any(token in path.lower() or token in read(root / path).lower() for token in tokens)][:80]
     families = []
     catalog = root / "reference" / "check-families.md"
     if not catalog.exists():
@@ -198,10 +302,10 @@ def build(root: Path, mode: str, base: str, file_list: Path | None) -> dict[str,
     return {
         "schema_version": "1.0", "mode": mode,
         "scope": {"root": str(root), "base": base, "branch": git(root, "branch", "--show-current"), "head": git(root, "rev-parse", "HEAD"), "merge_base": git(root, "merge-base", base, "HEAD") if base else "", "files": paths, "entries": [asdict(entry) for entry in entries]},
-        "intent": intent(root),
-        "repository": {"instructions": instructions, "languages": languages, "frameworks": (arch.get("key_libraries") or {}).get("framework", []), "package_managers": [], "test_commands": [], "architecture": arch, "manifests": manifests, "touchpoints": {"auth": [], "payments": [], "persistence": [], "routes": [], "infrastructure": []}},
-        "behavioural_units": behavioural_units(root, paths, entries), "candidates": candidate_values,
-        "commands": [{"name": "git evidence collection", "executed": True, "complete": True}, {"name": "deterministic scanner", "executed": True, "complete": not coverage_errors}],
+        "intent": intent(root, intent_file),
+        "repository": {"instructions": instructions, "languages": languages, "frameworks": list(dict.fromkeys([*(arch.get("key_libraries") or {}).get("framework", []), *requested_frameworks])), "framework_packs": loaded_framework_packs(root, arch, paths, requested_frameworks), "package_managers": detected.get("package_managers", []), "test_commands": detected.get("commands", {}), "architecture": arch, "manifests": manifests, "touchpoints": touchpoints},
+        "behavioural_units": behavioural_units(root, paths, entries, scope_reasons), "candidates": candidate_values,
+        "commands": [{"name": "git evidence collection", "executed": True, "complete": True}, {"name": "architecture detection", "executed": True, "complete": bool(arch)}, {"name": "deterministic scanner", "executed": True, "complete": not coverage_errors}],
         "coverage": coverage, "limitations": coverage_errors + (["Semantic confirmation, falsification, and runtime evidence are performed by the reviewer."] if True else []),
     }
 
@@ -212,9 +316,11 @@ def main() -> int:
     parser.add_argument("--mode", choices=("diff", "full"), required=True)
     parser.add_argument("--base", default="")
     parser.add_argument("--file-list", type=Path)
+    parser.add_argument("--intent-file", type=Path)
+    parser.add_argument("--framework", action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    payload = build(args.root.resolve(), args.mode, args.base, args.file_list)
+    payload = build(args.root.resolve(), args.mode, args.base, args.file_list, args.intent_file, tuple(args.framework))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     print(str(args.output))

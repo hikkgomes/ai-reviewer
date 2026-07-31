@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from build_review_context import build  # noqa: E402
 from review_ledger import blank_candidate, final_findings, transition, validate_ledger  # noqa: E402
 from score_review_results import score  # noqa: E402
+from validate_review_result import validate  # noqa: E402
+from compare_review_runs import compare  # noqa: E402
 
 
 class ReviewWorkflowTests(unittest.TestCase):
@@ -32,6 +34,21 @@ class ReviewWorkflowTests(unittest.TestCase):
             context = build(root, "full", "", None)
             self.assertTrue(context["candidates"])
             self.assertTrue(all(item["status"] == "candidate" for item in context["candidates"]))
+
+    def test_context_loads_intent_and_correlates_cross_file_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "intent.md").write_text("Only the authenticated tenant may read an invoice.\n")
+            (root / "route.py").write_text("from fastapi import APIRouter\nfrom service import load_invoice\ndef get_invoice(request):\n    return load_invoice(request.params['id'])\n")
+            (root / "service.py").write_text("def load_invoice(invoice_id):\n    return db.find(invoice_id)\n")
+            context = build(root, "full", "", None)
+            self.assertIn("authenticated tenant", context["intent"]["summary"])
+            self.assertTrue(context["repository"]["framework_packs"])
+            unit = next(item for item in context["behavioural_units"] if item["kind"] == "endpoint/server-action")
+            self.assertTrue(unit["changed_symbols"])
+            self.assertTrue(unit["state_read"] or unit["outputs"])
+            self.assertTrue(any(any(item["path"] == "route.py" for item in candidate["callers"]) for candidate in context["behavioural_units"]))
+            self.assertTrue(context["repository"]["touchpoints"]["routes"])
 
     def test_verified_transition_requires_falsification_and_verification(self) -> None:
         candidate = blank_candidate("candidate-1", source="semantic", claim="wrong owner", contract="tenant isolation")
@@ -57,6 +74,23 @@ class ReviewWorkflowTests(unittest.TestCase):
     def test_schema_and_benchmark_manifests_are_json(self) -> None:
         for path in (ROOT / "reference" / "review-context-schema.json", ROOT / "reference" / "review-result-schema.json", ROOT / "benchmarks" / "schema.json"):
             json.loads(path.read_text())
+
+    def test_result_validator_requires_verified_ledger_backing(self) -> None:
+        result = json.loads((ROOT / "tests" / "fixtures" / "sample-review-result.json").read_text())
+        result["findings"] = [{"id": "F-1", "candidate_id": "missing", "severity": "high", "confidence": "high", "location": "x:1", "contract": "c", "trigger_path": "p", "impact": "i", "evidence": ["e"], "fix": "f", "verification": "v"}]
+        errors = validate(result)
+        self.assertTrue(any("candidate_id is not verified" in error for error in errors))
+
+    def test_result_validator_accepts_provenance_and_empty_not_run_result(self) -> None:
+        result = json.loads((ROOT / "tests" / "fixtures" / "sample-review-result.json").read_text())
+        self.assertEqual(validate(result), [])
+
+    def test_comparison_reports_deltas_and_no_composite_score(self) -> None:
+        baseline = {"case": {"benchmark_id": "case", "finding_precision": 0.5, "critical_high_recall": 0.0}}
+        current = {"case": {"benchmark_id": "case", "finding_precision": 1.0, "critical_high_recall": 1.0}}
+        output = compare(current, baseline)
+        self.assertEqual(output["cases"][0]["delta"]["finding_precision"], 0.5)
+        self.assertIsNone(output["composite_score"])
 
 
 if __name__ == "__main__":

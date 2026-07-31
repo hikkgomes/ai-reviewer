@@ -1,3 +1,4 @@
-def total_for_order(order, member):
-    discount = 0.10 if member.is_active else 0
-    return order.subtotal * (1 - discount)
+from app.pricing import total_for_order
+
+def checkout(order, member, db):
+    return total_for_order(order, db.member_for_user(member.user_id))

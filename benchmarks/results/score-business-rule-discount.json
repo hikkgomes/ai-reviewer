@@ -1,0 +1,6 @@
+{
+  "benchmark_id": "business-rule-discount",
+  "provenance_present": true,
+  "reason": "agent_failed",
+  "status": "not_scorable"
+}

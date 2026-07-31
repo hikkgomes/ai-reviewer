@@ -1,0 +1,6 @@
+{
+  "benchmark_id": "transaction-retry-duplicate-email",
+  "provenance_present": true,
+  "reason": "agent_failed",
+  "status": "not_scorable"
+}

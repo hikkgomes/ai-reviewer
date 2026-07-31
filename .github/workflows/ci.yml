@@ -30,3 +30,9 @@ jobs:
           python3 scripts/validate_benchmarks.py
           python3 scripts/validate_review_result.py tests/fixtures/sample-review-result.json
           python3 -m unittest tests.test_review_workflow -v
+      - name: Exercise installed-skill benchmark runner offline
+        run: |
+          python3 scripts/run_benchmarks.py --no-agent --output /tmp/dissect-benchmark-results
+          for result in /tmp/dissect-benchmark-results/agent-*.json; do
+            python3 scripts/validate_review_result.py "$result"
+          done

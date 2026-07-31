@@ -1,6 +1,19 @@
 {
   "schema_version": "1.0",
   "mode": "diff",
+  "status": "not_run",
+  "provenance": {
+    "generator": "offline-test-fixture",
+    "skill_path": "test-skill",
+    "skill_sha256": "fixture",
+    "invocation": [],
+    "context_path": "context.json",
+    "raw_output_path": "raw.jsonl",
+    "commit_under_review": "fixture",
+    "started_at": "1970-01-01T00:00:00+00:00"
+  },
+  "candidates": [],
+  "ledger": [],
   "findings": [],
   "open_questions": [],
   "not_verified": ["runtime reachability"],

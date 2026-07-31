@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-REQUIRED = {"schema_version", "id", "intent", "base", "proposed", "expected_findings", "forbidden_findings", "expected_severity", "required_not_verified"}
+REQUIRED = {"schema_version", "id", "intent", "frameworks", "base", "proposed", "expected_findings", "forbidden_findings", "expected_severity", "required_not_verified", "mutations"}
 
 
 def validate_case(path: Path) -> list[str]:
@@ -19,9 +19,18 @@ def validate_case(path: Path) -> list[str]:
     errors.extend(f"{path}: missing {key}" for key in sorted(missing))
     if data.get("schema_version") != "1.0":
         errors.append(f"{path}: schema_version must be 1.0")
+    if not isinstance(data.get("frameworks"), list) or not data["frameworks"]:
+        errors.append(f"{path}: frameworks must be a non-empty array")
+    if not isinstance(data.get("mutations"), list) or not data["mutations"]:
+        errors.append(f"{path}: mutations must be a non-empty array")
+    intent_path = path.parent / "intent.md"
+    if not intent_path.exists():
+        errors.append(f"{path}: intent.md is required for benchmark provenance")
     for directory in (data.get("base"), data.get("proposed")):
         if not isinstance(directory, str) or not (path.parent / directory).is_dir():
             errors.append(f"{path}: benchmark directory does not exist: {directory}")
+        elif len([item for item in (path.parent / directory).rglob("*") if item.is_file()]) < 2:
+            errors.append(f"{path}: {directory} must contain at least two files")
     if data.get("corrected") is not None and not (path.parent / str(data["corrected"])).is_dir():
         errors.append(f"{path}: corrected directory does not exist: {data['corrected']}")
     ids = set()

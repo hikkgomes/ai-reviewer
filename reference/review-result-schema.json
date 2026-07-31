@@ -2,18 +2,24 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dissect.local/review-result.schema.json",
   "type": "object",
-  "required": ["schema_version", "mode", "findings", "open_questions", "not_verified", "coverage"],
+  "required": ["schema_version", "mode", "findings", "open_questions", "not_verified", "coverage", "provenance", "candidates", "ledger"],
   "properties": {
     "schema_version": {"const": "1.0"}, "mode": {"enum": ["diff", "full"]},
     "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
     "open_questions": {"type": "array", "items": {"type": "string"}},
     "not_verified": {"type": "array", "items": {"type": "string"}},
     "coverage": {"type": "object"}
+    ,"provenance": {
+      "type": "object",
+      "required": ["generator", "skill_path", "skill_sha256", "invocation", "context_path", "raw_output_path", "commit_under_review", "started_at"]
+    }
+    ,"candidates": {"type": "array", "items": {"type": "object"}}
+    ,"ledger": {"type": "array", "items": {"type": "object"}}
   },
   "$defs": {
     "finding": {
       "type": "object",
-      "required": ["id", "severity", "confidence", "location", "contract", "trigger_path", "impact", "evidence", "fix", "verification"],
+      "required": ["id", "candidate_id", "severity", "confidence", "location", "contract", "trigger_path", "impact", "evidence", "fix", "verification"],
       "properties": {
         "id": {"type": "string"}, "severity": {"enum": ["critical", "high", "medium", "low"]}, "confidence": {"type": "string"},
         "location": {"type": "string"}, "contract": {"type": "string"}, "trigger_path": {"type": "string"}, "impact": {"type": "string"},

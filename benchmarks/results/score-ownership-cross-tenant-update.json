@@ -1,0 +1,6 @@
+{
+  "benchmark_id": "ownership-cross-tenant-update",
+  "provenance_present": true,
+  "reason": "agent_failed",
+  "status": "not_scorable"
+}

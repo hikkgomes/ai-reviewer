@@ -1,26 +1,97 @@
 {
   "behavioural_units": [
     {
-      "after": "Review changed symbols and their reachable callers/callees in the semantic phase.",
-      "before": "Not collected by the evidence collector; compare the base or prior contract.",
+      "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
+      "before": "Base behaviour must be compared from the supplied diff/base revision.",
       "callers": [],
       "changed_symbols": [
+        "mailer.py:Mailer",
+        "mailer.py:send",
+        "repository.py:OrderStore",
+        "repository.py:mark_paid",
         "worker.py:fulfil"
       ],
       "configuration": [],
       "downstream_consumers": [],
       "entry_points": [
+        "mailer.py",
+        "repository.py",
         "worker.py"
       ],
-      "error_paths": [],
-      "external_side_effects": [],
+      "error_paths": [
+        "class Mailer:",
+        "def send(self, address):",
+        "return address",
+        "",
+        "class OrderStore:",
+        "def mark_paid(self, order_id):",
+        "return order_id",
+        "",
+        "def fulfil(order, store, mailer):",
+        "store.mark_paid(order.id)",
+        "for attempt in range(3):",
+        "try:",
+        "mailer.send(order.email)",
+        "return",
+        "except TimeoutError:",
+        "continue"
+      ],
+      "external_side_effects": [
+        "def send(self, address):",
+        "mailer.send(order.email)"
+      ],
       "id": "unit-1",
       "inputs": [],
       "kind": "application behaviour",
+      "outputs": [
+        "return address",
+        "return order_id",
+        "return"
+      ],
+      "scope_reasons": {
+        "mailer.py": [],
+        "repository.py": [],
+        "worker.py": []
+      },
+      "state_modified": [
+        "def fulfil(order, store, mailer):",
+        "store.mark_paid(order.id)"
+      ],
+      "state_read": [
+        "def fulfil(order, store, mailer):",
+        "store.mark_paid(order.id)"
+      ],
+      "tests": []
+    },
+    {
+      "after": "Evidence extracted from declarations, references, state and side-effect lines; semantic review must confirm it.",
+      "before": "Base behaviour must be compared from the supplied diff/base revision.",
+      "callers": [],
+      "changed_symbols": [
+        "tests/test_worker.py:test_timeout_retry"
+      ],
+      "configuration": [],
+      "downstream_consumers": [],
+      "entry_points": [
+        "tests/test_worker.py"
+      ],
+      "error_paths": [
+        "def test_timeout_retry():",
+        "assert True"
+      ],
+      "external_side_effects": [],
+      "id": "unit-2",
+      "inputs": [],
+      "kind": "test",
       "outputs": [],
+      "scope_reasons": {
+        "tests/test_worker.py": []
+      },
       "state_modified": [],
       "state_read": [],
-      "tests": []
+      "tests": [
+        "tests/test_worker.py"
+      ]
     }
   ],
   "candidates": [],
@@ -29,6 +100,11 @@
       "complete": true,
       "executed": true,
       "name": "git evidence collection"
+    },
+    {
+      "complete": true,
+      "executed": true,
+      "name": "architecture detection"
     },
     {
       "complete": true,
@@ -103,13 +179,16 @@
     }
   },
   "intent": {
-    "ambiguities": [
-      "Authoritative user/PR/task intent was not available in the review context."
-    ],
+    "ambiguities": [],
     "constraints": [],
     "negative_requirements": [],
-    "sources": [],
-    "summary": ""
+    "sources": [
+      {
+        "kind": "benchmark/task intent",
+        "path": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/intent.md"
+      }
+    ],
+    "summary": "Retry a failed order write without sending duplicate confirmation emails.\n"
   },
   "limitations": [
     "Semantic confirmation, falsification, and runtime evidence are performed by the reviewer."
@@ -122,14 +201,15 @@
         "Add a concise project description from the codebase context",
         "Identify domain-specific conventions not captured by heuristics",
         "Verify key libraries and runtime integrations",
-        "Label important folders that heuristics could not classify",
         "Confirm required environment setup and local services"
       ],
       "config_files": [],
       "docker_services": [],
       "entry_points": [],
       "env_keys": [],
-      "folder_structure": {},
+      "folder_structure": {
+        "tests": "tests"
+      },
       "key_libraries": {
         "auth": [],
         "database": [],
@@ -144,20 +224,44 @@
       "naming": {
         "components": "",
         "files": "camelCase",
-        "tests": "",
+        "tests": "test_*.py",
         "variables": "camelCase"
       },
       "patterns": [],
       "project_description": ""
     },
-    "frameworks": [],
+    "framework_packs": [
+      {
+        "loaded": true,
+        "name": "fastapi",
+        "path": "reference/frameworks/fastapi.md",
+        "sha256": "5959a55c67cf9d544104b2ec456b6cc474537db134124dd86624b9bfd4d378e1"
+      },
+      {
+        "loaded": true,
+        "name": "sqlalchemy",
+        "path": "reference/frameworks/sqlalchemy.md",
+        "sha256": "f6475e3d1a9465ba7b1890c5a6fa1cd4db535dcdae7bbf54fa1ef85e74bf324c"
+      }
+    ],
+    "frameworks": [
+      "fastapi",
+      "sqlalchemy"
+    ],
     "instructions": [],
     "languages": [
       "python"
     ],
     "manifests": [],
     "package_managers": [],
-    "test_commands": [],
+    "test_commands": {
+      "build": "",
+      "format": "",
+      "install": "",
+      "lint": "",
+      "test": "",
+      "typecheck": ""
+    },
     "touchpoints": {
       "auth": [],
       "infrastructure": [],
@@ -181,12 +285,48 @@
         "reviewed_path": "worker.py",
         "source_kind": "working-tree",
         "status": "M"
+      },
+      {
+        "blob_path": "repository.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "repository.py",
+        "old_path": "repository.py",
+        "reviewed_path": "repository.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "mailer.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "mailer.py",
+        "old_path": "mailer.py",
+        "reviewed_path": "mailer.py",
+        "source_kind": "working-tree",
+        "status": "M"
+      },
+      {
+        "blob_path": "tests/test_worker.py",
+        "commit_revision": "",
+        "exists_in_worktree": true,
+        "index_stage": null,
+        "new_path": "tests/test_worker.py",
+        "old_path": "tests/test_worker.py",
+        "reviewed_path": "tests/test_worker.py",
+        "source_kind": "working-tree",
+        "status": "M"
       }
     ],
     "files": [
+      "mailer.py",
+      "repository.py",
+      "tests/test_worker.py",
       "worker.py"
     ],
-    "head": "96dcea787fe85888d4c5f72aadaf35552c1d7263",
+    "head": "9fc8f55aa9ac8932a6ac1aacff61f5b1cd8d2b80",
     "merge_base": "",
     "root": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/proposed"
   }

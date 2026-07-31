@@ -1,8 +1,0 @@
-{
-  "schema_version": "1.0",
-  "mode": "diff",
-  "findings": [],
-  "open_questions": [],
-  "not_verified": ["production deployment reachability"],
-  "coverage": {"SEC-AUTHZ": {"state": "Checked"}}
-}

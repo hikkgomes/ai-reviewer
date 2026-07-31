@@ -1,4 +1,4 @@
-def total_for_order(order, member):
-    # The client supplies the convenient member flag in this request object.
-    discount = 0.10 if order.member_is_active else 0
-    return order.subtotal * (1 - discount)
+from app.pricing import total_for_order
+
+def checkout(order, member, db):
+    return total_for_order(order, db.member_for_user(member.user_id))

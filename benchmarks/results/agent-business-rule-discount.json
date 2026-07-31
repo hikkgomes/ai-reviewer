@@ -1,0 +1,44 @@
+{
+  "candidates": [],
+  "coverage": {},
+  "findings": [],
+  "ledger": [],
+  "mode": "full",
+  "not_verified": [
+    "agent output"
+  ],
+  "open_questions": [
+    "Agent did not produce a final result"
+  ],
+  "provenance": {
+    "benchmark_id": "business-rule-discount",
+    "commit_under_review": "9fc8f55aa9ac8932a6ac1aacff61f5b1cd8d2b80",
+    "completed_at": "2026-07-31T00:08:23.119065+00:00",
+    "context_path": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/results/context-business-rule-discount.json",
+    "exit_code": 1,
+    "final_output_path": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/results/agent-business-rule-discount.json",
+    "generator": "codex-cli",
+    "invocation": [
+      "/Users/henriquegomes/.vscode/extensions/openai.chatgpt-26.721.41059-darwin-arm64/bin/macos-aarch64/codex",
+      "exec",
+      "--ephemeral",
+      "--sandbox",
+      "read-only",
+      "--json",
+      "--output-schema",
+      "/Users/henriquegomes/Git/ai-reviewer-template/reference/review-result-schema.json",
+      "-o",
+      "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/results/agent-business-rule-discount.json",
+      "-C",
+      "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/business-rule/proposed",
+      "You are running the installed Dissect skill at /var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/dissect-installed-nzdmecm2/dissect-full.\n\nReview the proposed benchmark application at /Users/henriquegomes/Git/ai-reviewer-template/benchmarks/business-rule/proposed against the intent in /Users/henriquegomes/Git/ai-reviewer-template/benchmarks/business-rule/intent.md.\nUse the context at /Users/henriquegomes/Git/ai-reviewer-template/benchmarks/results/context-business-rule-discount.json. Read the relevant files, trace cross-file callers and controls, and follow reference/review-workflow.md.\n\nReturn JSON matching the review-result schema. Include a `provenance` object, a `candidates` array, and a `ledger` array. Every candidate must have status candidate, verified, disproved, not_verifiable, or duplicate, with falsification_attempts and verification_attempts. Every final finding must contain `candidate_id` equal to a ledger candidate whose status is verified. Do not guess expected IDs; use precise locations and evidence. For a clean case, return no findings and preserve Not verified areas.\n"
+    ],
+    "raw_output_path": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/results/raw-business-rule-discount.jsonl",
+    "schema_version": "1.0",
+    "skill_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/dissect-installed-nzdmecm2/dissect-full",
+    "skill_sha256": "d5b6b414c0415954ed42ccb67fff1059edb79af218dc12bfdccdfc061bb06d3b",
+    "started_at": "2026-07-31T00:08:23.032628+00:00"
+  },
+  "schema_version": "1.0",
+  "status": "agent_failed"
+}

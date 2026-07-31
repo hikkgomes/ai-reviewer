@@ -5,18 +5,35 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from review_ledger import validate_ledger  # noqa: E402
 
 FINDING_FIELDS = {"id", "severity", "confidence", "location", "contract", "trigger_path", "impact", "evidence", "fix", "verification"}
 
 
 def validate(data: dict) -> list[str]:
     errors = []
-    required = {"schema_version", "mode", "findings", "open_questions", "not_verified", "coverage"}
+    required = {"schema_version", "mode", "findings", "open_questions", "not_verified", "coverage", "provenance", "candidates", "ledger"}
     errors.extend(f"missing field: {key}" for key in sorted(required - data.keys()))
     if data.get("schema_version") != "1.0":
         errors.append("schema_version must be 1.0")
     if data.get("mode") not in {"diff", "full"}:
         errors.append("mode must be diff or full")
+    provenance = data.get("provenance")
+    required_provenance = {"generator", "skill_path", "skill_sha256", "invocation", "context_path", "raw_output_path", "commit_under_review", "started_at"}
+    if not isinstance(provenance, dict):
+        errors.append("provenance must be an object")
+    else:
+        errors.extend(f"provenance missing {key}" for key in sorted(required_provenance - provenance.keys()))
+    if not isinstance(data.get("candidates"), list) or not isinstance(data.get("ledger"), list):
+        errors.append("candidates and ledger must be arrays")
+    else:
+        if data["candidates"] != data["ledger"]:
+            errors.append("candidates and ledger must contain the same candidate records")
+        errors.extend(f"ledger: {error}" for error in validate_ledger({"candidates": data["ledger"]}))
+    verified = {item.get("id") for item in data.get("ledger", []) if isinstance(item, dict) and item.get("status") == "verified"}
     findings = data.get("findings", [])
     if not isinstance(findings, list):
         errors.append("findings must be an array")
@@ -32,6 +49,10 @@ def validate(data: dict) -> list[str]:
         ids.add(finding.get("id"))
         if finding.get("severity") not in {"critical", "high", "medium", "low"}:
             errors.append(f"finding {finding.get('id')}: invalid severity")
+        if not finding.get("candidate_id"):
+            errors.append(f"finding {finding.get('id')}: missing candidate_id")
+        elif finding.get("candidate_id") not in verified:
+            errors.append(f"finding {finding.get('id')}: candidate_id is not verified in ledger")
     for key in ("open_questions", "not_verified"):
         if not isinstance(data.get(key), list) or not all(isinstance(value, str) for value in data[key]):
             errors.append(f"{key} must be an array of strings")

@@ -106,4 +106,10 @@ echo
 echo "== Optional tool integrations =="
 python3 "$SCRIPT_DIR/tool_integrations.py"
 
+if [ -n "${AI_REVIEW_RESULT_PATH:-}" ]; then
+  python3 "$SCRIPT_DIR/validate_review_result.py" "$AI_REVIEW_RESULT_PATH"
+  RESULT_STATUS=$?
+  if [ "$RESULT_STATUS" -ne 0 ]; then exit "$RESULT_STATUS"; fi
+fi
+
 exit "$SCAN_STATUS"
