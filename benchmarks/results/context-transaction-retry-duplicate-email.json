@@ -19,22 +19,7 @@
         "worker.py"
       ],
       "error_paths": [
-        "class Mailer:",
-        "def send(self, address):",
-        "return address",
-        "",
-        "class OrderStore:",
-        "def mark_paid(self, order_id):",
-        "return order_id",
-        "",
-        "def fulfil(order, store, mailer):",
-        "store.mark_paid(order.id)",
-        "for attempt in range(3):",
-        "try:",
-        "mailer.send(order.email)",
-        "return",
-        "except TimeoutError:",
-        "continue"
+        "except TimeoutError:"
       ],
       "external_side_effects": [
         "def send(self, address):",
@@ -76,8 +61,7 @@
         "tests/test_worker.py"
       ],
       "error_paths": [
-        "def test_timeout_retry():",
-        "assert True"
+        "def test_timeout_retry():"
       ],
       "external_side_effects": [],
       "id": "unit-2",
@@ -326,7 +310,7 @@
       "tests/test_worker.py",
       "worker.py"
     ],
-    "head": "9fc8f55aa9ac8932a6ac1aacff61f5b1cd8d2b80",
+    "head": "499c7b33495ff9eb7ec108e38073452926f59322",
     "merge_base": "",
     "root": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/transaction-retry/proposed"
   }

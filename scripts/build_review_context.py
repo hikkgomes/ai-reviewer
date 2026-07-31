@@ -240,7 +240,12 @@ def behavioural_units(root: Path, paths: list[str], entries: list[DiffEntry], sc
             "state_read": evidence_lines(unit_text, (r"\b(?:get|find|load|select|query|fetch)\b", r"\b(?:db|session|cache|store)\b")),
             "state_modified": evidence_lines(unit_text, (r"\b(?:create|insert|update|delete|save|commit|rollback|set)\b", r"\b(?:db|session|cache|store)\b")),
             "external_side_effects": evidence_lines(unit_text, (r"send|publish|enqueue|charge|refund|fetch\(|requests?\.|http",)),
-            "error_paths": evidence_lines(unit_text, (r"except|catch|throw|raise|timeout|retry|fallback|rollback|finally")),
+            "error_paths": evidence_lines(
+                unit_text,
+                (
+                    r"except|catch|throw|raise|timeout|retry|fallback|rollback|finally",
+                ),
+            ),
             "callers": callers, "downstream_consumers": callers, "configuration": configuration,
             "tests": tests, "scope_reasons": {path: scope_reasons.get(path, []) for path in members},
             "before": "Base behaviour must be compared from the supplied diff/base revision.",

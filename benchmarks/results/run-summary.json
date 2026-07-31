@@ -1,5 +1,6 @@
 {
   "agent_requested": true,
+  "installed_skill_tree_sha256": "0537223700854080ec3c69990d311eb5bcc2ede5c9d8cc8dd35b65c14a6c83e1",
   "results": [
     {
       "benchmark_id": "business-rule-discount",
@@ -50,6 +51,6 @@
       "status": "not_scorable"
     }
   ],
-  "skill_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/dissect-installed-4m51585k/skills/dissect-full",
+  "skill_path": "/var/folders/9b/vbnyvgdx38g4kckgdjss11gm0000gn/T/codex-home-5l7lvq79/skills/dissect-full",
   "skill_sha256": "0a46c34e3089e77f53700a350648749397ffcb0144abeae4eb4e2ffa2ec26683"
 }

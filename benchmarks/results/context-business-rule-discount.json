@@ -12,12 +12,7 @@
       "entry_points": [
         "orders.py"
       ],
-      "error_paths": [
-        "from app.pricing import total_for_order",
-        "",
-        "def checkout(order, member, db):",
-        "return total_for_order(order, db.member_for_user(member.user_id))"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-1",
       "inputs": [],
@@ -67,17 +62,7 @@
         "app/__init__.py",
         "app/pricing.py"
       ],
-      "error_paths": [
-        "",
-        "from fastapi import APIRouter",
-        "",
-        "router = APIRouter()",
-        "",
-        "def total_for_order(order, member):",
-        "# The client supplies the convenient member flag in this request object.",
-        "discount = 0.10 if order.member_is_active else 0",
-        "return order.subtotal * (1 - discount)"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-2",
       "inputs": [
@@ -107,11 +92,7 @@
       "entry_points": [
         "tests/test_checkout.py"
       ],
-      "error_paths": [
-        "def test_checkout_uses_server_member_record():",
-        "# Mirrors the implementation and does not exercise the request boundary.",
-        "assert True"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-3",
       "inputs": [
@@ -415,7 +396,7 @@
       "orders.py",
       "tests/test_checkout.py"
     ],
-    "head": "9fc8f55aa9ac8932a6ac1aacff61f5b1cd8d2b80",
+    "head": "499c7b33495ff9eb7ec108e38073452926f59322",
     "merge_base": "",
     "root": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/business-rule/proposed"
   }

@@ -121,15 +121,21 @@ require explicit authorisation, an approved URL, credentials, and an entry in
 ## Benchmarking reviewer quality
 
 Run `python3 scripts/run_benchmarks.py` to install the current Codex skill into
-an isolated temporary directory, build contexts for the multi-file fixtures,
-and invoke the available Codex CLI. The runner retains raw JSONL, final agent
-output, context, skill hash, invocation, commit, and timestamps. If the agent
-or network is unavailable it records `not_run`/`agent_failed` artifacts and the
-scorer returns `not_scorable`; it never turns hand-authored expected output into
-a quality score. Final findings are accepted only when their `candidate_id`
-points to a verified ledger candidate with falsification and verification
-evidence. Use `scripts/compare_review_runs.py` to compare provenance-backed
-baseline and new runs without a composite safety score.
+an isolated temporary `CODEX_HOME/skills` directory, build contexts for the
+multi-file fixtures, and invoke the available Codex CLI. The runner retains
+raw JSONL, final agent output, context, the complete installed-skill manifest
+and digest, fixture and intent digests, discovery evidence, invocation,
+source-commit/dirty state, and timestamps. If the agent or network is
+unavailable it records `not_run`/`agent_failed` artifacts and the scorer returns
+`not_scorable`; it never turns hand-authored expected output into a quality
+score. Final findings are accepted only when their `candidate_id` points to a
+verified ledger candidate with falsification and verification evidence. Use
+`scripts/compare_review_runs.py` to compare provenance-backed baseline and new
+runs without a composite safety score.
+
+For a local model, start its provider and pass the explicit mode, for example
+`python3 scripts/run_benchmarks.py --oss --local-provider lmstudio`. The same
+isolated skill and provenance checks apply.
 
 ## Configuration
 

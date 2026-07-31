@@ -63,7 +63,10 @@ def score(expected: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
         "matched_findings": sorted(matched),
         "match_methods": match_methods,
         "unsupported_findings": [_finding_key(item) for item in unsupported],
-        "provenance_present": isinstance(result.get("provenance"), dict) and bool(result.get("provenance", {}).get("skill_sha256")),
+        "provenance_present": isinstance(result.get("provenance"), dict) and {
+            "skill_sha256", "installed_skill_tree_sha256", "reviewer_source_commit",
+            "benchmark_id", "benchmark_fixture_sha256", "intent_sha256",
+        }.issubset(result.get("provenance", {})),
         "ledger_verified_findings": sum(1 for item in result.get("ledger", []) if item.get("status") == "verified") if isinstance(result.get("ledger"), list) else 0,
     }
 

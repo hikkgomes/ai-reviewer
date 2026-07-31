@@ -22,7 +22,7 @@ def validate(data: dict) -> list[str]:
     if data.get("mode") not in {"diff", "full"}:
         errors.append("mode must be diff or full")
     provenance = data.get("provenance")
-    required_provenance = {"generator", "skill_path", "skill_sha256", "invocation", "context_path", "raw_output_path", "commit_under_review", "started_at"}
+    required_provenance = {"generator", "skill_path", "skill_sha256", "installed_skill_tree_sha256", "installed_skill_manifest", "invocation", "context_path", "raw_output_path", "final_output_path", "reviewer_source_commit", "reviewer_source_dirty", "benchmark_id", "benchmark_manifest_sha256", "benchmark_fixture_sha256", "intent_sha256", "codex_executable", "codex_version", "started_at", "completed_at"}
     if not isinstance(provenance, dict):
         errors.append("provenance must be an object")
     else:

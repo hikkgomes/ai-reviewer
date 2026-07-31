@@ -12,9 +12,7 @@
       "entry_points": [
         "middleware.ts"
       ],
-      "error_paths": [
-        "export function requireSession() { return true; }"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-1",
       "inputs": [],
@@ -41,11 +39,7 @@
       "entry_points": [
         "routes.py"
       ],
-      "error_paths": [
-        "def get_invoice(request, db):",
-        "invoice = db.invoice_for_tenant(request.user.tenant_id, request.params[\"id\"])",
-        "return {\"id\": invoice.id, \"total\": invoice.total}"
-      ],
+      "error_paths": [],
       "external_side_effects": [
         "invoice = db.invoice_for_tenant(request.user.tenant_id, request.params[\"id\"])"
       ],
@@ -81,9 +75,7 @@
       "entry_points": [
         "tests/routes.test.ts"
       ],
-      "error_paths": [
-        "test(\"returns only tenant invoice fields\", () => { expect(true).toBe(true); });"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-3",
       "inputs": [],
@@ -341,7 +333,7 @@
       "routes.py",
       "tests/routes.test.ts"
     ],
-    "head": "9fc8f55aa9ac8932a6ac1aacff61f5b1cd8d2b80",
+    "head": "499c7b33495ff9eb7ec108e38073452926f59322",
     "merge_base": "",
     "root": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/clean-valid/proposed"
   }

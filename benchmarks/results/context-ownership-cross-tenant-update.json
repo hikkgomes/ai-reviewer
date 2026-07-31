@@ -12,11 +12,7 @@
       "entry_points": [
         "db/invoices.js"
       ],
-      "error_paths": [
-        "export function invoiceForTenant(prisma, tenantId, id) {",
-        "return prisma.invoice.findFirst({ where: { id, tenantId } });",
-        "}"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-1",
       "inputs": [],
@@ -43,11 +39,7 @@
       "entry_points": [
         "routes.py"
       ],
-      "error_paths": [
-        "def update_invoice(request, db):",
-        "invoice = db.invoice(request.params[\"id\"])",
-        "invoice.update(request.json)"
-      ],
+      "error_paths": [],
       "external_side_effects": [
         "invoice = db.invoice(request.params[\"id\"])",
         "invoice.update(request.json)"
@@ -86,12 +78,7 @@
       "entry_points": [
         "middleware/auth.js"
       ],
-      "error_paths": [
-        "export function requireUser(req, _res, next) {",
-        "req.user = { tenantId: req.headers[\"x-tenant\"] };",
-        "next();",
-        "}"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-3",
       "inputs": [],
@@ -114,9 +101,7 @@
       "entry_points": [
         "tests/routes.test.js"
       ],
-      "error_paths": [
-        "test(\"requires a user\", () => { expect(true).toBe(true); });"
-      ],
+      "error_paths": [],
       "external_side_effects": [],
       "id": "unit-4",
       "inputs": [],
@@ -390,7 +375,7 @@
       "routes.py",
       "tests/routes.test.js"
     ],
-    "head": "9fc8f55aa9ac8932a6ac1aacff61f5b1cd8d2b80",
+    "head": "499c7b33495ff9eb7ec108e38073452926f59322",
     "merge_base": "",
     "root": "/Users/henriquegomes/Git/ai-reviewer-template/benchmarks/ownership/proposed"
   }
