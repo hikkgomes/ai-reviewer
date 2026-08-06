@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import shlex
 import tomllib
+
+from file_paths import iter_files
 from typing import Callable
 
 
@@ -170,9 +172,10 @@ def load_python_manifests(
         known_dependencies.update(dependencies)
         known_constraints.update(constraints or ())
 
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in iter_files(
+        root,
+        should_skip_dir=lambda directory: ignored(directory.relative_to(root).as_posix()),
+    ):
         rel = path.relative_to(root)
         if ignored(rel.as_posix()):
             continue

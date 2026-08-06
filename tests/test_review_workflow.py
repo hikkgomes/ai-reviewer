@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from build_review_context import build  # noqa: E402
+from build_review_context import all_text_paths, build, intent  # noqa: E402
 from review_ledger import blank_candidate, final_findings, transition, validate_ledger  # noqa: E402
 from score_review_results import score  # noqa: E402
 from validate_review_result import validate  # noqa: E402
@@ -20,6 +20,21 @@ from run_benchmarks import prepare_codex_environment, run_one, tree_manifest  # 
 
 
 class ReviewWorkflowTests(unittest.TestCase):
+    def test_context_prunes_dependency_and_build_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("def run():\n    return 1\n")
+            (root / "node_modules" / "package").mkdir(parents=True)
+            (root / "node_modules" / "package" / "ignored.js").write_text("export const ignored = true\n")
+            (root / "dist").mkdir()
+            (root / "dist" / "README.md").write_text("generated intent\n")
+
+            self.assertEqual(all_text_paths(root), ["src/app.py"])
+            self.assertEqual(intent(root)["summary"], "")
+            context = build(root, "full", "", None)
+            self.assertEqual(context["scope"]["files"], ["src/app.py"])
+
     def test_context_records_missing_intent_and_behavioural_units(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

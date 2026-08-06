@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 from .fixtures import is_trusted_self_review, mask_owned_fixture_spans
+from file_paths import iter_files
 from .legacy import scan_legacy
 from .model import Finding, HistoricalSource
 from .python_dependencies import (
@@ -204,8 +205,12 @@ def _candidate_files(options: ScanOptions) -> list[str]:
     else:
         candidates = [
             path.relative_to(options.root).as_posix()
-            for path in options.root.rglob("*")
-            if path.is_file()
+            for path in iter_files(
+                options.root,
+                ignored_dirs=frozenset(
+                    DEFAULT_IGNORES - ({"dist", "build", ".next"} if options.include_generated else set())
+                ),
+            )
         ]
     return sorted({
         rel for rel in candidates
@@ -656,7 +661,12 @@ def _package_name(specifier: str) -> str:
 def _load_package_manifests(options: ScanOptions) -> tuple[dict[Path, tuple[Path, dict]], list[str]]:
     manifests = {}
     errors = []
-    for path in options.root.rglob("package.json"):
+    ignored_dirs = frozenset(
+        DEFAULT_IGNORES - ({"dist", "build", ".next"} if options.include_generated else set())
+    )
+    for path in iter_files(options.root, ignored_dirs=ignored_dirs):
+        if path.name != "package.json":
+            continue
         rel = path.relative_to(options.root).as_posix()
         if _ignored(rel, options):
             continue
@@ -738,8 +748,13 @@ def _python_dependency_findings(
     }
     local_roots.update(
         path.parent.name
-        for path in options.root.rglob("__init__.py")
-        if not _ignored(path.relative_to(options.root).as_posix(), options)
+        for path in iter_files(
+            options.root,
+            ignored_dirs=frozenset(
+                DEFAULT_IGNORES - ({"dist", "build", ".next"} if options.include_generated else set())
+            ),
+        )
+        if path.name == "__init__.py" and not _ignored(path.relative_to(options.root).as_posix(), options)
     )
     metadata_aliases = installed_aliases()
     configured_aliases = {

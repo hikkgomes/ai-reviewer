@@ -13,6 +13,8 @@ if sys.version_info < (3, 11):
 
 import tomllib
 
+from file_paths import iter_files as walk_files
+
 
 SKIP_DIRS = {
     ".git",
@@ -249,11 +251,7 @@ def read_toml(path: Path) -> dict:
 
 def iter_files(root: Path, limit: int = 400) -> list[Path]:
     files = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if is_skipped(path, root):
-            continue
+    for path in walk_files(root, should_skip_dir=lambda directory: is_skipped(directory, root)):
         files.append(path)
         if len(files) >= limit:
             break

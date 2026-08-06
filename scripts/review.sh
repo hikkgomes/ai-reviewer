@@ -25,7 +25,12 @@ echo "Repo: $ROOT"
 echo
 echo "== Detected languages =="
 python3 - <<'PY'
+import os
 from pathlib import Path
+import sys
+
+sys.path.insert(0, os.environ["DISSECT_SCRIPT_DIR"])
+from file_paths import iter_files
 
 extensions = {
     ".ts": "typescript", ".tsx": "typescript", ".js": "javascript",
@@ -38,9 +43,7 @@ extensions = {
 ignored = {".git", "node_modules", "vendor", "dist", "build", "target", ".next"}
 languages = {
     extensions[path.suffix.lower()]
-    for path in Path.cwd().rglob("*")
-    if path.is_file()
-    and not any(part in ignored for part in path.parts)
+    for path in iter_files(Path.cwd(), ignored_dirs=frozenset(ignored))
     and path.suffix.lower() in extensions
 }
 print(", ".join(sorted(languages)) if languages else "none")

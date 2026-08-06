@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from diff_file_list import DiffEntry, read_diff_entries  # noqa: E402
 from dissect_checks.engine import ScanOptions, scan_report  # noqa: E402
+from file_paths import iter_files  # noqa: E402
 
 
 EXTENSIONS = {
@@ -73,13 +74,13 @@ def changed_entries(root: Path, mode: str, file_list: Path | None, base: str) ->
         except RuntimeError:
             # A caller may review an unpacked directory. Preserve evidence
             # collection rather than pretending a Git scope was available.
-            return [DiffEntry("M", rel(path, root), rel(path, root), True, "working-tree") for path in root.rglob("*") if path.is_file()]
-    return [DiffEntry("M", rel(path, root), rel(path, root), True, "working-tree") for path in root.rglob("*") if path.is_file() and ".git" not in path.parts]
+            return [DiffEntry("M", rel(path, root), rel(path, root), True, "working-tree") for path in iter_files(root)]
+    return [DiffEntry("M", rel(path, root), rel(path, root), True, "working-tree") for path in iter_files(root)]
 
 
 def source_paths(root: Path, entries: list[DiffEntry], mode: str) -> list[str]:
     if mode == "full":
-        return sorted({rel(path, root) for path in root.rglob("*") if path.is_file() and ".git" not in path.parts and path.parts[-1] not in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}})
+        return sorted({rel(path, root) for path in iter_files(root) if path.name not in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}})
     return sorted({entry.reviewed_path for entry in entries if entry.exists_in_worktree and entry.reviewed_path})
 
 
@@ -89,8 +90,8 @@ def intent(root: Path, intent_file: Path | None = None) -> dict[str, Any]:
         value = read(intent_file)
         if value:
             sources.append({"path": str(intent_file), "kind": "benchmark/task intent", "content": value})
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name not in INTENT_NAMES:
+    for path in iter_files(root):
+        if path.name not in INTENT_NAMES:
             continue
         value = read(path)
         if value:
@@ -150,7 +151,7 @@ def evidence_lines(text: str, patterns: tuple[str, ...]) -> list[str]:
 
 
 def all_text_paths(root: Path) -> list[str]:
-    return sorted(rel(path, root) for path in root.rglob("*") if path.is_file() and ".git" not in path.parts and path.suffix.lower() in TEXT_SUFFIXES)
+    return sorted(rel(path, root) for path in iter_files(root) if path.suffix.lower() in TEXT_SUFFIXES)
 
 
 def expanded_paths(root: Path, changed: list[str], mode: str) -> tuple[list[str], dict[str, list[dict[str, str]]]]:
@@ -282,7 +283,7 @@ def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file:
     changed = source_paths(root, entries, mode)
     paths, scope_reasons = expanded_paths(root, changed, mode)
     candidate_values, coverage_errors = candidates(root, entries, paths)
-    instructions = [rel(path, root) for path in root.rglob("*") if path.is_file() and path.name in INSTRUCTION_NAMES]
+    instructions = [rel(path, root) for path in iter_files(root) if path.name in INSTRUCTION_NAMES]
     manifests = [path for path in paths if Path(path).name in {"package.json", "pyproject.toml", "go.mod", "Cargo.toml", "composer.json", "pom.xml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}]
     languages = sorted({EXTENSIONS[Path(path).suffix.lower()] for path in paths if Path(path).suffix.lower() in EXTENSIONS})
     arch = architecture(root)

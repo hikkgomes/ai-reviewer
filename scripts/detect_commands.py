@@ -12,6 +12,8 @@ if sys.version_info < (3, 11):
 
 import tomllib
 
+from file_paths import iter_files
+
 
 ROOT = Path.cwd()
 SKIP_DIRS = {
@@ -288,7 +290,7 @@ def detect_for_directory(directory: Path) -> dict:
             result["commands"]["install"] = result["commands"]["install"] or "dart pub get"
             result["commands"]["test"] = result["commands"]["test"] or "dart test"
 
-    if any(directory.rglob("*.tf")):
+    if any(path.suffix == ".tf" for path in iter_files(directory)):
         add_unique(result["stack"], "terraform")
         add_unique(result["package_managers"], "terraform")
         result["commands"]["format"] = result["commands"]["format"] or "terraform fmt -check -recursive"
