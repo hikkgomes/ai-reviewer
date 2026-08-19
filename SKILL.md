@@ -31,6 +31,13 @@ falsify every candidate; verify survivors; report only verified findings. Use
 the concise diff report for pull requests and the fuller coverage ledger only
 for full reviews.
 
+## Deterministic tooling
+
+The optional anti-slop analyser runs only on JavaScript and TypeScript files with
+a skill-local Node runtime. It is a deterministic smell detector: its output is
+ledger candidate evidence, never an automatic finding. Comment-slop detection is
+cross-language and follows the same falsify/verify requirement.
+
 ## Setup
 
 Install this as a machine-level skill for Claude Code or Codex. Keep long-form methodology in `reference/`; this file is the native skill entrypoint.

@@ -112,6 +112,23 @@ isolation, payment semantics, governance, backup restoration, and production
 reachability require human, runtime, or operational evidence. Scanner candidates
 for these areas must be confirmed against surrounding configuration and code.
 
+### Optional deterministic analysers
+
+Dissect can run two optional candidate generators during context construction:
+
+- Anti-slop vendors the pinned Oxlint plugin for JavaScript and TypeScript. It
+  detects low-evidence type and implementation patterns using a skill-local Node
+  runtime.
+- Comment-slop uses language-aware comment extraction across the supported
+  language families to find redundant narration, section headers, historical
+  claims, and conversation leaks.
+
+Both analysers are optional, respect `paths.ignore` and the
+`review_options.anti_slop` and `review_options.comment_slop` toggles, and emit
+ledger candidates only. Every candidate needs falsification and semantic
+verification before it can become a finding. A skipped analyser is recorded as
+Not verified.
+
 Static/local review is the default. Dissect does not probe public applications,
 bypass authentication, create production accounts, retrieve private data,
 trigger payments, or perform destructive/recovery operations. Runtime checks

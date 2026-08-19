@@ -157,11 +157,8 @@ def serialize_entries(entries: list[DiffEntry]) -> bytes:
     ) + (b"\0" if entries else b"")
 
 
-def read_diff_entries(path: Path) -> list[DiffEntry]:
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return []
+def deserialize_entries(raw: bytes) -> list[DiffEntry]:
+    """Decode the canonical NUL-delimited JSON DiffEntry transport."""
     entries: list[DiffEntry] = []
     for value in raw.split(b"\0"):
         if not value:
@@ -181,6 +178,13 @@ def read_diff_entries(path: Path) -> list[DiffEntry]:
             name = value.decode("utf-8", errors="surrogateescape")
             entries.append(DiffEntry("M", name, name, True, "working-tree"))
     return entries
+
+
+def read_diff_entries(path: Path) -> list[DiffEntry]:
+    try:
+        return deserialize_entries(path.read_bytes())
+    except OSError:
+        return []
 
 
 def read_file_list(path: Path) -> list[str]:

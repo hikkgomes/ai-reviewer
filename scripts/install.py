@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
+import subprocess
 import sys
 import termios
 import tty
@@ -18,6 +20,7 @@ ADAPTERS_ROOT = SOURCE_ROOT / "adapters"
 CURSOR_ADAPTER = ADAPTERS_ROOT / "cursor-rules.md"
 CURSOR_START = "<!-- DISSECT-START -->"
 CURSOR_END = "<!-- DISSECT-END -->"
+MIN_NODE = (22, 18)
 SKILL_ITEMS = [
     "SKILL.md",
     "README.md",
@@ -55,13 +58,64 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def node_version(node: str) -> tuple[int, int, int] | None:
+    try:
+        result = subprocess.run([node, "--version"], capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    value = result.stdout or result.stderr or ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    match = re.search(r"v?(\d+)\.(\d+)(?:\.(\d+))?", value.strip())
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+
+
+def provision_anti_slop(skill_root: Path) -> bool:
+    """Install analyser dependencies in this skill copy, without touching a target checkout."""
+    vendor = skill_root / "scripts" / "vendor" / "anti-slop"
+    if not vendor.is_dir():
+        return False
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    if node is None:
+        print("Warning: Node.js is unavailable; anti-slop will remain optional.", file=sys.stderr)
+        return False
+    version = node_version(node)
+    if version is None or version[:2] < MIN_NODE:
+        print("Warning: Node.js 22.18 or newer is required; anti-slop will remain optional.", file=sys.stderr)
+        return False
+    if npm is None:
+        print("Warning: npm is unavailable; anti-slop will remain optional.", file=sys.stderr)
+        return False
+    try:
+        result = subprocess.run(
+            [npm, "ci"],
+            cwd=vendor,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        print(f"Warning: could not provision anti-slop ({error}); continuing without it.", file=sys.stderr)
+        return False
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        suffix = f" {detail[-1]}" if detail else ""
+        print(f"Warning: npm ci for anti-slop failed; continuing without it.{suffix}", file=sys.stderr)
+        return False
+    print(f"Provisioned anti-slop runtime: {vendor}")
+    return True
+
+
 def copy_item(src: Path, dst: Path) -> None:
     if src.is_dir():
         shutil.copytree(
             src,
             dst,
             dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns("__pycache__", ".DS_Store", "*.pyc"),
+            ignore=shutil.ignore_patterns("__pycache__", ".DS_Store", "*.pyc", "node_modules"),
         )
     else:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -88,6 +142,7 @@ def install_claude() -> None:
     skill_destination = claude_base / "skills" / SKILL_NAME
     skill_destination.parent.mkdir(parents=True, exist_ok=True)
     symlink_force(SOURCE_ROOT, skill_destination)
+    provision_anti_slop(SOURCE_ROOT)
 
     commands_dir = claude_base / "commands"
     agents_dir = claude_base / "agents"
@@ -146,6 +201,7 @@ def install_codex_skill(name: str, agents_base: Path) -> None:
     destination = agents_base / "skills" / name
     install_skill(destination)
     (destination / "SKILL.md").write_text(codex_skill_entrypoint(name), encoding="utf-8")
+    provision_anti_slop(destination)
     print(f"Installed Codex skill: {destination}")
 
 

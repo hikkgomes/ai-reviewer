@@ -1,0 +1,35 @@
+{
+  "diagnostics": [
+    {
+      "message": "This assertion chain discards type evidence. Keep the original precise type, or parse untrusted input at its boundary before narrowing it.",
+      "code": "anti-slop(no-chained-type-assertions)",
+      "severity": "error",
+      "filename": "/tmp/anti-slop-fixture/src/bad.ts",
+      "labels": [
+        { "span": { "offset": 12, "length": 23, "line": 3, "column": 14 } }
+      ]
+    },
+    {
+      "message": "unused variable",
+      "code": "eslint(no-unused-vars)",
+      "severity": "error",
+      "filename": "/tmp/anti-slop-fixture/src/bad.ts",
+      "labels": [
+        { "span": { "offset": 1, "length": 6, "line": 1, "column": 7 } }
+      ]
+    },
+    {
+      "message": "This type assertion has no `SAFETY:` justification. State the checked invariant immediately before the assertion or its containing statement.",
+      "code": "anti-slop(require-safety-comment-for-type-assertion)",
+      "severity": "error",
+      "filename": "/tmp/anti-slop-fixture/src/bad.ts",
+      "labels": [
+        { "span": { "offset": 12, "length": 23, "line": 3, "column": 14 } }
+      ]
+    }
+  ],
+  "number_of_files": 1,
+  "number_of_rules": 15,
+  "threads_count": 8,
+  "start_time": 0.136619208
+}

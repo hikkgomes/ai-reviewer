@@ -1,0 +1,11 @@
+{
+  "name": "dissect-anti-slop-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@oxlint/plugins": "1.78.0"
+  },
+  "devDependencies": {
+    "oxlint": "1.78.0"
+  }
+}

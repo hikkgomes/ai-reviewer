@@ -27,6 +27,24 @@ Activate for `.ts` and `.tsx`.
 
 - Intentional casts around well-contained framework limitations.
 - Generated client types with awkward optional fields.
+
+## Anti-slop patterns (deterministic candidates)
+
+Strong candidates, report only when semantically confirmed:
+
+- Chained type assertions, widen-then-assert flows, and known-value widening.
+- Unsafe dictionary types.
+- `unknown` in parameters, returns, or aliases without narrowing.
+- Type assertions without a specific safety justification.
+
+Weak signals, context only and never findings alone:
+
+- Module mocking, `Reflect` usage, runtime `typeof`, object-bag parameters, and
+  symbol-naming rules.
+
+Effect rules apply only when the project depends on `effect`. An anti-slop
+diagnostic proves that a pattern occurred, not that behaviour is wrong. Verify
+the concrete contract violated or the evidence gap before reporting it.
 # Operational tracing playbook
 
 Inspect task/PR intent, public types, schemas, generated API clients, route
