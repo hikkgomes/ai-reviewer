@@ -51,6 +51,10 @@ class CommentSlopTests(unittest.TestCase):
         self.assertLess(score, 2.0)
         self.assertGreaterEqual(score_comment("Set the security token", ["setSecurityToken(token)"]), 2.0)
         self.assertGreaterEqual(score_comment("Update the external cache", ["updateExternalCache(cache)"]), 2.0)
+        self.assertEqual(
+            score_comment("Binance writes observations, not synthetic ledger positions.", []),
+            1.0,
+        )
 
     def test_untruncated_untracked_comment_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
