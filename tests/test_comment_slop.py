@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+from subprocess import CompletedProcess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,7 +12,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_review_context  # noqa: E402
-from dissect_checks.comment_slop import extract_comments, scan_comments, score_comment  # noqa: E402
+import run_anti_slop  # noqa: E402
+from dissect_checks.comment_slop import (  # noqa: E402
+    _group_comments,
+    _normalize_verb,
+    extract_comments,
+    scan_comments,
+    score_comment,
+)
+from dissect_checks.redaction import redact_payload  # noqa: E402
+from diff_file_list import DiffEntry  # noqa: E402
 from review_ledger import validate_candidate  # noqa: E402
 
 
@@ -39,6 +49,152 @@ class CommentSlopTests(unittest.TestCase):
             ["const slug = existingSlug;", "commit();"],
         )
         self.assertLess(score, 2.0)
+        self.assertGreaterEqual(score_comment("Set the security token", ["setSecurityToken(token)"]), 2.0)
+        self.assertGreaterEqual(score_comment("Update the external cache", ["updateExternalCache(cache)"]), 2.0)
+
+    def test_untruncated_untracked_comment_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            text = ("const value = 0;\n" * 1000) + "// Update the account owner\nsaveUser(user);\n"
+            path = root / "untracked.ts"
+            path.write_text(text)
+            entries = [DiffEntry("??", "untracked.ts", "untracked.ts", True, "untracked")]
+            self.assertGreater(text.index("// Update"), 12000)
+            self.assertEqual(
+                build_review_context.changed_line_ranges(root, "untracked.ts", entries, "", build_review_context.read_full(path)),
+                [(1, len(text.splitlines()))],
+            )
+            values, limitations, coverage, _commands = build_review_context.optional_analyser_evidence(
+                root,
+                "diff",
+                ["untracked.ts"],
+                entries,
+                "",
+                {"review_options": {"anti_slop": False}},
+            )
+            self.assertTrue(any(item["source"].startswith("comment-slop/") for item in values))
+            self.assertEqual(coverage["comment-slop"]["state"], "Checked")
+            self.assertFalse(any("too large" in item for item in limitations))
+
+    def test_oversized_comment_file_is_not_reported_as_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "oversized.ts"
+            path.write_bytes(b"x" * (build_review_context.COMMENT_ANALYSIS_MAX_BYTES + 1))
+            values, limitations, coverage, commands = build_review_context.optional_analyser_evidence(
+                root,
+                "diff",
+                ["oversized.ts"],
+                [DiffEntry("??", "oversized.ts", "oversized.ts", True, "untracked")],
+                "",
+                {"review_options": {"anti_slop": False}},
+            )
+            self.assertEqual(values, [])
+            self.assertTrue(any("file too large for comment analysis oversized.ts" in item for item in limitations))
+            self.assertEqual(coverage["comment-slop"]["state"], "Not verified")
+            comment_command = next(item for item in commands if item["name"] == "comment-slop")
+            self.assertFalse(comment_command["complete"])
+
+    def test_changed_line_ranges_distinguishes_empty_evidence_from_failure(self) -> None:
+        entries = [DiffEntry("R", "old.ts", "new.ts", True, "commit")]
+        success = CompletedProcess([], 0, "@@ -1,1 +1,0 @@\n", "")
+        with tempfile.TemporaryDirectory() as directory, patch("build_review_context.subprocess.run", return_value=success):
+            self.assertEqual(build_review_context.changed_line_ranges(Path(directory), "new.ts", entries, "base", ""), [])
+        failure = CompletedProcess([], 1, "", "git unavailable")
+        with tempfile.TemporaryDirectory() as directory, patch("build_review_context.subprocess.run", return_value=failure):
+            self.assertIsNone(build_review_context.changed_line_ranges(Path(directory), "new.ts", entries, "base", ""))
+
+    def test_partial_diff_coverage_keeps_evidenced_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "good.ts").write_text("// Update the account owner\nsaveUser(user);\n")
+            (root / "bad.ts").write_text("// Update the account owner\nsaveUser(user);\n")
+            with patch(
+                "build_review_context.changed_line_ranges",
+                side_effect=[[(1, 2)], None],
+            ):
+                values, _limitations, coverage, commands = build_review_context.optional_analyser_evidence(
+                    root,
+                    "diff",
+                    ["good.ts", "bad.ts"],
+                    [],
+                    "",
+                    {"review_options": {"anti_slop": False}},
+                )
+            self.assertTrue(any(item["trigger_path"] == ["good.ts:1"] for item in values))
+            self.assertEqual(coverage["comment-slop"]["state"], "Not verified")
+            comment_command = next(item for item in commands if item["name"] == "comment-slop")
+            self.assertFalse(comment_command["complete"])
+
+    def test_behavioural_claim_normalises_verbs_and_has_contract(self) -> None:
+        self.assertEqual(
+            [_normalize_verb(value) for value in ("sends", "handles", "validated", "sending", "returns")],
+            ["send", "handle", "validate", "send", "return"],
+        )
+        candidates = scan_comments(
+            "app.ts",
+            "// This function sends an email to the account owner.\nsaveUser(user);\n",
+            [(1, 2)],
+            "diff",
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["source"], "comment-slop/behavioural-claim")
+        self.assertEqual(
+            candidates[0]["contract"],
+            "Verify the asserted behaviour exists in the current implementation (truthfulness), is in scope (relevance), and describes the current invariant (stability).",
+        )
+
+    def test_comment_slop_and_anti_slop_payloads_share_recursive_redaction(self) -> None:
+        token = "sk-abc123secretvalue"
+        candidates = scan_comments(
+            "app.ts",
+            f"// Set API key to {token}\nsetApiKey(value);\n",
+            [(1, 2)],
+            "diff",
+        )
+        self.assertEqual(len(candidates), 1)
+        serialised = json.dumps(candidates)
+        self.assertNotIn(token, serialised)
+        self.assertIn("[REDACTED type=generic-secret-token", serialised)
+        self.assertIs(run_anti_slop.redact_payload, redact_payload)
+        envelope = run_anti_slop._envelope(
+            status="skipped",
+            skip_reason="runner_error",
+            config_variant="generic",
+            files_scanned=0,
+            candidates=[],
+            detail=token,
+        )
+        self.assertNotIn(token, json.dumps(envelope))
+
+    def test_syntax_map_supports_multi_family_suffixes(self) -> None:
+        self.assertEqual(
+            [comment.text for comment in extract_comments("source.hpp", "// Update header\n/* Preserve ABI */\nint value = 1;\n")],
+            ["Update header", "Preserve ABI"],
+        )
+        self.assertEqual(
+            [comment.text for comment in extract_comments("source.php", "# Update the account\n$value = 1;\n")],
+            ["Update the account"],
+        )
+        self.assertEqual(
+            [comment.text for comment in extract_comments("source.tf", "// Update the resource\n# Keep the provider\nvalue = 1\n")],
+            ["Update the resource", "Keep the provider"],
+        )
+        self.assertEqual(
+            extract_comments(
+                "source.hpp",
+                'const char* text = "// not a comment";\nconst auto pattern = /https?:\\/\\/example/;\n',
+            ),
+            [],
+        )
+        self.assertEqual(
+            extract_comments("source.tf", 'value = "https://example.test/#not-comment"\n'),
+            [],
+        )
+        self.assertEqual(
+            extract_comments("source.tf", "value = <<EOF\n// not a comment\n# not a comment\nEOF\n"),
+            [],
+        )
 
     def test_extraction_ignores_strings_urls_regexes_and_heredocs(self) -> None:
         typescript = (
@@ -63,6 +219,36 @@ class CommentSlopTests(unittest.TestCase):
             ("d.ts", "// This function does not send notifications, validate input, or mutate state.\nrun()\n", "comment-slop/negative-claim"),
         )
         for path, text, source in cases:
+            candidates = scan_comments(path, text, [(1, 3)], "diff")
+            self.assertEqual([item["source"] for item in candidates], [source])
+
+    def test_multiline_verbatim_groups_map_to_expected_subtypes(self) -> None:
+        cases = (
+            (
+                "a.ts",
+                "// This helper does not send emails.\n// It never mutates the account.\nrun();\n",
+                "comment-slop/negative-claim",
+            ),
+            (
+                "b.ts",
+                "// This function saves the account.\n// Changed in the previous implementation.\nrun();\n",
+                "comment-slop/historical",
+            ),
+            (
+                "c.ts",
+                "// This function does not send emails.\n// Previously, it updated the account.\n// It no longer returns the old value.\nrun();\n",
+                "comment-slop/mixed",
+            ),
+            (
+                "d.ts",
+                "// This function does not send emails.\n// It will not mutate state.\nrun();\n",
+                "comment-slop/negative-claim",
+            ),
+        )
+        for path, text, source in cases:
+            comments = extract_comments(path, text)
+            groups = _group_comments(comments, text.splitlines())
+            self.assertEqual(len(groups), 1)
             candidates = scan_comments(path, text, [(1, 3)], "diff")
             self.assertEqual([item["source"] for item in candidates], [source])
 

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from diff_file_list import DiffEntry, deserialize_entries, read_diff_entries  # noqa: E402
-from dissect_checks.redaction import redact_sensitive_text  # noqa: E402
+from dissect_checks.redaction import redact_payload, redact_sensitive_text  # noqa: E402
 from file_paths import is_ignored_path  # noqa: E402
 from review_ledger import blank_candidate, validate_candidate  # noqa: E402
 
@@ -336,17 +336,7 @@ def _envelope(
     }
     if detail:
         payload["detail"] = detail[:500]
-    return _redact_payload(payload)
-
-
-def _redact_payload(value: Any) -> Any:
-    if isinstance(value, str):
-        return redact_sensitive_text(value)
-    if isinstance(value, list):
-        return [_redact_payload(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _redact_payload(item) for key, item in value.items()}
-    return value
+    return redact_payload(payload)
 
 
 def analyse(

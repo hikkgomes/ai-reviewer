@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from review_ledger import blank_candidate, validate_candidate
+from .redaction import redact_payload
 
 
 @dataclass(frozen=True)
@@ -23,13 +24,33 @@ class Comment:
 
 
 SLASH_LANGUAGES = {
-    ".c", ".cc", ".cpp", ".cxx", ".cs", ".go", ".java", ".js", ".jsx",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cs", ".go", ".java", ".js", ".jsx",
     ".mjs", ".cjs", ".kt", ".kts", ".php", ".rs", ".swift", ".ts", ".tsx",
     ".mts", ".cts",
 }
-HASH_LANGUAGES = {".bash", ".cfg", ".ini", ".py", ".rb", ".sh", ".tf", ".toml", ".yaml", ".yml", ".zsh"}
+HASH_LANGUAGES = {".bash", ".cfg", ".ini", ".php", ".py", ".rb", ".sh", ".tf", ".tfvars", ".toml", ".yaml", ".yml", ".zsh"}
 SQL_LANGUAGES = {".sql"}
 HTML_LANGUAGES = {".html", ".htm", ".md", ".xml", ".xhtml", ".svg"}
+
+SYNTAX: dict[str, frozenset[str]] = {
+    suffix: frozenset(
+        family
+        for family, suffixes in (
+            ("slash", SLASH_LANGUAGES),
+            ("hash", HASH_LANGUAGES),
+            ("sql", SQL_LANGUAGES),
+            ("html", HTML_LANGUAGES),
+        )
+        if suffix in suffixes
+    )
+    for suffix in SLASH_LANGUAGES | HASH_LANGUAGES | SQL_LANGUAGES | HTML_LANGUAGES
+}
+for _suffix, _families in {".php": {"slash", "hash"}, ".tf": {"slash", "hash"}, ".tfvars": {"slash", "hash"}}.items():
+    SYNTAX[_suffix] = frozenset(set(SYNTAX.get(_suffix, frozenset())) | _families)
+
+# Syntax audit: every suffix named by reference/lang is represented above;
+# C/C++ headers use slash comments, PHP uses slash and hash, and Terraform
+# uses slash, hash, and block comments. No other reference suffix mismatched.
 
 IMPERATIVE_VERBS = {
     "add", "call", "check", "create", "do", "ensure", "execute", "fetch", "get",
@@ -46,9 +67,13 @@ HISTORICAL_RE = re.compile(
 )
 CONVERSATION_RE = re.compile(r"\b(?:as requested|per the instructions|fixed the bug where)\b", re.I)
 EXPLANATORY_RE = re.compile(
-    r"\b(?:because|since|workaround|NOTE|SAFETY|must|cannot|invariant|canonical|contract|"
-    r"deliberately|explicit|reviewable|security|artifact|reviewer|external|compatibility)\b",
+    r"\b(?:because|since|workaround|must|cannot|invariant|NOTE|SAFETY|compatibility|contract|deliberately|canonical)\b",
     re.I,
+)
+BEHAVIOURAL_RE = re.compile(
+    r"(?:\b(?:this|the)\s+(?:function|method|helper|class|module|hook|endpoint|handler)\b.*"
+    r"|\A\s*[A-Za-z][A-Za-z0-9]*\b.*)",
+    re.I | re.S,
 )
 URL_RE = re.compile(r"\b(?:https?|ftp)://\S+", re.I)
 REFERENCE_RE = re.compile(r"\bsee\s+(?:https?://|\S*(?:ticket|issue)|#\d+)\b", re.I)
@@ -169,9 +194,10 @@ def _consume_regex(text: str, start: int) -> int:
 
 def _generic_comments(path: str, text: str) -> list[Comment]:
     suffix = Path(path).suffix.lower()
-    line_marker = "#" if suffix in HASH_LANGUAGES else "--" if suffix in SQL_LANGUAGES else None
-    slash_comments = suffix in SLASH_LANGUAGES
-    html_comments = suffix in HTML_LANGUAGES
+    syntax = SYNTAX.get(suffix, frozenset())
+    line_marker = "#" if "hash" in syntax else "--" if "sql" in syntax else None
+    slash_comments = "slash" in syntax
+    html_comments = "html" in syntax
     heredoc_lines = _heredoc_lines(text)
     comments: list[Comment] = []
     index = 0
@@ -188,7 +214,7 @@ def _generic_comments(path: str, text: str) -> list[Comment]:
             comments.append(Comment(line, _line_number(text, end), _comment_text(text[index + 4:end])))
             index = length if end == length else end + 3
             continue
-        if (slash_comments or suffix in SQL_LANGUAGES) and text.startswith("/*", index):
+        if (slash_comments or "sql" in syntax) and text.startswith("/*", index):
             is_docstring = text.startswith("/**", index)
             end = text.find("*/", index + 2)
             end = length if end < 0 else end
@@ -217,7 +243,7 @@ def _generic_comments(path: str, text: str) -> list[Comment]:
             else:
                 index = _consume_quoted(text, index, text[index])
             continue
-        if text[index] == "`" and suffix in SLASH_LANGUAGES | {".rb", ".sh", ".bash", ".zsh"}:
+        if text[index] == "`" and (slash_comments or suffix in {".rb", ".sh", ".bash", ".zsh"}):
             index = _consume_quoted(text, index, "`")
             continue
         if text[index] == "/" and slash_comments and not text.startswith(("//", "/*"), index) and _looks_like_regex(text, index):
@@ -265,15 +291,16 @@ def _tokens(value: str) -> list[str]:
 
 def _strip_inline_comment(path: str, value: str) -> str:
     suffix = Path(path).suffix.lower()
-    markers: tuple[str, ...]
-    if suffix in HASH_LANGUAGES:
-        markers = ("#",)
-    elif suffix in SQL_LANGUAGES:
-        markers = ("--", "/*")
-    elif suffix in HTML_LANGUAGES:
-        markers = ("<!--",)
-    else:
-        markers = ("//", "/*")
+    syntax = SYNTAX.get(suffix, frozenset())
+    markers: list[str] = []
+    if "slash" in syntax:
+        markers.extend(("//", "/*"))
+    if "hash" in syntax:
+        markers.append("#")
+    if "sql" in syntax:
+        markers.append("--")
+    if "html" in syntax:
+        markers.append("<!--")
     quote = ""
     index = 0
     while index < len(value):
@@ -323,6 +350,52 @@ def _is_heading(text: str) -> bool:
     )
 
 
+def _normalize_verb(token: str) -> str:
+    """Apply small, deterministic inflection rules used by the comment scorer."""
+    value = token.lower()
+    if value.endswith("ies") and len(value) > 4:
+        return value[:-3] + "y"
+    if value.endswith("ing") and len(value) > 5:
+        stem = value[:-3]
+        if stem + "e" in IMPERATIVE_VERBS:
+            return stem + "e"
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            stem = stem[:-1]
+        return stem
+    if value.endswith("ed") and len(value) > 4:
+        stem = value[:-2]
+        if stem + "e" in IMPERATIVE_VERBS:
+            return stem + "e"
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            stem = stem[:-1]
+        return stem
+    if value.endswith("es") and len(value) > 4:
+        stem = value[:-2]
+        if stem in IMPERATIVE_VERBS or stem + "e" in IMPERATIVE_VERBS:
+            return stem if stem in IMPERATIVE_VERBS else stem + "e"
+    if value.endswith("s") and len(value) > 3:
+        return value[:-1]
+    return value
+
+
+def _is_behavioural_claim(text: str) -> bool:
+    if not BEHAVIOURAL_RE.search(text) or NEGATIVE_RE.search(text) or HISTORICAL_RE.search(text):
+        return False
+    subject = re.search(
+        r"\b(?:this|the)\s+(?:function|method|helper|class|module|hook|endpoint|handler)\b(?P<body>.*)",
+        text,
+        re.I | re.S,
+    )
+    if subject and any(_normalize_verb(token) in IMPERATIVE_VERBS for token in _tokens(subject.group("body"))):
+        return True
+    leading = re.match(r"\s*([A-Za-z][A-Za-z0-9]*)\b", text)
+    return bool(
+        leading
+        and leading.group(1).lower().endswith(("s", "es", "ies"))
+        and _normalize_verb(leading.group(1)) in IMPERATIVE_VERBS
+    )
+
+
 def _score(text: str, code: list[str], diff_density: float) -> float:
     comment_tokens = set(_tokens(text))
     code_tokens = set(_tokens(" ".join(code)))
@@ -333,7 +406,7 @@ def _score(text: str, code: list[str], diff_density: float) -> float:
         score += 1.5
     if overlap_ratio >= 0.5:
         score += 1.0
-    if any(token in IMPERATIVE_VERBS for token in comment_tokens):
+    if any(_normalize_verb(token) in IMPERATIVE_VERBS for token in comment_tokens):
         score += 2.0
     if code and SequenceMatcher(None, " ".join(_tokens(text)), " ".join(_tokens(" ".join(code)))).ratio() >= 0.55:
         score += 2.0
@@ -349,15 +422,10 @@ def _score(text: str, code: list[str], diff_density: float) -> float:
         score += 3.0
     if EXPLANATORY_RE.search(text):
         score -= 1.0
+    if _is_behavioural_claim(text):
+        score += 2.0
     if re.search(r"\bNOTE\b", text):
         score += 0.5
-    if re.search(
-        r"\b(?:because|since|workaround|must|cannot|invariant|safety|canonical|contract|"
-        r"deliberately|explicit|reviewable|security|artifact|reviewer|external|compatibility)\b",
-        text,
-        re.I,
-    ):
-        score -= 2.5
     if URL_RE.search(text):
         score -= 1.0
     if REFERENCE_RE.search(text):
@@ -375,6 +443,8 @@ def score_comment(text: str, following_code: Iterable[str], diff_density: float 
 def _subtype(text: str, code: list[str]) -> str:
     if CONVERSATION_RE.search(text):
         return "conversation-leak"
+    if _is_behavioural_claim(text):
+        return "behavioural-claim"
     historical = bool(HISTORICAL_RE.search(text))
     negative = bool(NEGATIVE_RE.search(text))
     if historical and negative and re.search(r"\b(?:won['’]?t|will not|does not|doesn['’]?t)\b", text, re.I):
@@ -420,11 +490,18 @@ def scan_comments(
             continue
         subtype = _subtype(comment.text, code)
         digest = hashlib.sha1(f"{path}:{comment.line}:{comment.text}".encode("utf-8")).hexdigest()[:12]
+        contract = (
+            "Verify the asserted behaviour exists in the current implementation "
+            "(truthfulness), is in scope (relevance), and describes the current "
+            "invariant (stability)."
+            if subtype == "behavioural-claim"
+            else "Verify truthfulness, relevance, and stability before recommending removal."
+        )
         candidate = blank_candidate(
             f"candidate-comment-slop-{digest}",
             source=f"comment-slop/{subtype}",
             claim=f"Comment may be redundant or narrational at {Path(path).as_posix()}:{comment.line}",
-            contract="Verify truthfulness, relevance, and stability before recommending removal.",
+            contract=contract,
         )
         candidate["trigger_path"] = [f"{Path(path).as_posix()}:{comment.line}"]
         candidate["supporting_evidence"] = [{
@@ -433,6 +510,7 @@ def scan_comments(
             "line": comment.line,
             "message": comment.text,
         }]
+        candidate = redact_payload(candidate)
         errors = validate_candidate(candidate)
         if errors:
             raise ValueError("invalid comment-slop candidate: " + "; ".join(errors))

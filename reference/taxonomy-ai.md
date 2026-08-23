@@ -57,6 +57,12 @@ Redundant AI narration is a reviewable category in its own right. The default
 recommendation is removal, not because comments are forbidden, but because
 adjacent code and repository history already carry the same information.
 
+The deterministic detector emits these subtypes: `narration`,
+`section-header`, `conversation-leak`, `historical`, `negative-claim`,
+`mixed`, and `behavioural-claim`. For `behavioural-claim`, use the same
+truthfulness check as other candidates. Inspect the function body and direct
+callees only. Beyond that depth, use `not_verifiable`.
+
 Verify every candidate with three checks:
 
 1. Truthfulness: does the current code support the claim? Inspect the function
