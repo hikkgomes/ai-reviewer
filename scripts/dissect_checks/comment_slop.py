@@ -29,6 +29,7 @@ SLASH_LANGUAGES = {
     ".mts", ".cts",
 }
 HASH_LANGUAGES = {".bash", ".cfg", ".ini", ".php", ".py", ".rb", ".sh", ".tf", ".tfvars", ".toml", ".yaml", ".yml", ".zsh"}
+HASH_ATTRIBUTE_SUFFIXES = {".php"}
 SQL_LANGUAGES = {".sql"}
 HTML_LANGUAGES = {".html", ".htm", ".md", ".xml", ".xhtml", ".svg"}
 
@@ -67,7 +68,7 @@ HISTORICAL_RE = re.compile(
 )
 CONVERSATION_RE = re.compile(r"\b(?:as requested|per the instructions|fixed the bug where)\b", re.I)
 EXPLANATORY_RE = re.compile(
-    r"\b(?:because|since|workaround|must|cannot|invariant|NOTE|SAFETY|compatibility|contract|deliberately|canonical)\b",
+    r"\b(?:because|since|workaround|must|cannot|invariant|NOTE|SAFETY|compatibility|contract|deliberately)\b",
     re.I,
 )
 BEHAVIOURAL_RE = re.compile(
@@ -231,7 +232,11 @@ def _generic_comments(path: str, text: str) -> list[Comment]:
             comments.append(Comment(line, line, _comment_text(text[index + 2:end])))
             index = end
             continue
-        if line_marker and text.startswith(line_marker, index):
+        if (
+            line_marker
+            and text.startswith(line_marker, index)
+            and not (suffix in HASH_ATTRIBUTE_SUFFIXES and text.startswith("#[", index))
+        ):
             end = text.find("\n", index + len(line_marker))
             end = length if end < 0 else end
             comments.append(Comment(line, line, _comment_text(text[index + len(line_marker):end])))
@@ -320,7 +325,14 @@ def _strip_inline_comment(path: str, value: str) -> str:
             quote = char
             index += 1
             continue
-        marker = next((item for item in markers if value.startswith(item, index)), None)
+        marker = next(
+            (
+                item for item in markers
+                if value.startswith(item, index)
+                and not (item == "#" and suffix in HASH_ATTRIBUTE_SUFFIXES and value.startswith("#[", index))
+            ),
+            None,
+        )
         if marker is not None:
             return value[:index].rstrip()
         index += 1

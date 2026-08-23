@@ -81,19 +81,72 @@ class CommentSlopTests(unittest.TestCase):
             root = Path(directory)
             path = root / "oversized.ts"
             path.write_bytes(b"x" * (build_review_context.COMMENT_ANALYSIS_MAX_BYTES + 1))
-            values, limitations, coverage, commands = build_review_context.optional_analyser_evidence(
-                root,
-                "diff",
-                ["oversized.ts"],
-                [DiffEntry("??", "oversized.ts", "oversized.ts", True, "untracked")],
-                "",
-                {"review_options": {"anti_slop": False}},
-            )
+            with patch("build_review_context.read_full", wraps=build_review_context.read_full) as read_full:
+                values, limitations, coverage, commands = build_review_context.optional_analyser_evidence(
+                    root,
+                    "diff",
+                    ["oversized.ts"],
+                    [DiffEntry("??", "oversized.ts", "oversized.ts", True, "untracked")],
+                    "",
+                    {"review_options": {"anti_slop": False}},
+                )
+            read_full.assert_not_called()
             self.assertEqual(values, [])
             self.assertTrue(any("file too large for comment analysis oversized.ts" in item for item in limitations))
             self.assertEqual(coverage["comment-slop"]["state"], "Not verified")
             comment_command = next(item for item in commands if item["name"] == "comment-slop")
             self.assertFalse(comment_command["complete"])
+
+    def test_unreadable_source_is_not_verified_but_readable_candidates_survive(self) -> None:
+        for mode in ("diff", "full"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                good = root / "good.ts"
+                bad = root / "bad.ts"
+                good.write_text("// This function saves the account owner\nsaveUser(user);\n")
+                bad.write_text("// This function saves the account owner\nsaveUser(user);\n")
+                original = Path.read_text
+
+                def read_text(path: Path, *args: object, **kwargs: object) -> str:
+                    if path == bad:
+                        raise OSError("permission denied")
+                    return original(path, *args, **kwargs)
+
+                entries = [
+                    DiffEntry("??", name, name, True, "untracked")
+                    for name in ("good.ts", "bad.ts")
+                ]
+                with patch.object(Path, "read_text", autospec=True, side_effect=read_text):
+                    values, limitations, coverage, commands = build_review_context.optional_analyser_evidence(
+                        root, mode, ["good.ts", "bad.ts"], entries, "",
+                        {"review_options": {"anti_slop": False}},
+                    )
+                self.assertTrue(any(item["trigger_path"] == ["good.ts:1"] for item in values))
+                self.assertTrue(any("source unreadable for comment analysis bad.ts" in item for item in limitations))
+                self.assertEqual(coverage["comment-slop"]["state"], "Not verified")
+                comment_command = next(item for item in commands if item["name"] == "comment-slop")
+                self.assertFalse(comment_command["complete"])
+
+    def test_comment_analysis_reads_each_non_oversized_path_at_most_once(self) -> None:
+        for mode in ("diff", "full"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ("one.ts", "two.ts"):
+                    (root / name).write_text("// Update the account owner\nsaveUser(user);\n")
+                entries = [DiffEntry("??", name, name, True, "untracked") for name in ("one.ts", "two.ts")]
+                counts: dict[Path, int] = {}
+                original = Path.read_text
+
+                def read_text(path: Path, *args: object, **kwargs: object) -> str:
+                    counts[path] = counts.get(path, 0) + 1
+                    return original(path, *args, **kwargs)
+
+                with patch.object(Path, "read_text", autospec=True, side_effect=read_text):
+                    build_review_context.optional_analyser_evidence(
+                        root, mode, ["one.ts", "two.ts"], entries, "",
+                        {"review_options": {"anti_slop": False}},
+                    )
+                self.assertEqual(counts, {root / "one.ts": 1, root / "two.ts": 1})
 
     def test_changed_line_ranges_distinguishes_empty_evidence_from_failure(self) -> None:
         entries = [DiffEntry("R", "old.ts", "new.ts", True, "commit")]
@@ -196,6 +249,19 @@ class CommentSlopTests(unittest.TestCase):
             [],
         )
 
+    def test_php_attributes_are_not_comments(self) -> None:
+        text = (
+            "#[Route('/users/{id}')]\n"
+            "#[Example(\n"
+            "    name: 'user',\n"
+            ")]\n"
+            "function showUser() {}\n"
+            "# actual comment\n"
+            "$value = 1;\n"
+        )
+        self.assertEqual([comment.text for comment in extract_comments("source.php", text)], ["actual comment"])
+        self.assertFalse(any(item["location"]["line"] == 1 for item in scan_comments("source.php", text, None, "full")))
+
     def test_extraction_ignores_strings_urls_regexes_and_heredocs(self) -> None:
         typescript = (
             'const text = "// Perform the required operation.";\n'
@@ -226,23 +292,23 @@ class CommentSlopTests(unittest.TestCase):
         cases = (
             (
                 "a.ts",
-                "// This helper does not send emails.\n// It never mutates the account.\nrun();\n",
+                "// This is the function to do this\n// This function won't do that\nrun();\n",
                 "comment-slop/negative-claim",
             ),
             (
                 "b.ts",
-                "// This function saves the account.\n// Changed in the previous implementation.\nrun();\n",
-                "comment-slop/historical",
+                "// This function do this\n// This function doesn't do that other thing that it used to do\nrun();\n",
+                "comment-slop/mixed",
             ),
             (
                 "c.ts",
-                "// This function does not send emails.\n// Previously, it updated the account.\n// It no longer returns the old value.\nrun();\n",
+                "// This is the function to do this\n// This function won't do that\n// This function doesn't do that other thing that it used to do\nrun();\n",
                 "comment-slop/mixed",
             ),
             (
                 "d.ts",
-                "// This function does not send emails.\n// It will not mutate state.\nrun();\n",
-                "comment-slop/negative-claim",
+                "// This function won't do that\n// This function doesn't do that other thing that it used to do\nrun();\n",
+                "comment-slop/mixed",
             ),
         )
         for path, text, source in cases:

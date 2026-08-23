@@ -83,14 +83,16 @@ def _comment_analysis_too_large(path: Path) -> bool:
         return False
 
 
+class SourceReadError(Exception):
+    """Comment-analysis source could not be read; treat as missing evidence."""
+
+
 def read_full(path: Path) -> str:
     """Read a comment-analysis source file without the context-read cap."""
-    if _comment_analysis_too_large(path):
-        return ""
     try:
         return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+    except OSError as error:
+        raise SourceReadError(str(error)) from error
 
 
 def rel(path: Path, root: Path) -> str:
@@ -265,9 +267,9 @@ def changed_line_ranges(
 
 
 def _comment_density(
-    root: Path,
     paths: list[str],
     ranges_by_path: dict[str, list[tuple[int, int]] | None],
+    text_by_path: dict[str, str],
 ) -> float:
     changed_lines = sum(
         end - start + 1
@@ -280,7 +282,10 @@ def _comment_density(
         ranges = ranges_by_path.get(path)
         if not ranges:
             continue
-        comments = comment_slop.extract_comments(path, read_full(root / path))
+        text = text_by_path.get(path)
+        if text is None:
+            continue
+        comments = comment_slop.extract_comments(path, text)
         comment_lines += sum(
             1 for comment in comments
             if any(comment.line <= end and comment.end_line >= start for start, end in ranges)
@@ -448,24 +453,37 @@ def optional_analyser_evidence(
         return values, limitations, coverage, commands
 
     ranges_by_path: dict[str, list[tuple[int, int]] | None] = {}
+    text_by_path: dict[str, str] = {}
+    unreadable_paths: set[str] = set()
     oversized_paths = {
         path for path in source_scope if _comment_analysis_too_large(root / path)
     }
     for path in sorted(oversized_paths):
         limitations.append(redact_sensitive_text(f"comment-slop: file too large for comment analysis {path}"))
-    if mode == "diff":
-        for path in source_scope:
-            if path in oversized_paths:
+    for path in source_scope:
+        if path in oversized_paths:
+            if mode == "diff":
                 ranges_by_path[path] = None
-                continue
-            ranges = changed_line_ranges(root, path, entries, base, read_full(root / path))
+            continue
+        try:
+            text_by_path[path] = read_full(root / path)
+        except SourceReadError:
+            unreadable_paths.add(path)
+            limitations.append(redact_sensitive_text(f"comment-slop: source unreadable for comment analysis {path}"))
+            if mode == "diff":
+                ranges_by_path[path] = None
+            continue
+        if mode == "diff":
+            ranges = changed_line_ranges(root, path, entries, base, text_by_path[path])
             ranges_by_path[path] = ranges
             if ranges is None:
                 limitations.append(redact_sensitive_text(f"comment-slop: no diff-line evidence for {path}"))
-    density = _comment_density(root, source_scope, ranges_by_path) if mode == "diff" else 0.0
+    density = _comment_density(source_scope, ranges_by_path, text_by_path) if mode == "diff" else 0.0
     try:
         for path in source_scope:
-            text = read_full(root / path)
+            text = text_by_path.get(path)
+            if text is None:
+                continue
             ranges = ranges_by_path.get(path) if mode == "diff" else None
             values.extend(comment_slop.scan_comments(path, text, ranges, mode, density))
     except Exception as error:  # optional tooling must remain non-fatal
@@ -474,18 +492,13 @@ def optional_analyser_evidence(
         coverage["comment-slop"] = {"state": "Not verified", "reason": limitation}
         commands.append({"name": "comment-slop", "executed": True, "complete": False, "reason": redact_sensitive_text(str(error))})
     else:
-        unevidenced = [path for path, ranges in ranges_by_path.items() if ranges is None]
+        unevidenced = sorted({
+            path for path, ranges in ranges_by_path.items() if ranges is None
+        } | oversized_paths | unreadable_paths)
         if unevidenced:
             preview = ", ".join(unevidenced[:3])
             reason = redact_sensitive_text(
-                f"comment-slop: no diff-line evidence for {len(unevidenced)} file(s): {preview}"
-            )
-            coverage["comment-slop"] = {"state": "Not verified", "reason": reason}
-            commands.append({"name": "comment-slop", "executed": True, "complete": False})
-        elif oversized_paths:
-            preview = ", ".join(sorted(oversized_paths)[:3])
-            reason = redact_sensitive_text(
-                f"comment-slop: file too large for comment analysis: {preview}"
+                f"comment-slop: incomplete source or diff evidence for {len(unevidenced)} file(s): {preview}"
             )
             coverage["comment-slop"] = {"state": "Not verified", "reason": reason}
             commands.append({"name": "comment-slop", "executed": True, "complete": False})
