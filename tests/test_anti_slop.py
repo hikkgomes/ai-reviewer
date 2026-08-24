@@ -113,13 +113,23 @@ class AntiSlopTests(unittest.TestCase):
         self.assertEqual(result["status"], "skipped")
         self.assertEqual(result["skip_reason"], "no_js_ts_files")
 
-    def test_context_integrates_candidates_and_survives_missing_node(self) -> None:
+    @unittest.skipUnless(
+        shutil.which("node") and (ROOT / "scripts/vendor/anti-slop/node_modules/.bin/oxlint").exists(),
+        "skill-local Node runtime is unavailable",
+    )
+    def test_context_integrates_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "app.ts"
             source.write_text("declare const value: unknown;\nexport function load(): unknown { return value; }\n")
             context = build_review_context.build(root, "full", "", None)
             self.assertTrue(any(item["source"] == "anti-slop/no-unknown-returns" for item in context["candidates"]))
+
+    def test_context_survives_missing_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "app.ts"
+            source.write_text("declare const value: unknown;\nexport function load(): unknown { return value; }\n")
             with patch("run_anti_slop.shutil.which", return_value=None):
                 degraded = build_review_context.build(root, "full", "", None)
             self.assertTrue(any("Not verified — anti-slop pass unavailable (node_unavailable)" in item for item in degraded["limitations"]))
