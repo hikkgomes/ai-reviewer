@@ -147,6 +147,9 @@ reported as semantic findings.
   churn, and removed/weakened tests.
 - For critical UI pages, assess screenshot or visual-regression coverage without
   mandating a framework.
+- Optional evidence source: anti-slop diagnostics can identify deterministic
+  low-evidence TypeScript/JavaScript patterns. Treat every match as a candidate
+  and verify it against the affected contract.
 
 ## GOV-AUDIT — Governance, auditability, and shadow deployment
 

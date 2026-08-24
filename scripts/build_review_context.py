@@ -22,7 +22,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from diff_file_list import DiffEntry, read_diff_entries  # noqa: E402
 from dissect_checks.engine import ScanOptions, scan_report  # noqa: E402
-from file_paths import iter_files  # noqa: E402
+from dissect_checks import comment_slop  # noqa: E402
+from dissect_checks.redaction import redact_sensitive_text  # noqa: E402
+import run_anti_slop  # noqa: E402
+from file_paths import is_ignored_path, iter_files  # noqa: E402
 
 
 EXTENSIONS = {
@@ -43,6 +46,7 @@ KIND_RULES = (
     ("test", ("test", "spec", "fixture")),
     ("endpoint/server-action", ("route", "api", "handler", "controller", "action")),
 )
+COMMENT_ANALYSIS_MAX_BYTES = 5 * 1024 * 1024
 
 
 def git(root: Path, *args: str) -> str:
@@ -50,11 +54,45 @@ def git(root: Path, *args: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def local_config(root: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((root / ".ai-review" / "local.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def analyser_enabled(config: dict[str, Any], name: str) -> bool:
+    options = config.get("review_options")
+    if not isinstance(options, dict) or not isinstance(options.get(name), bool):
+        return True
+    return options[name]
+
+
 def read(path: Path, limit: int = 12000) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")[:limit]
     except OSError:
         return ""
+
+
+def _comment_analysis_too_large(path: Path) -> bool:
+    try:
+        return path.stat().st_size > COMMENT_ANALYSIS_MAX_BYTES
+    except OSError:
+        return False
+
+
+class SourceReadError(Exception):
+    """Comment-analysis source could not be read; treat as missing evidence."""
+
+
+def read_full(path: Path) -> str:
+    """Read a comment-analysis source file without the context-read cap."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise SourceReadError(str(error)) from error
 
 
 def rel(path: Path, root: Path) -> str:
@@ -81,7 +119,13 @@ def changed_entries(root: Path, mode: str, file_list: Path | None, base: str) ->
 def source_paths(root: Path, entries: list[DiffEntry], mode: str) -> list[str]:
     if mode == "full":
         return sorted({rel(path, root) for path in iter_files(root) if path.name not in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}})
-    return sorted({entry.reviewed_path for entry in entries if entry.exists_in_worktree and entry.reviewed_path})
+    return sorted({
+        entry.reviewed_path
+        for entry in entries
+        if entry.exists_in_worktree
+        and entry.reviewed_path
+        and not is_ignored_path(root, entry.reviewed_path)
+    })
 
 
 def intent(root: Path, intent_file: Path | None = None) -> dict[str, Any]:
@@ -171,6 +215,84 @@ def expanded_paths(root: Path, changed: list[str], mode: str) -> tuple[list[str]
             selected.add(path)
             reasons[path] = [{"reason": "direct symbol reference" if referenced else "credible companion path", "symbols": ", ".join(referenced)}]
     return sorted(selected), reasons
+
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.M)
+
+
+def _hunk_ranges(diff_text: str) -> list[tuple[int, int]]:
+    ranges = []
+    for match in _HUNK_RE.finditer(diff_text):
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
+        if count:
+            ranges.append((start, start + count - 1))
+    return ranges
+
+
+def changed_line_ranges(
+    root: Path,
+    path: str,
+    entries: list[DiffEntry],
+    base: str,
+    text: str,
+) -> list[tuple[int, int]] | None:
+    """Return current added-line ranges, or ``None`` when Git evidence is absent."""
+    matching = [entry for entry in entries if entry.reviewed_path == path]
+    if any(entry.source_kind == "untracked" for entry in matching):
+        return [(1, max(1, len(text.splitlines())))]
+    commands: list[list[str]] = []
+    if base:
+        commands.append(["git", "diff", "--unified=0", base, "--", path])
+    else:
+        commands.extend([
+            ["git", "diff", "--unified=0", "--", path],
+            ["git", "diff", "--cached", "--unified=0", "--", path],
+        ])
+    output = []
+    git_succeeded = False
+    for command in commands:
+        try:
+            result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+        except OSError:
+            continue
+        if result.returncode == 0:
+            git_succeeded = True
+            output.append(result.stdout)
+    ranges = _hunk_ranges("\n".join(output))
+    # [] is successful evidence for rename-only or other zero-addition edits;
+    # pure deleted files normally do not reach comment-slop because source_scope
+    # excludes paths absent from the worktree. None means Git evidence failed.
+    return ranges if git_succeeded else None
+
+
+def _comment_density(
+    paths: list[str],
+    ranges_by_path: dict[str, list[tuple[int, int]] | None],
+    text_by_path: dict[str, str],
+) -> float:
+    changed_lines = sum(
+        end - start + 1
+        for ranges in ranges_by_path.values()
+        if ranges
+        for start, end in ranges
+    )
+    comment_lines = 0
+    for path in paths:
+        ranges = ranges_by_path.get(path)
+        if not ranges:
+            continue
+        text = text_by_path.get(path)
+        if text is None:
+            continue
+        comments = comment_slop.extract_comments(path, text)
+        comment_lines += sum(
+            1 for comment in comments
+            if any(comment.line <= end and comment.end_line >= start for start, end in ranges)
+        )
+    if changed_lines == 0:
+        return 0.0
+    return comment_lines / changed_lines
 
 
 def detected_repository(root: Path) -> dict[str, Any]:
@@ -278,11 +400,127 @@ def candidates(root: Path, entries: list[DiffEntry], paths: list[str]) -> tuple[
     return output, list(report.coverage_errors)
 
 
+def optional_analyser_evidence(
+    root: Path,
+    mode: str,
+    source_scope: list[str],
+    entries: list[DiffEntry],
+    base: str,
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], dict[str, dict[str, str]], list[dict[str, Any]]]:
+    """Run optional analysers without allowing their runtime to break context collection."""
+    values: list[dict[str, Any]] = []
+    limitations: list[str] = []
+    coverage: dict[str, dict[str, str]] = {}
+    commands: list[dict[str, Any]] = []
+
+    if not analyser_enabled(config, "anti_slop"):
+        limitation = "anti-slop disabled by review_options"
+        limitations.append(limitation)
+        coverage["anti-slop"] = {"state": "Not verified", "reason": limitation}
+        commands.append({"name": "anti-slop", "executed": False, "complete": False, "reason": limitation})
+    else:
+        try:
+            anti = run_anti_slop.analyse(root, source_scope)
+        except Exception as error:  # optional tooling must remain non-fatal
+            anti = {
+                "tool": "anti-slop", "status": "skipped", "skip_reason": "runner_error",
+                "config_variant": "generic", "files_scanned": 0, "candidates": [],
+                "detail": str(error),
+            }
+        values.extend(anti.get("candidates", []))
+        commands.append({
+            "name": "anti-slop", "executed": True,
+            "complete": anti.get("status") == "ok",
+            "status": anti.get("status"), "skip_reason": anti.get("skip_reason"),
+        })
+        if anti.get("status") == "skipped":
+            reason = str(anti.get("skip_reason") or "unknown")
+            limitation = f"Not verified — anti-slop pass unavailable ({reason})"
+            limitations.append(limitation)
+            coverage["anti-slop"] = {"state": "Not verified", "reason": limitation}
+        else:
+            coverage["anti-slop"] = {
+                "state": "Checked",
+                "reason": f"Skill-local anti-slop pass scanned {anti.get('files_scanned', 0)} file(s); matches remain candidates.",
+            }
+
+    if not analyser_enabled(config, "comment_slop"):
+        limitation = "comment-slop disabled by review_options"
+        limitations.append(limitation)
+        coverage["comment-slop"] = {"state": "Not verified", "reason": limitation}
+        commands.append({"name": "comment-slop", "executed": False, "complete": False, "reason": limitation})
+        return values, limitations, coverage, commands
+
+    ranges_by_path: dict[str, list[tuple[int, int]] | None] = {}
+    text_by_path: dict[str, str] = {}
+    unreadable_paths: set[str] = set()
+    oversized_paths = {
+        path for path in source_scope if _comment_analysis_too_large(root / path)
+    }
+    for path in sorted(oversized_paths):
+        limitations.append(redact_sensitive_text(f"comment-slop: file too large for comment analysis {path}"))
+    for path in source_scope:
+        if path in oversized_paths:
+            if mode == "diff":
+                ranges_by_path[path] = None
+            continue
+        try:
+            text_by_path[path] = read_full(root / path)
+        except SourceReadError:
+            unreadable_paths.add(path)
+            limitations.append(redact_sensitive_text(f"comment-slop: source unreadable for comment analysis {path}"))
+            if mode == "diff":
+                ranges_by_path[path] = None
+            continue
+        if mode == "diff":
+            ranges = changed_line_ranges(root, path, entries, base, text_by_path[path])
+            ranges_by_path[path] = ranges
+            if ranges is None:
+                limitations.append(redact_sensitive_text(f"comment-slop: no diff-line evidence for {path}"))
+    density = _comment_density(source_scope, ranges_by_path, text_by_path) if mode == "diff" else 0.0
+    try:
+        for path in source_scope:
+            text = text_by_path.get(path)
+            if text is None:
+                continue
+            ranges = ranges_by_path.get(path) if mode == "diff" else None
+            values.extend(comment_slop.scan_comments(path, text, ranges, mode, density))
+    except Exception as error:  # optional tooling must remain non-fatal
+        limitation = redact_sensitive_text(f"Not verified — comment-slop pass unavailable (runner_error: {error})")
+        limitations.append(limitation)
+        coverage["comment-slop"] = {"state": "Not verified", "reason": limitation}
+        commands.append({"name": "comment-slop", "executed": True, "complete": False, "reason": redact_sensitive_text(str(error))})
+    else:
+        unevidenced = sorted({
+            path for path, ranges in ranges_by_path.items() if ranges is None
+        } | oversized_paths | unreadable_paths)
+        if unevidenced:
+            preview = ", ".join(unevidenced[:3])
+            reason = redact_sensitive_text(
+                f"comment-slop: incomplete source or diff evidence for {len(unevidenced)} file(s): {preview}"
+            )
+            coverage["comment-slop"] = {"state": "Not verified", "reason": reason}
+            commands.append({"name": "comment-slop", "executed": True, "complete": False})
+        else:
+            coverage["comment-slop"] = {
+                "state": "Checked",
+                "reason": "Comment candidates are scoped to changed lines in diff mode and remain subject to semantic verification.",
+            }
+            commands.append({"name": "comment-slop", "executed": True, "complete": True})
+    return values, limitations, coverage, commands
+
+
 def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file: Path | None = None, requested_frameworks: tuple[str, ...] = ()) -> dict[str, Any]:
+    config = local_config(root)
     entries = changed_entries(root, mode, file_list, base)
     changed = source_paths(root, entries, mode)
     paths, scope_reasons = expanded_paths(root, changed, mode)
     candidate_values, coverage_errors = candidates(root, entries, paths)
+    optional_values, analyser_limitations, analyser_coverage, analyser_commands = optional_analyser_evidence(
+        root, mode, changed, entries, base, config,
+    )
+    candidate_values.extend(optional_values)
     instructions = [rel(path, root) for path in iter_files(root) if path.name in INSTRUCTION_NAMES]
     manifests = [path for path in paths if Path(path).name in {"package.json", "pyproject.toml", "go.mod", "Cargo.toml", "composer.json", "pom.xml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}]
     languages = sorted({EXTENSIONS[Path(path).suffix.lower()] for path in paths if Path(path).suffix.lower() in EXTENSIONS})
@@ -305,14 +543,22 @@ def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file:
     for match in re.finditer(r"(?m)^##\s+([A-Z]+-[A-Z]+)", read(catalog, 50000)):
         families.append(match.group(1))
     coverage = {family: {"state": "Not verified", "reason": "Deterministic candidates require semantic confirmation."} for family in families}
+    coverage.update(analyser_coverage)
+    commands = [
+        {"name": "git evidence collection", "executed": True, "complete": True},
+        {"name": "architecture detection", "executed": True, "complete": bool(arch)},
+        {"name": "deterministic scanner", "executed": True, "complete": not coverage_errors},
+        *analyser_commands,
+    ]
     return {
         "schema_version": "1.0", "mode": mode,
         "scope": {"root": str(root), "base": base, "branch": git(root, "branch", "--show-current"), "head": git(root, "rev-parse", "HEAD"), "merge_base": git(root, "merge-base", base, "HEAD") if base else "", "files": paths, "entries": [asdict(entry) for entry in entries]},
         "intent": intent(root, intent_file),
         "repository": {"instructions": instructions, "languages": languages, "frameworks": list(dict.fromkeys([*(arch.get("key_libraries") or {}).get("framework", []), *requested_frameworks])), "framework_packs": loaded_framework_packs(root, arch, paths, requested_frameworks), "package_managers": detected.get("package_managers", []), "test_commands": detected.get("commands", {}), "architecture": arch, "manifests": manifests, "touchpoints": touchpoints},
         "behavioural_units": behavioural_units(root, paths, entries, scope_reasons), "candidates": candidate_values,
-        "commands": [{"name": "git evidence collection", "executed": True, "complete": True}, {"name": "architecture detection", "executed": True, "complete": bool(arch)}, {"name": "deterministic scanner", "executed": True, "complete": not coverage_errors}],
-        "coverage": coverage, "limitations": coverage_errors + (["Semantic confirmation, falsification, and runtime evidence are performed by the reviewer."] if True else []),
+        "commands": commands,
+        "coverage": coverage,
+        "limitations": coverage_errors + analyser_limitations + ["Semantic confirmation, falsification, and runtime evidence are performed by the reviewer."],
     }
 
 

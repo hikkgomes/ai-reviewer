@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -16,6 +17,7 @@ _SENSITIVE_LABEL = (
 )
 _PROVIDER_PATTERNS = (
     ("stripe-live", re.compile(r"\bsk_live_[A-Za-z0-9]{16,}\b")),
+    ("generic-secret-token", re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")),
     ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("github-token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b")),
     ("github-fine-grained-token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}\b")),
@@ -93,6 +95,17 @@ def redact_sensitive_text(text: str) -> str:
     for kind, pattern in _PROVIDER_PATTERNS:
         redacted = pattern.sub(lambda match, kind=kind: _replacement(match.group(0), kind), redacted)
     return redacted
+
+
+def redact_payload(value: Any) -> Any:
+    """Recursively redact strings before a payload is retained or emitted."""
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, list):
+        return [redact_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_payload(item) for key, item in value.items()}
+    return value
 
 
 def redact_environment(entries: tuple[tuple[str, str], ...]) -> list[dict[str, str]]:

@@ -8,6 +8,8 @@
     "run_install_on_review": false,
     "deterministic_output": "text",
     "fail_on_severity": "none",
+    "anti_slop": true,
+    "comment_slop": true,
     "execution_environment": {}
   },
   "commands": {
