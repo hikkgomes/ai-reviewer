@@ -72,6 +72,11 @@ class CommentSlopTests(unittest.TestCase):
                 ["for client_row in select * from public.clients order by id loop"],
                 1.0,
             ),
+            (
+                "Only portfolios with no client are self-service portfolios.",
+                ["where p.client_id is null"],
+                1.0,
+            ),
         )
         for comment, following_code, diff_density in cases:
             with self.subTest(comment=comment):

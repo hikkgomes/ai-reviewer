@@ -414,12 +414,13 @@ def _score(text: str, code: list[str], diff_density: float) -> float:
     code_tokens = set(_tokens(" ".join(code)))
     overlap = comment_tokens & code_tokens
     overlap_ratio = len(overlap) / max(1, len(comment_tokens))
+    has_imperative = any(_normalize_verb(token) in IMPERATIVE_VERBS for token in comment_tokens)
     score = 0.0
-    if overlap_ratio >= 0.25:
+    if has_imperative and overlap_ratio >= 0.25:
         score += 1.5
-    if overlap_ratio >= 0.5:
+    if has_imperative and overlap_ratio >= 0.5:
         score += 1.0
-    if any(_normalize_verb(token) in IMPERATIVE_VERBS for token in comment_tokens):
+    if has_imperative:
         score += 2.0
     if code and SequenceMatcher(None, " ".join(_tokens(text)), " ".join(_tokens(" ".join(code)))).ratio() >= 0.55:
         score += 2.0
