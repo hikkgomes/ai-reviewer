@@ -432,7 +432,7 @@ def _score(text: str, code: list[str], diff_density: float) -> float:
     if NEGATIVE_RE.search(text):
         score += 0.5
     if HISTORICAL_RE.search(text):
-        score += 1.5
+        score += 1.0
     if CONVERSATION_RE.search(text):
         score += 3.0
     if EXPLANATORY_RE.search(text):

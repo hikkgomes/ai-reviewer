@@ -55,6 +55,7 @@ class CommentSlopTests(unittest.TestCase):
             score_comment("Binance writes observations, not synthetic ledger positions.", []),
             1.0,
         )
+        self.assertLess(score_comment("Previously this used Redis.", []), 2.0)
 
     def test_gate_d_rationales_remain_below_candidate_threshold(self) -> None:
         cases = (
