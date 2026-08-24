@@ -77,6 +77,11 @@ class CommentSlopTests(unittest.TestCase):
                 ["where p.client_id is null"],
                 1.0,
             ),
+            (
+                "Persistent, run-scoped work tables keep calculations concurrent-safe and allow plpgsql_check to validate every statement during database lint.",
+                ["create table if not exists pg_temp.calculation_work"],
+                1.0,
+            ),
         )
         for comment, following_code, diff_density in cases:
             with self.subTest(comment=comment):
