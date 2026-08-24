@@ -56,6 +56,27 @@ class CommentSlopTests(unittest.TestCase):
             1.0,
         )
 
+    def test_gate_d_rationales_remain_below_candidate_threshold(self) -> None:
+        cases = (
+            (
+                "Validate the canonical environment rather than trusting a forged plan object.",
+                [
+                    "if canonical_environment(plan.environment_dict) != plan.environment:",
+                    'return None, "execution-plan environment is not canonical"',
+                    "resolved = _resolve_executable(plan.argv[0], plan.environment_dict)",
+                ],
+                0.0,
+            ),
+            (
+                "A legacy client is the tenant boundary. Never derive it from the portfolio creator.",
+                ["for client_row in select * from public.clients order by id loop"],
+                1.0,
+            ),
+        )
+        for comment, following_code, diff_density in cases:
+            with self.subTest(comment=comment):
+                self.assertLess(score_comment(comment, following_code, diff_density), 2.0)
+
     def test_untruncated_untracked_comment_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -68,7 +68,8 @@ HISTORICAL_RE = re.compile(
 )
 CONVERSATION_RE = re.compile(r"\b(?:as requested|per the instructions|fixed the bug where)\b", re.I)
 EXPLANATORY_RE = re.compile(
-    r"\b(?:because|since|workaround|must|cannot|invariant|NOTE|SAFETY|compatibility|contract|deliberately)\b",
+    r"(?:\b(?:because|since|workaround|must|cannot|invariant|NOTE|SAFETY|compatibility|contract|deliberately|boundary)\b"
+    r"|\brather\s+than\b)",
     re.I,
 )
 BEHAVIOURAL_RE = re.compile(
@@ -434,6 +435,8 @@ def _score(text: str, code: list[str], diff_density: float) -> float:
         score += 3.0
     if EXPLANATORY_RE.search(text):
         score -= 1.0
+    if re.search(r"\brather\s+than\b", text, re.I):
+        score -= 1.5
     if _is_behavioural_claim(text):
         score += 2.0
     if re.search(r"\bNOTE\b", text):
