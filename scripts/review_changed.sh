@@ -48,7 +48,16 @@ fi
 
 CHANGED_FILE_LIST="$(mktemp /tmp/ai_review_changed.XXXXXX 2>/dev/null || mktemp -t ai_review_changed)"
 export AI_REVIEW_FILE_LIST="$CHANGED_FILE_LIST"
-trap 'rm -f "$CHANGED_FILE_LIST"' EXIT
+CONTEXT_PID=""
+WATCHDOG_PID=""
+cleanup() {
+  if [ -n "$CONTEXT_PID" ]; then kill -TERM "$CONTEXT_PID" 2>/dev/null || true; fi
+  if [ -n "$WATCHDOG_PID" ]; then kill -TERM "$WATCHDOG_PID" 2>/dev/null || true; fi
+  rm -f "$CHANGED_FILE_LIST"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 if ! python3 "$SCRIPT_DIR/diff_file_list.py" --range "$COMMITTED_RANGE" >"$CHANGED_FILE_LIST"; then
   exit 1
 fi
@@ -61,9 +70,27 @@ else
 fi
 
 CONTEXT_PATH="${AI_REVIEW_CONTEXT_PATH:-$(mktemp /tmp/ai_review_context.XXXXXX 2>/dev/null || mktemp -t ai_review_context)}"
+CALLER_PID="$PPID"
 python3 "$SCRIPT_DIR/build_review_context.py" \
   --root "$ROOT" --mode diff --base "${MERGE_BASE:-$BASE_REF}" \
-  --file-list "$CHANGED_FILE_LIST" --output "$CONTEXT_PATH" >/dev/null
+  --file-list "$CHANGED_FILE_LIST" --output "$CONTEXT_PATH" \
+  --timeout "${AI_REVIEW_CONTEXT_TIMEOUT_SECONDS:-300}" >/dev/null &
+CONTEXT_PID=$!
+(
+  while kill -0 "$CALLER_PID" 2>/dev/null; do sleep 1; done
+  kill -TERM "$CONTEXT_PID" 2>/dev/null || true
+) &
+WATCHDOG_PID=$!
+if wait "$CONTEXT_PID"; then
+  CONTEXT_STATUS=0
+else
+  CONTEXT_STATUS=$?
+fi
+CONTEXT_PID=""
+kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+wait "$WATCHDOG_PID" 2>/dev/null || true
+WATCHDOG_PID=""
+if [ "$CONTEXT_STATUS" -ne 0 ]; then exit "$CONTEXT_STATUS"; fi
 echo "Review context: $CONTEXT_PATH"
 
 echo

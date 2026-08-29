@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from build_review_context import all_text_paths, build, intent  # noqa: E402
+from build_review_context import all_text_paths, build, expanded_paths, intent, main, reference_tokens  # noqa: E402
 from review_ledger import blank_candidate, final_findings, transition, validate_ledger  # noqa: E402
 from score_review_results import score  # noqa: E402
 from validate_review_result import validate  # noqa: E402
@@ -20,6 +22,33 @@ from run_benchmarks import prepare_codex_environment, run_one, tree_manifest  # 
 
 
 class ReviewWorkflowTests(unittest.TestCase):
+    def test_reference_index_preserves_plain_and_dotted_symbols(self) -> None:
+        self.assertEqual(
+            reference_tokens("schema.load_user($account)"),
+            {"schema.load_user", "schema", "load_user", "$account"},
+        )
+
+    def test_diff_expansion_finds_cross_file_symbol_references(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "service.py").write_text("def load_user():\n    return 1\n")
+            (root / "route.py").write_text("from service import load_user\n")
+            paths, reasons = expanded_paths(root, ["service.py"], "diff")
+            self.assertEqual(paths, ["route.py", "service.py"])
+            self.assertEqual(reasons["route.py"][0]["reason"], "direct symbol reference")
+
+    def test_context_cli_interrupts_work_at_its_time_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "build_review_context.build",
+            side_effect=lambda *_args: signal.pause(),
+        ), patch.object(
+            sys,
+            "argv",
+            ["build_review_context.py", "--mode", "full", "--timeout", "1", "--output", str(Path(directory) / "context.json")],
+        ):
+            with self.assertRaisesRegex(TimeoutError, "exceeded 1 seconds"):
+                main()
+
     def test_context_prunes_dependency_and_build_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -29,6 +58,9 @@ class ReviewWorkflowTests(unittest.TestCase):
             (root / "node_modules" / "package" / "ignored.js").write_text("export const ignored = true\n")
             (root / "dist").mkdir()
             (root / "dist" / "README.md").write_text("generated intent\n")
+            (root / ".venv-ci" / "lib").mkdir(parents=True)
+            (root / ".venv-ci" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+            (root / ".venv-ci" / "lib" / "installed.py").write_text("def dependency():\n    return 1\n")
 
             self.assertEqual(all_text_paths(root), ["src/app.py"])
             self.assertEqual(intent(root)["summary"], "")

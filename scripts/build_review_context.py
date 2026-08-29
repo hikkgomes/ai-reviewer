@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 from typing import Any
@@ -47,6 +48,8 @@ KIND_RULES = (
     ("endpoint/server-action", ("route", "api", "handler", "controller", "action")),
 )
 COMMENT_ANALYSIS_MAX_BYTES = 5 * 1024 * 1024
+DEFAULT_CONTEXT_TIMEOUT_SECONDS = 300
+_REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
 
 
 def git(root: Path, *args: str) -> str:
@@ -190,6 +193,16 @@ def symbols_with_lines(text: str, path: str) -> list[dict[str, Any]]:
     return found
 
 
+def reference_tokens(text: str) -> set[str]:
+    """Index identifier references once instead of searching once per symbol."""
+    dotted = _REFERENCE_TOKEN_RE.findall(text)
+    return set(dotted) | {
+        part
+        for value in dotted
+        for part in value.split(".")
+    }
+
+
 def evidence_lines(text: str, patterns: tuple[str, ...]) -> list[str]:
     return [line.strip() for line in text.splitlines() if any(re.search(pattern, line, re.I) for pattern in patterns)][:20]
 
@@ -202,14 +215,17 @@ def expanded_paths(root: Path, changed: list[str], mode: str) -> tuple[list[str]
     if mode == "full":
         return all_text_paths(root), {}
     candidates = all_text_paths(root)
-    changed_symbols = [name for path in changed for name in symbols(read(root / path))]
+    changed_symbols = list(dict.fromkeys(
+        name for path in changed for name in symbols(read(root / path))
+    ))
     selected = set(changed)
     reasons: dict[str, list[dict[str, str]]] = {path: [{"reason": "changed scope"}] for path in changed}
     for path in candidates:
         if path in selected:
             continue
         text = read(root / path)
-        referenced = [name for name in changed_symbols if re.search(rf"\b{re.escape(name)}\b", text)]
+        tokens = reference_tokens(text)
+        referenced = [name for name in changed_symbols if name in tokens]
         companion = any(token in path.lower() for token in ("middleware", "schema", "model", "migration", "config", "test", "spec", "route", "handler"))
         if referenced or companion and any(Path(item).stem in path for item in changed):
             selected.add(path)
@@ -327,6 +343,8 @@ def loaded_framework_packs(root: Path, architecture_data: dict[str, Any], paths:
 
 
 def behavioural_units(root: Path, paths: list[str], entries: list[DiffEntry], scope_reasons: dict[str, list[dict[str, str]]]) -> list[dict[str, Any]]:
+    text_by_path = {path: read(root / path) for path in paths}
+    tokens_by_path = {path: reference_tokens(text) for path, text in text_by_path.items()}
     groups: dict[str, tuple[str, list[str]]] = {}
     for path in paths:
         kind = classify(path)
@@ -338,21 +356,20 @@ def behavioural_units(root: Path, paths: list[str], entries: list[DiffEntry], sc
         tests: list[str] = []
         configuration: list[str] = []
         for member in members:
-            content = read(root / member)
+            content = text_by_path[member]
             changed_symbols.extend(f"{member}:{symbol}" for symbol in symbols(content))
             if "/test" in f"/{member}" or "/tests" in f"/{member}" or ".spec." in member or ".test." in member:
                 tests.append(member)
             if any(token in member.lower() for token in ("config", ".env", "workflow", "docker", "terraform")):
                 configuration.append(member)
-        unit_text = "\n".join(read(root / member) for member in members)
-        declarations = [item for member in members for item in symbols_with_lines(read(root / member), member)]
+        unit_text = "\n".join(text_by_path[member] for member in members)
+        declarations = [item for member in members for item in symbols_with_lines(text_by_path[member], member)]
         names = [item["name"] for item in declarations]
         callers = []
         for candidate in paths:
             if candidate in members:
                 continue
-            candidate_text = read(root / candidate)
-            referenced = [name for name in names if re.search(rf"\b{re.escape(name)}\b", candidate_text)]
+            referenced = [name for name in names if name in tokens_by_path[candidate]]
             if referenced:
                 callers.append({"path": candidate, "symbols": referenced, "reason": "direct symbol reference"})
         units.append({
@@ -570,9 +587,22 @@ def main() -> int:
     parser.add_argument("--file-list", type=Path)
     parser.add_argument("--intent-file", type=Path)
     parser.add_argument("--framework", action="append", default=[])
+    parser.add_argument("--timeout", type=int, default=DEFAULT_CONTEXT_TIMEOUT_SECONDS)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    payload = build(args.root.resolve(), args.mode, args.base, args.file_list, args.intent_file, tuple(args.framework))
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+
+    def timeout_handler(_signum: int, _frame: Any) -> None:
+        raise TimeoutError(f"review context construction exceeded {args.timeout} seconds")
+
+    previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(args.timeout)
+    try:
+        payload = build(args.root.resolve(), args.mode, args.base, args.file_list, args.intent_file, tuple(args.framework))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     print(str(args.output))

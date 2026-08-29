@@ -21,6 +21,11 @@ DEFAULT_IGNORED_DIRS = frozenset({
 })
 
 
+def is_virtual_environment_dir(path: Path) -> bool:
+    """Identify Python virtual environments by structure, not directory name."""
+    return path.name in {".venv", "venv"} or (path / "pyvenv.cfg").is_file()
+
+
 def configured_ignore_patterns(root: Path) -> tuple[str, ...]:
     """Read repository path ignores without making malformed config fatal."""
     try:
@@ -67,8 +72,11 @@ def is_ignored_path(
         relative = resolved.absolute().relative_to(root).as_posix()
     except ValueError:
         return True
-    if any(part in DEFAULT_IGNORED_DIRS for part in Path(relative).parts):
-        return True
+    current = root
+    for part in Path(relative).parts[:-1]:
+        current /= part
+        if part in DEFAULT_IGNORED_DIRS or is_virtual_environment_dir(current):
+            return True
     patterns = configured_ignore_patterns(root) if ignored_paths is None else ignored_paths
     return any(matches_ignore_pattern(relative, pattern) for pattern in patterns)
 
@@ -90,6 +98,7 @@ def iter_files(
         dirnames[:] = sorted(
             name for name in dirnames
             if name not in ignored_dirs
+            and not is_virtual_environment_dir(parent / name)
             and not (should_skip_dir and should_skip_dir(parent / name))
             and not any(
                 matches_ignore_pattern((parent / name).relative_to(root).as_posix(), pattern)
