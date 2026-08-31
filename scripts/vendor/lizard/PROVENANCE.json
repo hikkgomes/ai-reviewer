@@ -1,0 +1,26 @@
+{
+  "name": "lizard",
+  "version": "1.24.0",
+  "upstream": "https://pypi.org/project/lizard/1.24.0/",
+  "licence": "MIT",
+  "distribution": "lizard-1.24.0-py2.py3-none-any.whl",
+  "sha256": "a688bc607a891ff4a7836826f25742dc9c1bf648da3075dbd495e199e8848602",
+  "dependencies": [
+    {
+      "name": "pathspec",
+      "version": "1.1.1",
+      "sha256": "a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189",
+      "licence": "MPL-2.0",
+      "upstream": "https://pypi.org/project/pathspec/1.1.1/"
+    },
+    {
+      "name": "Pygments",
+      "version": "2.21.0",
+      "sha256": "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9",
+      "licence": "BSD-2-Clause",
+      "upstream": "https://pypi.org/project/Pygments/2.21.0/"
+    }
+  ],
+  "purpose": "skill-local fallback for function-level cyclomatic complexity",
+  "upgrade": "Update the exact requirement and provenance together, then rerun compiler-valid complexity fixtures."
+}

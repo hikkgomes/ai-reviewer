@@ -29,6 +29,20 @@ DEFAULT_ANALYSIS_LIMITS: dict[str, int | float] = {
     "anti_slop_max_total_bytes": 256 * 1024 * 1024,
     "anti_slop_max_files": 20000,
     "anti_slop_max_candidates": 5000,
+    "test_integrity_timeout_seconds": 300,
+    "test_matrix_timeout_seconds": 600,
+    "mutation_timeout_seconds": 300,
+    "mutation_max_mutants": 25,
+    "mutation_max_per_function": 3,
+    "proof_test_timeout_seconds": 120,
+    "flaky_test_repetitions": 3,
+    "complexity_timeout_seconds": 60,
+    "complexity_max_files": 20000,
+    "complexity_max_total_bytes": 256 * 1024 * 1024,
+    "complexity_max_candidates": 100,
+    "complexity_fallback_threshold": 15,
+    "complexity_delta_threshold": 5,
+    "complexity_delta_minimum_head": 10,
     "external_command_max_argument_bytes": 24000,
     "external_command_max_files": 250,
     "worker_threads": 0,
@@ -40,6 +54,15 @@ _TIME_FIELDS = frozenset({
     "comment_slop_timeout_seconds",
     "comment_slop_per_file_timeout_seconds",
     "anti_slop_timeout_seconds",
+    "test_integrity_timeout_seconds",
+    "test_matrix_timeout_seconds",
+    "mutation_timeout_seconds",
+    "proof_test_timeout_seconds",
+    "complexity_timeout_seconds",
+})
+_FEATURE_TOGGLES = frozenset({
+    "anti_slop", "comment_slop", "test_integrity", "complexity",
+    "dynamic_test_evidence", "targeted_mutation", "proof_tests",
 })
 
 
@@ -50,7 +73,14 @@ def analysis_limits(config: Mapping[str, Any] | None) -> dict[str, int | float]:
         return values
     options = config.get("review_options")
     if not isinstance(options, Mapping) or "analysis_limits" not in options:
+        if isinstance(options, Mapping):
+            for key in _FEATURE_TOGGLES & set(options):
+                if not isinstance(options[key], bool):
+                    raise ValueError(f"review option {key} must be a boolean")
         return values
+    for key in _FEATURE_TOGGLES & set(options):
+        if not isinstance(options[key], bool):
+            raise ValueError(f"review option {key} must be a boolean")
     supplied = options.get("analysis_limits")
     if not isinstance(supplied, Mapping):
         raise ValueError("review_options.analysis_limits must be an object")

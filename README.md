@@ -124,6 +124,12 @@ They never promote syntax matches to findings:
   JavaScript, TypeScript, Go, Rust, C, C++, Java, C#, SQL, PHP, Ruby,
   Terraform, YAML, Kotlin, Swift, Shell, PowerShell, HTML, Markdown, XML,
   SVG, and configuration files.
+- Test-integrity inventories test artefacts, production subjects, and their
+  evidence-backed relations. It emits static candidates, an approval-bound
+  base/head matrix, targeted mutation evidence, and inert proof-test plans.
+- Complexity analysis measures selected functions with repository policy first
+  and the skill-local Lizard 1.24.0 fallback second. Complexity is a review
+  signal, not an automatic defect or authorship detector.
 
 All structural matches remain ledger candidates. Falsify and semantically
 verify each candidate before reporting it. No applicable files produce
@@ -154,13 +160,29 @@ limits are configurable under `review_options.analysis_limits`:
   "anti_slop_max_total_bytes": 268435456,
   "anti_slop_max_files": 20000,
   "anti_slop_max_candidates": 5000,
+  "test_integrity_timeout_seconds": 300,
+  "test_matrix_timeout_seconds": 600,
+  "mutation_timeout_seconds": 300,
+  "mutation_max_mutants": 25,
+  "mutation_max_per_function": 3,
+  "proof_test_timeout_seconds": 120,
+  "flaky_test_repetitions": 3,
+  "complexity_timeout_seconds": 60,
+  "complexity_max_files": 20000,
+  "complexity_max_total_bytes": 268435456,
+  "complexity_max_candidates": 100,
+  "complexity_fallback_threshold": 15,
+  "complexity_delta_threshold": 5,
+  "complexity_delta_minimum_head": 10,
   "external_command_max_argument_bytes": 24000,
   "external_command_max_files": 250,
   "worker_threads": 0
 }
 ```
 
-See `reference/anti-slop-rule-contract.md` for rule boundaries and
+See `reference/anti-slop-rule-contract.md`,
+`reference/test-integrity-rule-contract.md`, and
+`reference/complexity-policy.md` for rule boundaries and
 `reference/review-context-schema.json` for backend-aware coverage.
 
 Static/local review is the default. Dissect does not probe public applications,
@@ -250,7 +272,7 @@ full context worker has an external hard timeout.
 }
 ```
 
-The context schema version for this coverage is `1.1`. A CLI
+The context schema version for this coverage is `1.2`. A CLI
 `--timeout` value, or `AI_REVIEW_CONTEXT_TIMEOUT_SECONDS` in the shell entry
 points, overrides the configured context timeout.
 
@@ -343,6 +365,13 @@ passed through. Add a string-to-string `execution_environment` object under
 and original value are approval-digest-bound; secret-labelled values are
 redacted in text and JSON plan displays.
 
+Dynamic test evidence, mutation runs, and proof tests use temporary source
+trees, isolated home and temp directories, hard timeouts, bounded redacted
+output, and exact approval digests. A static test-integrity candidate never
+recommends removal by itself. Removal needs an independent contract, reachability
+evidence, matrix results, and unique mutation protection. A proof test is never
+written to or committed in the reviewed checkout.
+
 Diff scope uses one canonical NUL-delimited file list from Git through display,
 language detection, and scanning. Human output JSON-quotes paths so tabs and
 newlines cannot impersonate additional files.
@@ -369,6 +398,10 @@ Run the offline regression suite with:
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/sync_adapters.py --check
+python3 scripts/validate_rule_effectiveness.py
+python3 scripts/run_rule_acceptance.py
+python3 scripts/run_complexity.py --root . --mode full --format json
+python3 scripts/run_test_integrity.py --root . --mode full --format json
 ```
 
 ## Extending Dissect

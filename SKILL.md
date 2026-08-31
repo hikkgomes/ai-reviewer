@@ -39,6 +39,14 @@ Rust, C, C++, Java, and C#. Comment-slop uses the canonical language registry.
 Both are structural candidate generators only. No match is a finding without
 falsification and semantic verification.
 
+Test-integrity analysis inventories tests, fixtures, helpers, configuration, CI
+commands, production subjects, and their evidence-backed relations. It detects
+only high-signal weakening or bypass patterns. Static matches remain
+candidates. The base/head matrix, targeted changed-code mutation, and proof-test
+workflow require exact approval before repository tests execute. Complexity
+uses repository thresholds first and skill-local Lizard 1.24.0 second. It is a
+review signal, not an LLM-authorship check or an automatic defect.
+
 No applicable backend is `Not applicable`. Disabled, missing, malformed,
 ambiguous, timed-out, or budget-limited applicable work is `Not verified`.
 Generated files are excluded only by explicit `paths.generated` patterns.

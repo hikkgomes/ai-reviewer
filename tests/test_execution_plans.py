@@ -280,13 +280,15 @@ class ExecutionPlanTests(unittest.TestCase):
             changed = replace(plan, interpreter_arguments=("-x",))
             self.assertNotEqual(plan.approval_digest, changed.approval_digest)
             completed_result = subprocess.CompletedProcess([], 0, "approved", "")
-            with patch("dissect_checks.execution_plan.subprocess.run", return_value=completed_result) as run:
+            with patch("dissect_checks.execution_plan._run_snapshot", return_value=completed_result) as run:
                 completed, execution_error = execute_approved_plan(plan, plan.approval_digest)
             self.assertIsNone(execution_error)
             self.assertIsNotNone(completed)
-            command = run.call_args.args[0]
-            self.assertEqual(command[1], "-e")
-            self.assertEqual(command[3:], ["user"])
+            called_plan, executable_snapshot, interpreter_snapshot = run.call_args.args
+            self.assertEqual(called_plan.interpreter_arguments, ("-e",))
+            self.assertEqual(called_plan.argv[1:], ("user",))
+            self.assertNotEqual(executable_snapshot, executable)
+            self.assertNotEqual(interpreter_snapshot, Path("/bin/sh"))
 
     def test_unsupported_env_split_shebang_is_rejected_during_planning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

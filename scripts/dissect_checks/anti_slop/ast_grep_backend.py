@@ -9,7 +9,7 @@ from typing import Any, Iterable, Sequence
 
 from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded
 from dissect_checks.redaction import redact_sensitive_text
-from .model import AnalysisTarget, BackendDiagnostic, BackendResult
+from .model import AnalysisTarget, BackendDiagnostic, BackendResult, LoadedAnalysisTarget, load_target
 from .chunking import CommandChunkError, iter_command_chunks
 from .rules import owner_for
 
@@ -38,6 +38,62 @@ def preflight(vendor_dir: Path = VENDOR_DIR) -> str | None:
         return "deps_missing"
     if not (vendor_dir / "ast-grep" / "sgconfig.yml").is_file():
         return "rules_missing"
+    return None
+
+
+def _delimiter_error(source: bytes) -> str | None:
+    """Catch bounded, target-local syntax truncation before AST matching."""
+    text = source.decode("utf-8", errors="replace")
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = set(pairs.values())
+    stack: list[str] = []
+    quote = ""
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in closing:
+            if not stack or stack.pop() != char:
+                return "unbalanced_delimiters"
+        index += 1
+    if quote or block_comment or stack:
+        return "unbalanced_delimiters"
     return None
 
 
@@ -147,6 +203,7 @@ def _matches_to_diagnostics(matches: Iterable[dict[str, Any]], root: Path, targe
                 "source_layer": target.source_kind,
                 "content_sha256": target.content_sha256,
                 "analysis_level": "structural",
+                "discriminator": f"{rule}:{line}:{column}",
                 "metadata": match.get("meta", match.get("metadata", {})),
             },
         ))
@@ -201,6 +258,52 @@ def _run_language(
     return diagnostics, checked, None, "Completed."
 
 
+def _prepare_targets(
+    root: Path,
+    applicable: Sequence[AnalysisTarget],
+    budget: AnalysisBudget,
+    max_file_bytes: int,
+) -> tuple[list[AnalysisTarget], int, str | None, str, dict[str, str], list[dict[str, Any]]]:
+    runnable: list[AnalysisTarget] = []
+    skipped = 0
+    first_reason: str | None = None
+    first_detail = ""
+    parse_states: dict[str, str] = {}
+    parse_errors: list[dict[str, Any]] = []
+    for target in applicable:
+        try:
+            loaded = target if isinstance(target, LoadedAnalysisTarget) else load_target(
+                root, target, budget, max_file_bytes=max_file_bytes,
+            )
+            target = loaded.target
+            syntax_error = _delimiter_error(loaded.data)
+            key = target.target_id
+            if syntax_error is not None:
+                skipped += 1
+                first_reason = first_reason or "parse_error"
+                first_detail = first_detail or syntax_error
+                parse_states[key] = "failed"
+                parse_errors.append({"path": target.logical_path, "reason_code": "parse_error", "detail": syntax_error})
+                continue
+            runnable.append(target)
+            parse_states[key] = "not_run"
+        except AnalysisBudgetExceeded as error:
+            skipped += 1
+            first_reason = first_reason or error.reason_code
+            first_detail = first_detail or error.detail
+            parse_states[target.target_id] = "failed"
+            parse_errors.append({"path": target.logical_path, "reason_code": error.reason_code})
+            if error.reason_code in {"total_timeout", "max_files", "max_total_bytes"}:
+                break
+        except (OSError, ValueError, TypeError) as error:
+            skipped += 1
+            first_reason = first_reason or "read_failure"
+            first_detail = first_detail or str(error)
+            parse_states[target.target_id] = "failed"
+            parse_errors.append({"path": target.logical_path, "reason_code": "read_failure", "detail": str(error)[:240]})
+    return runnable, skipped, first_reason, first_detail, parse_states, parse_errors
+
+
 def analyse(
     root: Path,
     targets: Sequence[AnalysisTarget],
@@ -221,43 +324,27 @@ def analyse(
     reason = preflight(vendor_dir)
     if reason is not None:
         return BackendResult(backend_id, "structural", (language_id,), "unavailable", len(applicable), 0, len(applicable), [], reason, "Skill-local ast-grep runtime is unavailable.")
-    runnable: list[AnalysisTarget] = []
-    skipped = 0
-    first_skip_reason: str | None = None
-    first_skip_detail = ""
-    for target in applicable:
-        try:
-            budget.claim_file()
-            if target.physical_path.stat().st_size > max_file_bytes:
-                raise AnalysisBudgetExceeded("max_file_bytes", "source file exceeds the structural analysis limit")
-            # Claim bytes for the bounded validation read.  ast-grep performs
-            # the actual parse, but budget accounting still covers the input.
-            with target.physical_path.open("rb") as source_file:
-                data = source_file.read(max_file_bytes + 1)
-            if len(data) > max_file_bytes:
-                raise AnalysisBudgetExceeded("max_file_bytes", "source file exceeds the structural analysis limit")
-            if b"\0" in data[:4096]:
-                raise AnalysisBudgetExceeded("binary_source", "NUL byte in source prefix")
-            budget.claim_bytes(len(data))
-            runnable.append(target)
-        except AnalysisBudgetExceeded as error:
-            skipped += 1
-            first_skip_reason = first_skip_reason or error.reason_code
-            first_skip_detail = first_skip_detail or error.detail
-        except OSError as error:
-            skipped += 1
-            first_skip_reason = first_skip_reason or "read_failure"
-            first_skip_detail = first_skip_detail or str(error)
+    runnable, skipped, first_skip_reason, first_skip_detail, parse_states, parse_errors = _prepare_targets(
+        root, applicable, budget, max_file_bytes,
+    )
     if not runnable:
         return BackendResult(
             backend_id, "structural", (language_id,), "unavailable", len(applicable), 0,
             skipped, [], first_skip_reason, first_skip_detail or "No source file completed structural analysis.",
+            parse_states, parse_errors,
         )
     diagnostics, checked, reason_code, reason_text = _run_language(
         backend_id, root, tuple(runnable), budget, vendor_dir=vendor_dir,
         max_files=max_files, max_argument_bytes=max_argument_bytes, threads=threads,
     )
     if reason_code:
-        return BackendResult(backend_id, "structural", (language_id,), "partial" if checked else "unavailable", len(applicable), checked, len(applicable) - checked, diagnostics, reason_code, reason_text)
+        for target in runnable[:checked]:
+            parse_states[target.target_id] = "complete"
+        for target in runnable[checked:]:
+            parse_states[target.target_id] = "not_verified"
+        parse_errors.append({"reason_code": reason_code, "detail": reason_text[:240]})
+        return BackendResult(backend_id, "structural", (language_id,), "partial" if checked else "unavailable", len(applicable), checked, len(applicable) - checked, diagnostics, reason_code, reason_text, parse_states, parse_errors)
+    for target in runnable:
+        parse_states[target.target_id] = "complete"
     status = "partial" if skipped else "complete"
-    return BackendResult(backend_id, "structural", (language_id,), status, len(applicable), checked, skipped, diagnostics, first_skip_reason, first_skip_detail or "Completed.")
+    return BackendResult(backend_id, "structural", (language_id,), status, len(applicable), checked, skipped, diagnostics, first_skip_reason, first_skip_detail or "Completed.", parse_states, parse_errors)

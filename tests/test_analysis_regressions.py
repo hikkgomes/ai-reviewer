@@ -61,7 +61,7 @@ class AnalysisRegressionTests(unittest.TestCase):
             source.write_text("# Perform the required operation.\nsave_user(user)\n")
             binary = root / "data.parquet"
             binary.write_bytes(b"not source\x00")
-            with patch.object(Path, "read_text", autospec=True, wraps=Path.read_text) as read_text:
+            with patch.object(Path, "open", autospec=True, wraps=Path.open) as open_source:
                 build_review_context.optional_analyser_evidence(
                     root,
                     "full",
@@ -70,13 +70,17 @@ class AnalysisRegressionTests(unittest.TestCase):
                     "",
                     {"review_options": {"anti_slop": False}},
                 )
-            self.assertFalse(any(call.args[0] == binary for call in read_text.call_args_list))
+            self.assertFalse(any(call.args[0] == binary for call in open_source.call_args_list))
 
     def test_generic_scanner_exposes_linear_cursor_work(self) -> None:
         text = ("// Update the account owner\nconst value = 1;\n" * 2000)
-        comments, work = comment_slop.extract_comments_with_work("app.ts", text)
+        observed = [0]
+        comments, work = comment_slop.extract_comments_with_work(
+            "app.ts", text, observer=lambda count: observed.__setitem__(0, observed[0] + count),
+        )
         self.assertTrue(comments)
-        self.assertLessEqual(work, len(text.encode("utf-8")) * 6)
+        self.assertLessEqual(observed[0], len(text.encode("utf-8")) * 6)
+        self.assertEqual(work, observed[0])
 
     def test_generic_scanner_work_scales_linearly(self) -> None:
         measurements = []
@@ -85,8 +89,11 @@ class AnalysisRegressionTests(unittest.TestCase):
             target = kib * 1024
             data = (unit * ((target // len(unit)) + 1))[:target]
             text = data.decode("utf-8")
-            _, work = comment_slop.extract_comments_with_work("app.ts", text)
-            measurements.append((len(text.encode("utf-8")), work))
+            observed = [0]
+            _, _reported_work = comment_slop.extract_comments_with_work(
+                "app.ts", text, observer=lambda count: observed.__setitem__(0, observed[0] + count),
+            )
+            measurements.append((len(text.encode("utf-8")), observed[0]))
         for size, work in measurements:
             self.assertLessEqual(work, size * 6)
         self.assertLessEqual(measurements[-1][1], measurements[0][1] * 9)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -23,6 +24,8 @@ CURSOR_END = "<!-- DISSECT-END -->"
 MIN_NODE = (22, 18)
 OXLINT_VERSION = "1.78.0"
 AST_GREP_VERSION = "0.45.2"
+LIZARD_VERSION = "1.24.0"
+LIZARD_WHEEL_SHA256 = "a688bc607a891ff4a7836826f25742dc9c1bf648da3075dbd495e199e8848602"
 SKILL_ITEMS = [
     "SKILL.md",
     "README.md",
@@ -123,6 +126,29 @@ def provision_anti_slop(skill_root: Path) -> bool:
     return True
 
 
+def provision_complexity(skill_root: Path) -> bool:
+    """Verify the skill-local Lizard lock and bounded fallback implementation."""
+    vendor = skill_root / "scripts" / "vendor" / "lizard"
+    requirements = vendor / "requirements.txt"
+    provenance = vendor / "PROVENANCE.json"
+    backend = skill_root / "scripts" / "dissect_checks" / "complexity" / "lizard_backend.py"
+    if not vendor.is_dir() or not requirements.is_file() or not provenance.is_file() or not backend.is_file():
+        raise RuntimeError("Lizard fallback files are missing")
+    try:
+        metadata = json.loads(provenance.read_text(encoding="utf-8"))
+        locked = requirements.read_text(encoding="utf-8")
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"could not read Lizard provenance: {error}") from error
+    if metadata.get("version") != LIZARD_VERSION or metadata.get("sha256") != LIZARD_WHEEL_SHA256:
+        raise RuntimeError("Lizard provenance does not match the exact pinned release")
+    if LIZARD_VERSION not in locked or LIZARD_WHEEL_SHA256 not in locked:
+        raise RuntimeError("Lizard requirement is not exact-pinned with its distribution hash")
+    if f'LIZARD_VERSION = "{LIZARD_VERSION}"' not in backend.read_text(encoding="utf-8"):
+        raise RuntimeError("complexity backend does not declare the pinned Lizard version")
+    print(f"Verified skill-local complexity runtime: Lizard {LIZARD_VERSION} ({LIZARD_WHEEL_SHA256})")
+    return True
+
+
 def copy_item(src: Path, dst: Path) -> None:
     if src.is_dir():
         shutil.copytree(
@@ -157,6 +183,7 @@ def install_claude() -> None:
     skill_destination.parent.mkdir(parents=True, exist_ok=True)
     symlink_force(SOURCE_ROOT, skill_destination)
     provision_anti_slop(SOURCE_ROOT)
+    provision_complexity(SOURCE_ROOT)
 
     commands_dir = claude_base / "commands"
     agents_dir = claude_base / "agents"
@@ -216,6 +243,7 @@ def install_codex_skill(name: str, agents_base: Path) -> None:
     install_skill(destination)
     (destination / "SKILL.md").write_text(codex_skill_entrypoint(name), encoding="utf-8")
     provision_anti_slop(destination)
+    provision_complexity(destination)
     print(f"Installed Codex skill: {destination}")
 
 

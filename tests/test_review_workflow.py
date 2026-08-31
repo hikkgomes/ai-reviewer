@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import signal
 import shutil
 import sys
 import tempfile
@@ -39,15 +38,15 @@ class ReviewWorkflowTests(unittest.TestCase):
 
     def test_context_cli_interrupts_work_at_its_time_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
-            "build_review_context.build",
-            side_effect=lambda *_args: signal.pause(),
+            "build_review_context._worker_arguments",
+            return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
         ), patch.object(
             sys,
             "argv",
             ["build_review_context.py", "--mode", "full", "--timeout", "1", "--output", str(Path(directory) / "context.json")],
         ):
-            with self.assertRaisesRegex(TimeoutError, "exceeded 1 seconds"):
-                main()
+            self.assertEqual(main(), 124)
+            self.assertFalse((Path(directory) / "context.json").exists())
 
     def test_context_prunes_dependency_and_build_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

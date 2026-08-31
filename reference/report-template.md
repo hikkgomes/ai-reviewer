@@ -31,6 +31,33 @@ structural candidates until contextually confirmed. State optional backend
 coverage as `Finding`, `Checked`, `Not applicable`, or `Not verified`; do not
 add a `Not run` state.
 
+## Test integrity findings
+
+List only verified test bypasses, weakened contracts, circular oracles, or
+unprotected changed behaviour. Static candidates alone do not support removal.
+
+## Proof tests performed
+
+Record the candidate, independent oracle, focal subject, current result, control
+result, reachability, and outcome. Never include an automatically committed
+proof test.
+
+## Mutation evidence
+
+List only material surviving or killed changed-code mutations. Keep each mutant
+separate and do not use one mutation score as a quality result.
+
+## Complexity review candidates
+
+Record function identity, base/head complexity, delta, threshold source, and the
+concrete behavioural risk to review. Complexity is a signal, not an automatic
+finding.
+
+## Not verified test evidence
+
+State missing commands, unapproved execution, incomplete matrices, invalid
+fixtures, parser failures, or unavailable toolchains that limit confidence.
+
 ## Scope and Residual Risk
 
 State changed behaviour reviewed, credible expansion, excluded pre-existing

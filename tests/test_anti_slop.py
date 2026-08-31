@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +17,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import build_review_context  # noqa: E402
 import run_anti_slop  # noqa: E402
 from diff_file_list import DiffEntry, deserialize_entries, serialize_entries  # noqa: E402
+from dissect_checks.anti_slop import oxlint_backend  # noqa: E402
+from dissect_checks.anti_slop.model import AnalysisTarget  # noqa: E402
 from review_ledger import validate_candidate  # noqa: E402
 
 
@@ -26,16 +29,19 @@ class AntiSlopTests(unittest.TestCase):
             source = root / "source.ts"
             source.write_text("export const value = 1;\n")
             vendor = root / "vendor"
-            with patch("run_anti_slop.shutil.which", return_value=None):
-                self.assertEqual(run_anti_slop.analyse(root, [source], vendor_dir=vendor)["skip_reason"], "node_unavailable")
-            with patch("run_anti_slop.shutil.which", return_value="/node"), patch(
-                "run_anti_slop._node_version", return_value=(22, 17, 0)
+            with patch("dissect_checks.anti_slop.oxlint_backend.shutil.which", return_value=None):
+                result = run_anti_slop.analyse(root, [source], vendor_dir=vendor)
+                self.assertEqual(result["backends"]["oxlint-js-ts"]["reason_code"], "node_unavailable")
+            with patch("dissect_checks.anti_slop.oxlint_backend.shutil.which", return_value="/node"), patch(
+                "dissect_checks.anti_slop.oxlint_backend._node_version", return_value=(22, 17, 0)
             ):
-                self.assertEqual(run_anti_slop.analyse(root, [source], vendor_dir=vendor)["skip_reason"], "node_version_unsupported")
-            with patch("run_anti_slop.shutil.which", return_value="/node"), patch(
-                "run_anti_slop._node_version", return_value=(22, 18, 0)
-            ), patch("run_anti_slop._oxlint_path", return_value=vendor / "missing"):
-                self.assertEqual(run_anti_slop.analyse(root, [source], vendor_dir=vendor)["skip_reason"], "deps_missing")
+                result = run_anti_slop.analyse(root, [source], vendor_dir=vendor)
+                self.assertEqual(result["backends"]["oxlint-js-ts"]["reason_code"], "node_version_unsupported")
+            with patch("dissect_checks.anti_slop.oxlint_backend.shutil.which", return_value="/node"), patch(
+                "dissect_checks.anti_slop.oxlint_backend._node_version", return_value=(22, 18, 0)
+            ), patch("dissect_checks.anti_slop.oxlint_backend._oxlint_path", return_value=vendor / "missing"):
+                result = run_anti_slop.analyse(root, [source], vendor_dir=vendor)
+                self.assertEqual(result["backends"]["oxlint-js-ts"]["reason_code"], "deps_missing")
 
     def test_entries_from_canonical_stream_selects_existing_js_ts_once(self) -> None:
         entries = [
@@ -64,23 +70,59 @@ class AntiSlopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text(json.dumps({"dependencies": {"effect": "^3"}}))
-            self.assertTrue(run_anti_slop.detect_effect(root))
-            (root / "package.json").write_text(json.dumps({"workspaces": ["packages/*"]}))
-            package = root / "packages" / "app"
-            package.mkdir(parents=True)
-            (package / "package.json").write_text(json.dumps({"devDependencies": {"effect": "^3"}}))
-            self.assertTrue(run_anti_slop.detect_effect(root))
+            source = root / "consumer.ts"
+            source.write_text("export const value = 1;\n")
+            target = AnalysisTarget("consumer.ts", source, "typescript")
+            enriched = oxlint_backend.enrich_targets(root, (target,))
+            self.assertEqual(enriched[0].config_variant, "effect")
+            self.assertEqual(enriched[0].manifest_path, "package.json")
+            self.assertTrue(enriched[0].manifest_sha256)
             (root / "package.json").write_text("not json")
-            self.assertFalse(run_anti_slop.detect_effect(root))
+            self.assertEqual(oxlint_backend.enrich_targets(root, (target,))[0].config_variant, "generic")
+
+    def test_effect_variant_uses_the_index_manifest_snapshot(self) -> None:
+        def git(root: Path, *arguments: str) -> None:
+            subprocess.run(["git", *arguments], cwd=root, capture_output=True, check=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git(root, "init", "-q")
+            git(root, "config", "user.email", "test@example.com")
+            git(root, "config", "user.name", "Test")
+            git(root, "config", "commit.gpgsign", "false")
+            (root / "package.json").write_text(json.dumps({"dependencies": {"typescript": "^5"}}))
+            (root / "consumer.ts").write_text("export const value = 1;\n")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "base")
+            (root / "package.json").write_text(json.dumps({"dependencies": {"effect": "^3"}}))
+            (root / "consumer.ts").write_text("export const value = 2;\n")
+            git(root, "add", "-A")
+            (root / "package.json").write_text(json.dumps({"dependencies": {"typescript": "^5"}}))
+            (root / "consumer.ts").write_text("export const value = 1;\n")
+            entries = build_review_context.changed_entries(root, "diff", None, "")
+            with build_review_context._diff_optional_targets(root, ["consumer.ts"], entries, "", {}) as snapshot:
+                target = next(item for item in snapshot.anti_targets if item.source_kind == "index")
+                self.assertEqual(target.config_variant, "effect")
+                self.assertEqual(target.manifest_source_layer, "index")
+                self.assertTrue(target.manifest_sha256)
 
     def test_candidate_mapping_filters_default_rule_and_validates_ledger_shape(self) -> None:
         fixture = ROOT / "tests" / "fixtures" / "anti-slop" / "oxlint-diagnostics.json"
-        diagnostics = run_anti_slop.parse_diagnostics(fixture.read_text())
-        candidates = run_anti_slop.to_candidates(diagnostics, Path("/tmp/anti-slop-fixture"))
-        self.assertEqual(len(candidates), 2)
-        self.assertTrue(all(item["id"].startswith("candidate-anti-slop-") for item in candidates))
-        self.assertTrue(all(not any("signal" in evidence for evidence in item["supporting_evidence"]) for item in candidates))
-        self.assertTrue(all(validate_candidate(item) == [] for item in candidates))
+        diagnostics, parser_errors = oxlint_backend.parse_diagnostics_with_errors(fixture.read_text())
+        self.assertEqual(parser_errors, [])
+        fixture_root = Path("/tmp/anti-slop-fixture")
+        target = AnalysisTarget("src/bad.ts", fixture_root / "src/bad.ts", "typescript", content_sha256="0" * 64)
+        # The fixture parser output is bound to the requested source identity
+        # before it can become a ledger candidate.
+        bound = oxlint_backend.diagnostics_from_tool(diagnostics, fixture_root, (target,))
+        self.assertEqual(len(bound), 2)
+        self.assertEqual(bound[0].metadata["source_layer"], "working-tree")
+        envelope = run_anti_slop._envelope({
+            "status": "complete", "state": "Checked", "reason": "ok",
+            "files_scanned": 1, "candidates": [], "backends": {},
+        })
+        self.assertNotIn("legacy_status", envelope)
+        self.assertNotIn("skip_reason", envelope)
 
     @unittest.skipUnless(
         shutil.which("node") and (ROOT / "scripts/vendor/anti-slop/node_modules/.bin/oxlint").exists(),
@@ -91,7 +133,8 @@ class AntiSlopTests(unittest.TestCase):
         negative = ROOT / "tests/fixtures/anti-slop/unknown-returns-negative.ts"
         positive_result = run_anti_slop.analyse(ROOT, [positive])
         negative_result = run_anti_slop.analyse(ROOT, [negative])
-        self.assertEqual(positive_result["status"], "ok")
+        self.assertEqual(positive_result["status"], "complete")
+        self.assertEqual(positive_result["schema_version"], "anti-slop/2.0")
         self.assertEqual(len(positive_result["candidates"]), 1)
         self.assertEqual(positive_result["candidates"][0]["source"], "anti-slop/no-unknown-returns")
         self.assertEqual(positive_result["candidates"][0]["supporting_evidence"][0]["line"], 2)
@@ -104,15 +147,14 @@ class AntiSlopTests(unittest.TestCase):
     def test_effect_rule_uses_the_second_plugin_prefix(self) -> None:
         target = ROOT / "tests/fixtures/anti-slop/effect"
         result = run_anti_slop.analyse(target, [target / "consumer.ts"])
-        self.assertEqual(result["config_variant"], "effect")
+        self.assertEqual(result["backends"]["oxlint-js-ts"]["status"], "complete")
         self.assertEqual(result["candidates"][0]["source"], "anti-slop-effect/no-service-constructor-imports")
 
     def test_empty_scope_is_a_non_fatal_skip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = run_anti_slop.analyse(root, [])
-        self.assertEqual(result["status"], "skipped")
-        self.assertEqual(result["skip_reason"], "no_js_ts_files")
+        self.assertEqual(result["status"], "not_applicable")
         self.assertEqual(result["state"], "Not applicable")
 
     def test_unsupported_scope_is_not_applicable(self) -> None:
@@ -121,8 +163,7 @@ class AntiSlopTests(unittest.TestCase):
             source = root / "data.parquet"
             source.write_bytes(b"not source")
             result = run_anti_slop.analyse(root, [source])
-        self.assertEqual(result["status"], "skipped")
-        self.assertEqual(result["skip_reason"], "no_supported_files")
+        self.assertEqual(result["status"], "not_applicable")
         self.assertEqual(result["state"], "Not applicable")
 
     @unittest.skipUnless(
@@ -142,8 +183,11 @@ class AntiSlopTests(unittest.TestCase):
             root = Path(directory)
             source = root / "app.ts"
             source.write_text("declare const value: unknown;\nexport function load(): unknown { return value; }\n")
-            with patch("run_anti_slop.shutil.which", return_value=None):
+            with patch("build_review_context.anti_slop_orchestrator.analyse", wraps=build_review_context.anti_slop_orchestrator.analyse) as analyse_call, patch(
+                "dissect_checks.anti_slop.oxlint_backend.shutil.which", return_value=None,
+            ):
                 degraded = build_review_context.build(root, "full", "", None)
+            analyse_call.assert_called_once()
             self.assertTrue(any("Not verified — anti-slop pass unavailable (node_unavailable)" in item for item in degraded["limitations"]))
             self.assertEqual(degraded["coverage"]["anti-slop"]["state"], "Not verified")
 
@@ -153,7 +197,10 @@ class AntiSlopTests(unittest.TestCase):
             (root / ".ai-review").mkdir()
             (root / ".ai-review/local.json").write_text(json.dumps({"review_options": {"anti_slop": False}}))
             (root / "app.ts").write_text("declare const value: unknown;\nexport function load(): unknown { return value; }\n")
-            with patch("run_anti_slop.analyse", side_effect=AssertionError("anti-slop should be disabled")):
+            with patch(
+                "build_review_context.anti_slop_orchestrator.analyse",
+                side_effect=AssertionError("anti-slop should be disabled"),
+            ):
                 context = build_review_context.build(root, "full", "", None)
             self.assertIn("anti-slop disabled by review_options", context["limitations"])
             self.assertFalse(any(item.get("source", "").startswith("anti-slop/") for item in context["candidates"]))

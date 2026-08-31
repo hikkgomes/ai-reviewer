@@ -10,12 +10,13 @@ import shutil
 import subprocess
 import time
 from typing import Any, Iterable, Sequence
+from dataclasses import replace
 
 from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded
 from dissect_checks.redaction import redact_sensitive_text
 from file_paths import is_generated_path, is_ignored_path
 from language_registry import language_for_path
-from .model import AnalysisTarget, BackendDiagnostic, BackendResult
+from .model import AnalysisTarget, BackendDiagnostic, BackendResult, LoadedAnalysisTarget, load_target
 from .chunking import CommandChunkError, iter_command_chunks
 from .rules import owner_for
 
@@ -94,51 +95,160 @@ def filter_files(paths: Iterable[str | Path], target_root: Path, config: dict[st
 def _has_effect_dependency(data: Any) -> bool:
     return isinstance(data, dict) and any(
         isinstance(data.get(section), dict) and "effect" in data[section]
-        for section in ("dependencies", "devDependencies", "peerDependencies")
+        for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
     )
 
 
-def _workspace_patterns(data: dict[str, Any]) -> list[str]:
-    workspaces = data.get("workspaces")
-    if isinstance(workspaces, list):
-        return [item for item in workspaces if isinstance(item, str)]
-    if isinstance(workspaces, dict) and isinstance(workspaces.get("packages"), list):
-        return [item for item in workspaces["packages"] if isinstance(item, str)]
-    return []
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def detect_effect(target_root: Path) -> bool:
-    manifest = _read_json(target_root / "package.json")
-    if manifest is None:
-        return False
-    if _has_effect_dependency(manifest):
-        return True
-    for pattern in _workspace_patterns(manifest):
-        try:
-            matches = target_root.glob(pattern)
-        except (OSError, ValueError):
-            continue
-        for match in matches:
+def _manifest_metadata(
+    root: Path,
+    target: AnalysisTarget,
+    max_file_bytes: int,
+    *,
+    budget: AnalysisBudget | None = None,
+    cache: dict[tuple[str, str, str], tuple[str, str, str, bool] | None] | None = None,
+) -> tuple[str, str, str, bool]:
+    """Resolve the nearest manifest from the same current source snapshot."""
+    metadata_cache = cache if cache is not None else {}
+    if target.source_kind not in {"working-tree", "untracked"}:
+        if target.manifest_path and target.manifest_sha256:
+            return target.manifest_path, target.manifest_source_layer, target.manifest_sha256, target.config_variant == "effect"
+        directory = Path(target.logical_path).parent
+        revision = target.revision if target.revision not in {"", "WORKTREE"} else "HEAD"
+        while True:
+            manifest_path = (directory / "package.json").as_posix()
+            cache_key = (target.source_kind, revision, manifest_path)
+            if cache_key in metadata_cache:
+                metadata = metadata_cache[cache_key]
+                if metadata is not None:
+                    return metadata
+                if directory == Path("."):
+                    break
+                directory = directory.parent
+                continue
+            reference = (
+                f":{target.source_kind.split(':', 1)[-1] if target.source_kind.startswith('index:') else 0}:{manifest_path}"
+                if target.source_kind.startswith("index")
+                else f"{revision}:{manifest_path}"
+            )
             try:
-                if not match.resolve().is_relative_to(target_root.resolve()):
-                    continue
+                size_result = subprocess.run(["git", "cat-file", "-s", reference], cwd=root, capture_output=True, text=True, check=False)
+                size = int(size_result.stdout.strip()) if size_result.returncode == 0 else -1
             except OSError:
+                size = -1
+            if size < 0 or size > max_file_bytes:
+                metadata_cache[cache_key] = None
+                if directory == Path("."):
+                    break
+                directory = directory.parent
                 continue
-            package_path = match / "package.json" if match.is_dir() else match
-            if package_path.name != "package.json":
-                continue
-            package = _read_json(package_path)
-            if package is not None and _has_effect_dependency(package):
-                return True
-    return False
+            if budget is not None:
+                budget.claim_file()
+                budget.claim_bytes(size)
+            try:
+                result = subprocess.run(
+                    ["git", "show", "--format=", reference],
+                    cwd=root,
+                    capture_output=True,
+                    check=False,
+                )
+                data = result.stdout if result.returncode == 0 and len(result.stdout) == size else b""
+            except OSError:
+                data = b""
+            if data and len(data) <= max_file_bytes:
+                try:
+                    value = json.loads(data.decode("utf-8"))
+                except (UnicodeError, ValueError):
+                    value = None
+                if isinstance(value, dict):
+                    metadata = (manifest_path, target.source_kind, hashlib.sha256(data).hexdigest(), _has_effect_dependency(value))
+                    metadata_cache[cache_key] = metadata
+                    return metadata
+            metadata_cache[cache_key] = None
+            if directory == Path("."):
+                break
+            directory = directory.parent
+        return "", "", "", False
+    try:
+        physical = target.physical_path.resolve()
+        root = root.resolve()
+        physical.relative_to(root)
+    except (OSError, ValueError):
+        return "", "", "", False
+    directory = physical.parent
+    while True:
+        manifest = directory / "package.json"
+        logical = manifest.relative_to(root).as_posix() if manifest.is_relative_to(root) else ""
+        cache_key = (target.source_kind, "WORKTREE", logical)
+        if cache_key in metadata_cache:
+            metadata = metadata_cache[cache_key]
+            if metadata is not None:
+                return metadata
+            if directory == root:
+                break
+            directory = directory.parent
+            continue
+        try:
+            manifest.relative_to(root)
+            size = manifest.stat().st_size
+            if size > max_file_bytes:
+                data = b""
+            else:
+                if budget is not None:
+                    budget.claim_file()
+                    budget.claim_bytes(size)
+                with manifest.open("rb") as handle:
+                    data = handle.read(size)
+                if len(data) != size or manifest.stat().st_size != size:
+                    data = b""
+        except (OSError, ValueError):
+            data = b""
+        if data and len(data) <= max_file_bytes:
+            try:
+                value = json.loads(data.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                value = None
+            if isinstance(value, dict):
+                metadata = (logical, target.source_kind, hashlib.sha256(data).hexdigest(), _has_effect_dependency(value))
+                metadata_cache[cache_key] = metadata
+                return metadata
+        metadata_cache[cache_key] = None
+        if directory == root:
+            break
+        directory = directory.parent
+    return "", "", "", False
+
+
+def enrich_targets(
+    root: Path,
+    targets: Sequence[AnalysisTarget],
+    *,
+    max_file_bytes: int = MAX_FILE_BYTES,
+    budget: AnalysisBudget | None = None,
+) -> tuple[AnalysisTarget, ...]:
+    """Bind ordinary JS/TS targets to their nearest manifest before loading."""
+    output: list[AnalysisTarget] = []
+    cache: dict[tuple[str, str, str], tuple[str, str, str, bool] | None] = {}
+    for target in targets:
+        if target.language_id not in LANGUAGES or target.config_variant:
+            output.append(target)
+            continue
+        try:
+            path, layer, digest, has_effect = _manifest_metadata(
+                root, target, max_file_bytes, budget=budget, cache=cache,
+            )
+        except AnalysisBudgetExceeded:
+            # The source loader below will record the terminal budget state
+            # for this target. Keep the target on the normal coverage path.
+            output.append(target)
+            continue
+        output.append(replace(
+            target,
+            config_variant="effect" if has_effect else "generic",
+            manifest_path=path,
+            manifest_source_layer=layer,
+            manifest_sha256=digest,
+        ))
+    return tuple(output)
 
 
 def _validate_tool_json(stdout: str, stderr: str, expected_files: int) -> Any:
@@ -253,7 +363,20 @@ def _diagnostic_location(diagnostic: dict[str, Any]) -> tuple[int, int]:
     return int(diagnostic.get("line", 0) or 0), int(diagnostic.get("column", 0) or 0)
 
 
-def parse_diagnostics(stdout: str, stderr: str = "") -> list[dict[str, Any]]:
+def _is_parser_diagnostic(diagnostic: dict[str, Any]) -> bool:
+    code = str(diagnostic.get("code", diagnostic.get("rule_id", diagnostic.get("ruleId", "")))).lower()
+    category = str(diagnostic.get("category", diagnostic.get("severity", ""))).lower()
+    message = str(diagnostic.get("message", "")).lower()
+    return (
+        code.startswith(("parse", "syntax", "parser"))
+        or code in {"e_parse", "e-syntax", "oxlint/parse-error"}
+        or "parse error" in message
+        or "syntax error" in message
+        or category in {"parse", "parser", "syntax"}
+    )
+
+
+def parse_diagnostics_with_errors(stdout: str, stderr: str = "") -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         payload = json.loads(stdout)
     except (TypeError, ValueError) as error:
@@ -262,8 +385,15 @@ def parse_diagnostics(stdout: str, stderr: str = "") -> list[dict[str, Any]]:
     if not isinstance(raw_diagnostics, list):
         raise AnalysisSkip("invalid_json", redact_sensitive_text((stderr or "")[:500]))
     parsed: list[dict[str, Any]] = []
+    parser_errors: list[dict[str, Any]] = []
     for diagnostic in raw_diagnostics:
         if not isinstance(diagnostic, dict):
+            continue
+        if _is_parser_diagnostic(diagnostic):
+            parser_errors.append({
+                "filename": str(diagnostic.get("filename", diagnostic.get("file", diagnostic.get("path", "")))),
+                "message": str(diagnostic.get("message", "Parser rejected the source."))[:240],
+            })
             continue
         rule = _canonical_rule_id(diagnostic.get("code", diagnostic.get("rule_id", diagnostic.get("ruleId", diagnostic.get("rule")))))
         if not rule.startswith(RULE_PREFIXES):
@@ -276,7 +406,12 @@ def parse_diagnostics(stdout: str, stderr: str = "") -> list[dict[str, Any]]:
             "line": line,
             "column": column,
         })
-    return parsed
+    return parsed, parser_errors
+
+
+def parse_diagnostics(stdout: str, stderr: str = "") -> list[dict[str, Any]]:
+    """Return anti-slop diagnostics while retaining parser errors separately."""
+    return parse_diagnostics_with_errors(stdout, stderr)[0]
 
 
 def _relative_path(filename: str, target_root: Path) -> str:
@@ -320,7 +455,13 @@ def _target_for_filename(filename: str, target_root: Path, targets: Sequence[Ana
     return logical, matches[0]
 
 
-def diagnostics_from_tool(diagnostics: Iterable[dict[str, Any]], target_root: Path, targets: Sequence[AnalysisTarget]) -> list[BackendDiagnostic]:
+def diagnostics_from_tool(
+    diagnostics: Iterable[dict[str, Any]],
+    target_root: Path,
+    targets: Sequence[AnalysisTarget],
+    *,
+    config_variant: str = "",
+) -> list[BackendDiagnostic]:
     output: list[BackendDiagnostic] = []
     for diagnostic in diagnostics:
         relpath, target = _target_for_filename(str(diagnostic.get("filename", "")), target_root, targets)
@@ -329,6 +470,16 @@ def diagnostics_from_tool(diagnostics: Iterable[dict[str, Any]], target_root: Pa
             raise RunnerError(f"Oxlint returned an unexpected rule ID: {rule_id}")
         line = max(1, int(diagnostic.get("line", 0) or 0))
         column = max(0, int(diagnostic.get("column", 0) or 0))
+        selected_variant = config_variant or target.config_variant or "generic"
+        metadata = {
+            "source_layer": target.source_kind,
+            "content_sha256": target.content_sha256,
+            "config_variant": selected_variant,
+            "manifest_path": target.manifest_path,
+            "manifest_source_layer": target.manifest_source_layer,
+            "manifest_sha256": target.manifest_sha256,
+            "discriminator": f"{rule_id}:{line}:{column}",
+        }
         output.append(BackendDiagnostic(
             BACKEND_ID,
             target.language_id,
@@ -337,45 +488,126 @@ def diagnostics_from_tool(diagnostics: Iterable[dict[str, Any]], target_root: Pa
             line,
             column,
             str(diagnostic.get("message", "")),
-            {
-                "source_layer": target.source_kind,
-                "content_sha256": target.content_sha256,
-                "config_variant": "effect" if detect_effect(target_root) else "generic",
-            },
+            metadata,
         ))
     return sorted(output, key=lambda item: (item.path, item.line, item.column, item.rule_id, item.message))
 
 
-def to_candidates(diagnostics: Iterable[dict[str, Any]], target_root: Path, *, backend_id: str = BACKEND_ID) -> list[dict[str, Any]]:
-    """Compatibility candidate conversion with stable content-independent IDs."""
-    from review_ledger import blank_candidate, validate_candidate
+def _target_state_key(target: AnalysisTarget) -> str:
+    return target.target_id
 
-    output: list[dict[str, Any]] = []
-    for diagnostic in diagnostics:
-        rule = str(diagnostic.get("rule", ""))
-        if owner_for(rule) != "oxlint":
-            raise RunnerError(f"Oxlint returned an unexpected rule ID: {rule}")
-        relpath = _relative_path(str(diagnostic.get("filename", "")), target_root)
-        line = max(1, int(diagnostic.get("line", 0) or 0))
-        column = max(0, int(diagnostic.get("column", 0) or 0))
-        identity = json.dumps({"analyser": "anti-slop", "backend": backend_id, "rule": rule, "path": relpath, "source_layer": diagnostic.get("source_layer", "working-tree"), "line": line, "column": column}, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-        candidate = blank_candidate(
-            f"candidate-anti-slop-{digest}",
-            source=rule,
-            claim=f"{rule}: structural review candidate at {relpath}:{line}",
-        )
-        candidate["trigger_path"] = [f"{relpath}:{line}"]
-        candidate["supporting_evidence"] = [{
-            "kind": "lint_diagnostic", "backend_id": backend_id, "file": relpath,
-            "line": line, "column": column, "message": str(diagnostic.get("message", "")),
-            "analysis_level": "structural", "source_layer": diagnostic.get("source_layer", "working-tree"),
-        }]
-        errors = validate_candidate(candidate)
-        if errors:
-            raise RunnerError("invalid anti-slop candidate: " + "; ".join(errors))
-        output.append(candidate)
-    return output
+
+def _target_variant(target: AnalysisTarget) -> str:
+    return target.config_variant or "generic"
+
+
+def _load_runnable_targets(
+    root: Path,
+    applicable: Sequence[AnalysisTarget],
+    budget: AnalysisBudget,
+    max_file_bytes: int,
+) -> tuple[list[AnalysisTarget], int, str | None, str]:
+    runnable: list[AnalysisTarget] = []
+    skipped = 0
+    first_reason: str | None = None
+    first_detail = ""
+    for target in applicable:
+        try:
+            loaded = target if isinstance(target, LoadedAnalysisTarget) else load_target(
+                root, target, budget, max_file_bytes=max_file_bytes,
+            )
+            runnable.append(loaded.target)
+        except AnalysisBudgetExceeded as error:
+            skipped += 1
+            first_reason = first_reason or error.reason_code
+            first_detail = first_detail or error.detail
+        except (OSError, ValueError, TypeError) as error:
+            skipped += 1
+            first_reason = first_reason or "read_failure"
+            first_detail = first_detail or str(error)
+    return runnable, skipped, first_reason, first_detail
+
+
+def _analyse_variants(
+    root: Path,
+    runnable: Sequence[AnalysisTarget],
+    budget: AnalysisBudget,
+    *,
+    vendor_dir: Path,
+    max_files: int,
+    max_argument_bytes: int,
+) -> tuple[list[BackendDiagnostic], int, str | None, str, dict[str, str], list[dict[str, Any]]]:
+    parse_states = {_target_state_key(target): "not_run" for target in runnable}
+    parse_errors: list[dict[str, Any]] = []
+    diagnostics: list[BackendDiagnostic] = []
+    checked = 0
+    runner_reason: str | None = None
+    runner_detail = ""
+    variants: dict[str, list[AnalysisTarget]] = {}
+    for target in runnable:
+        variants.setdefault(_target_variant(target), []).append(target)
+    for variant in sorted(variants):
+        group = tuple(sorted(variants[variant], key=lambda item: (item.logical_path, item.source_kind, item.content_sha256)))
+        config_name = "oxlint-review-effect.json" if variant == "effect" else "oxlint-review.json"
+        try:
+            stdout, stderr = run_oxlint(
+                _oxlint_path(vendor_dir),
+                vendor_dir / config_name,
+                [target.physical_path for target in group],
+                budget.remaining_seconds(),
+                max_files=max_files,
+                max_argument_bytes=max_argument_bytes,
+            )
+            parsed, parser_failures = parse_diagnostics_with_errors(stdout, stderr)
+            failed_keys = _parser_failed_targets(root, group, parser_failures)
+            parse_errors.extend({**failure, "config_variant": variant} for failure in parser_failures)
+            diagnostics.extend(diagnostics_from_tool(parsed, root, group, config_variant=variant))
+            for target in group:
+                parse_states[_target_state_key(target)] = "failed" if _target_state_key(target) in failed_keys else "complete"
+            checked += len(group) - len(failed_keys)
+            if failed_keys:
+                runner_reason = runner_reason or "parse_error"
+                runner_detail = runner_detail or "Applicable source did not all parse successfully."
+        except AnalysisSkip as error:
+            runner_reason = runner_reason or error.reason
+            runner_detail = runner_detail or redact_sensitive_text(error.detail[:500])
+            completed_count = min(len(group), error.checked_files)
+            checked += completed_count
+            for target in group[:completed_count]:
+                parse_states[_target_state_key(target)] = "complete"
+            if error.partial_outputs:
+                try:
+                    partial_items: list[dict[str, Any]] = []
+                    for output in error.partial_outputs:
+                        partial_items.extend(parse_diagnostics(output))
+                    diagnostics.extend(diagnostics_from_tool(partial_items, root, group[:completed_count], config_variant=variant))
+                except (AnalysisSkip, RunnerError, ValueError):
+                    pass
+            break
+        except (RunnerError, OSError, ValueError) as error:
+            runner_reason = runner_reason or "runner_error"
+            runner_detail = runner_detail or redact_sensitive_text(str(error)[:500])
+            break
+    return diagnostics, checked, runner_reason, runner_detail, parse_states, parse_errors
+
+
+def _parser_failed_targets(
+    root: Path,
+    targets: Sequence[AnalysisTarget],
+    failures: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    failed: set[str] = set()
+    unknown = False
+    for failure in failures:
+        filename = str(failure.get("filename", ""))
+        try:
+            _logical, target = _target_for_filename(filename, root, targets)
+            failed.add(_target_state_key(target))
+        except (PathEscapeError, RunnerError):
+            unknown = True
+    if unknown:
+        failed.update(_target_state_key(target) for target in targets)
+    return failed
 
 
 def analyse(
@@ -388,65 +620,54 @@ def analyse(
     max_argument_bytes: int = 24000,
     max_file_bytes: int = MAX_FILE_BYTES,
 ) -> BackendResult:
-    applicable = tuple(sorted((target for target in targets if target.language_id in LANGUAGES), key=lambda item: item.logical_path))
+    applicable = tuple(sorted(
+        (target for target in targets if target.language_id in LANGUAGES),
+        key=lambda item: (item.logical_path, item.source_kind, item.content_sha256),
+    ))
     if not applicable:
-        return BackendResult(BACKEND_ID, "structural", LANGUAGES, "not_applicable", 0, 0, 0, [], None, "No applicable JavaScript or TypeScript files.")
+        return BackendResult(
+            BACKEND_ID, "structural", LANGUAGES, "not_applicable",
+            0, 0, 0, [], None, "No applicable JavaScript or TypeScript files.",
+        )
     reason = preflight(vendor_dir)
     if reason is not None:
-        return BackendResult(BACKEND_ID, "structural", LANGUAGES, "unavailable", len(applicable), 0, len(applicable), [], reason, "Skill-local Oxlint runtime is unavailable.")
-    runnable: list[AnalysisTarget] = []
-    skipped = 0
-    first_skip_reason: str | None = None
-    first_skip_detail = ""
-    for target in applicable:
-        try:
-            budget.claim_file()
-            if target.physical_path.stat().st_size > max_file_bytes:
-                raise AnalysisBudgetExceeded("max_file_bytes", "JavaScript or TypeScript file exceeds the structural analysis limit")
-            with target.physical_path.open("rb") as source_file:
-                data = source_file.read(max_file_bytes + 1)
-            if len(data) > max_file_bytes:
-                raise AnalysisBudgetExceeded("max_file_bytes", "JavaScript or TypeScript file exceeds the structural analysis limit")
-            if b"\0" in data[:4096]:
-                raise AnalysisBudgetExceeded("binary_source", "NUL byte in JavaScript or TypeScript source prefix")
-            budget.claim_bytes(len(data))
-            runnable.append(target)
-        except AnalysisBudgetExceeded as error:
-            skipped += 1
-            first_skip_reason = first_skip_reason or error.reason_code
-            first_skip_detail = first_skip_detail or error.detail
-        except OSError as error:
-            skipped += 1
-            first_skip_reason = first_skip_reason or "read_failure"
-            first_skip_detail = first_skip_detail or str(error)
-    if not runnable:
         return BackendResult(
             BACKEND_ID, "structural", LANGUAGES, "unavailable", len(applicable), 0,
-            skipped, [], first_skip_reason, first_skip_detail or "No JavaScript or TypeScript file completed structural analysis.",
+            len(applicable), [], reason, "Skill-local Oxlint runtime is unavailable.",
         )
-    config_variant = "effect" if detect_effect(root) else "generic"
-    config_path = vendor_dir / ("oxlint-review-effect.json" if config_variant == "effect" else "oxlint-review.json")
-    try:
-        stdout, stderr = run_oxlint(
-            _oxlint_path(vendor_dir), config_path, [target.physical_path for target in runnable],
-            budget.remaining_seconds(), max_files=max_files, max_argument_bytes=max_argument_bytes,
-        )
-        diagnostics = diagnostics_from_tool(parse_diagnostics(stdout, stderr), root, runnable)
-        status = "partial" if skipped else "complete"
-        return BackendResult(BACKEND_ID, "structural", LANGUAGES, status, len(applicable), len(runnable), skipped, diagnostics, first_skip_reason, first_skip_detail or "Completed.")
-    except AnalysisSkip as error:
-        partial: list[BackendDiagnostic] = []
-        if error.partial_outputs:
-            try:
-                partial = diagnostics_from_tool(
-                    [item for output in error.partial_outputs for item in parse_diagnostics(output)],
-                    root,
-                    runnable,
-                )
-            except (AnalysisSkip, RunnerError, ValueError):
-                partial = []
-        checked = error.checked_files
-        total_skipped = len(applicable) - checked
-        return BackendResult(BACKEND_ID, "structural", LANGUAGES, "partial" if checked else "unavailable", len(applicable), checked, total_skipped, partial, error.reason, redact_sensitive_text(error.detail[:500]))
-    except (RunnerError, OSError, ValueError) as error:
-        return BackendResult(BACKEND_ID, "structural", LANGUAGES, "failed", len(applicable), 0, len(applicable), [], "runner_error", redact_sensitive_text(str(error)[:500]))
+
+    runnable, skipped, first_skip_reason, first_skip_detail = _load_runnable_targets(
+        root, applicable, budget, max_file_bytes,
+    )
+
+    diagnostics, checked, runner_reason, runner_detail, parse_states, parse_errors = _analyse_variants(
+        root,
+        runnable,
+        budget,
+        vendor_dir=vendor_dir,
+        max_files=max_files,
+        max_argument_bytes=max_argument_bytes,
+    )
+
+    diagnostics.sort(key=lambda item: (item.path, item.line, item.column, item.rule_id, item.message))
+    total_skipped = len(applicable) - checked
+    if runner_reason or skipped:
+        status = "partial" if checked else "unavailable"
+    else:
+        status = "complete"
+    reason_code = runner_reason or first_skip_reason
+    reason_text = runner_detail or first_skip_detail or "Completed."
+    return BackendResult(
+        BACKEND_ID,
+        "structural",
+        LANGUAGES,
+        status,
+        len(applicable),
+        checked,
+        total_skipped,
+        diagnostics,
+        reason_code,
+        reason_text,
+        parse_states,
+        parse_errors,
+    )

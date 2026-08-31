@@ -189,7 +189,13 @@ class CommentSlopTests(unittest.TestCase):
                         root, mode, ["one.ts", "two.ts"], entries, "",
                         {"review_options": {"anti_slop": False}},
                     )
-                self.assertEqual(counts, {root / "one.ts": 1, root / "two.ts": 1})
+                source_counts = {
+                    path: count for path, count in counts.items()
+                    if path.name in {"one.ts", "two.ts"}
+                }
+                self.assertEqual(source_counts, {root / "one.ts": 1, root / "two.ts": 1})
+                self.assertTrue(all(path.name != "one.ts" or count == 1 for path, count in counts.items()))
+                self.assertTrue(all(path.name != "two.ts" or count == 1 for path, count in counts.items()))
 
     def test_changed_line_ranges_distinguishes_empty_evidence_from_failure(self) -> None:
         entries = [DiffEntry("R", "old.ts", "new.ts", True, "commit")]
@@ -253,14 +259,14 @@ class CommentSlopTests(unittest.TestCase):
         self.assertNotIn(token, serialised)
         self.assertIn("[REDACTED type=generic-secret-token", serialised)
         self.assertIs(run_anti_slop.redact_payload, redact_payload)
-        envelope = run_anti_slop._envelope(
-            status="skipped",
-            skip_reason="runner_error",
-            config_variant="generic",
-            files_scanned=0,
-            candidates=[],
-            detail=token,
-        )
+        envelope = run_anti_slop._envelope({
+            "status": "unavailable",
+            "state": "Not verified",
+            "reason": token,
+            "files_scanned": 0,
+            "candidates": [],
+            "backends": {},
+        })
         self.assertNotIn(token, json.dumps(envelope))
 
     def test_syntax_map_supports_multi_family_suffixes(self) -> None:

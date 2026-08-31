@@ -101,7 +101,19 @@ Check for:
 - Edge cases and error paths are covered, especially validation, denied access, missing dependencies, retries, and rollback.
 - Tests fail for the bug they claim to prevent.
 - Fixtures represent realistic data and do not encode hallucinated schemas.
-- Mocks do not remove the behavior under review.
+- Mocks do not remove the behaviour under review.
+
+For changed or challenged tests, also inspect the test artefact and subject
+mapping, independent oracle source, reachability, base/head distinction,
+targeted mutation kill set, repeated-run stability, and unique boundary or
+failure coverage. Use the four-scenario matrix when runtime tests are
+applicable. Static test-integrity matches are candidates only. Never recommend
+test removal from a smell alone.
+
+Review function complexity separately. Use the repository policy before the
+skill-local Lizard fallback. Complexity candidates need a concrete review risk,
+such as mixed responsibilities or unclear failure paths; a high number alone is
+not a correctness finding.
 
 Error-path tests deserve deliberate attention; passing happy-path tests is not
 evidence that rollback, cancellation, or failure contracts hold.

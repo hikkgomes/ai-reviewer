@@ -3,6 +3,9 @@ name: Dissect CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 3 * * 6"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,6 +43,13 @@ jobs:
           python3 scripts/validate_benchmarks.py
           python3 scripts/validate_review_result.py tests/fixtures/sample-review-result.json
           python3 -m unittest tests.test_review_workflow -v
+      - name: Validate test evidence and complexity contracts
+        run: |
+          python3 scripts/validate_rule_effectiveness.py --skip-meta-mutation
+          python3 scripts/run_rule_acceptance.py
+          python3 scripts/run_complexity.py --root . --mode full --format json > /tmp/dissect-complexity.json
+          python3 scripts/run_test_integrity.py --root . --mode full --format json > /tmp/dissect-test-evidence.json
+          python3 scripts/validate_test_evidence.py /tmp/dissect-test-evidence.json
       - name: Exercise installed-skill benchmark runner offline
         run: |
           python3 scripts/run_benchmarks.py --no-agent --output /tmp/dissect-benchmark-results
@@ -104,3 +114,81 @@ jobs:
           if not isinstance(json.loads((root / "oxlint.json").read_text()), dict):
               raise SystemExit("Oxlint smoke output was not JSON")
           PY
+
+  rule-effectiveness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: npm
+          cache-dependency-path: scripts/vendor/anti-slop/package-lock.json
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Install anti-slop runtime
+        run: npm ci
+        working-directory: scripts/vendor/anti-slop
+      - name: Run compiler-valid acceptance and meta-mutation gates
+        run: |
+          scripts/vendor/anti-slop/node_modules/.bin/ast-grep test --config scripts/vendor/anti-slop/ast-grep/sgconfig.yml --color never
+          python3 scripts/run_rule_acceptance.py --require-toolchains
+          python3 scripts/validate_rule_effectiveness.py --require-toolchains
+
+  self-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: npm
+          cache-dependency-path: scripts/vendor/anti-slop/package-lock.json
+      - name: Install anti-slop runtime
+        run: npm ci
+        working-directory: scripts/vendor/anti-slop
+      - name: Run bounded Dissect self-review evidence
+        run: |
+          python3 scripts/build_review_context.py --root . --mode full --timeout 300 --output /tmp/dissect-self-review-context.json
+          python3 scripts/validate_review_context.py /tmp/dissect-self-review-context.json
+          python3 scripts/run_test_integrity.py --root . --mode full --format json > /tmp/dissect-self-review-tests.json
+          python3 scripts/run_complexity.py --root . --mode full --format json > /tmp/dissect-self-review-complexity.json
+          python3 scripts/validate_test_evidence.py /tmp/dissect-self-review-tests.json
+          python3 scripts/sync_adapters.py --check
+          bash -n scripts/review.sh scripts/review_changed.sh
+      - name: Upload self-review evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dissect-self-review-evidence
+          path: |
+            /tmp/dissect-self-review-context.json
+            /tmp/dissect-self-review-tests.json
+            /tmp/dissect-self-review-complexity.json
+
+  calibration:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: npm
+          cache-dependency-path: scripts/vendor/anti-slop/package-lock.json
+      - name: Install anti-slop runtime
+        run: npm ci
+        working-directory: scripts/vendor/anti-slop
+      - name: Run reviewed calibration corpus
+        run: |
+          python3 scripts/run_rule_acceptance.py
+          python3 scripts/validate_rule_effectiveness.py --skip-meta-mutation

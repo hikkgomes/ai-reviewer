@@ -3,15 +3,34 @@
   "$id": "https://dissect.local/review-context.schema.json",
   "title": "Dissect review context",
   "type": "object",
-  "required": ["schema_version", "mode", "scope", "intent", "repository", "behavioural_units", "candidates", "commands", "coverage", "limitations"],
+  "required": ["schema_version", "mode", "scope", "intent", "repository", "behavioural_units", "candidates", "test_evidence", "complexity", "commands", "coverage", "limitations"],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "mode": {"enum": ["diff", "full"]},
     "scope": {"type": "object"},
     "intent": {"$ref": "#/$defs/intent"},
     "repository": {"type": "object"},
     "behavioural_units": {"type": "array", "items": {"$ref": "#/$defs/unit"}},
     "candidates": {"type": "array", "items": {"$ref": "#/$defs/candidate"}},
+    "test_evidence": {
+      "type": "object",
+      "required": ["status", "state", "artifacts", "subjects", "relations", "changes", "static_candidates", "matrix", "mutations", "proof_tests"],
+      "properties": {
+        "status": {"enum": ["complete", "partial", "not_applicable", "planned", "unavailable", "failed"]},
+        "state": {"enum": ["Finding", "Checked", "Not applicable", "Not verified"]},
+        "artifacts": {"type": "array", "items": {"type": "object"}},
+        "subjects": {"type": "array", "items": {"type": "object"}},
+        "relations": {"type": "array", "items": {"type": "object"}},
+        "changes": {"type": "array", "items": {"type": "object"}},
+        "static_candidates": {"type": "array", "items": {"type": "object"}},
+        "matrix": {"type": "array", "items": {"$ref": "#/$defs/matrix_scenario"}},
+        "mutations": {"type": "array", "items": {"type": "object"}},
+        "targeted_mutation": {"type": "object"},
+        "proof_tests": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": true
+    },
+    "complexity": {"$ref": "#/$defs/complexity"},
     "commands": {"type": "array", "items": {"type": "object"}},
     "coverage": {
       "type": "object",
@@ -72,6 +91,63 @@
         "status": {"enum": ["candidate", "verified", "disproved", "not_verifiable", "duplicate"]}
       }
     },
+    "complexity": {
+      "type": "object",
+      "required": ["status", "backend_id", "functions", "candidates", "policy"],
+      "properties": {
+        "status": {"enum": ["complete", "partial", "not_applicable", "unavailable", "failed"]},
+        "backend_id": {"type": "string"},
+        "applicable_files": {"type": "integer", "minimum": 0},
+        "checked_files": {"type": "integer", "minimum": 0},
+        "skipped_files": {"type": "integer", "minimum": 0},
+        "reason_code": {"type": ["string", "null"]},
+        "functions": {"type": "array", "items": {"$ref": "#/$defs/complexity_function"}},
+        "candidates": {"type": "array", "items": {"$ref": "#/$defs/complexity_candidate"}},
+        "policy": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "complexity_function": {
+      "type": "object",
+      "required": ["qualified_name", "logical_path", "source_layer", "content_sha256", "start_line", "end_line", "cyclomatic", "nloc", "token_count", "parameter_count", "is_test", "threshold", "threshold_source"],
+      "properties": {
+        "qualified_name": {"type": "string"}, "logical_path": {"type": "string"},
+        "source_layer": {"type": "string"}, "content_sha256": {"$ref": "#/$defs/hash"},
+        "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
+        "cyclomatic": {"type": "integer", "minimum": 1}, "nloc": {"type": "integer", "minimum": 0},
+        "token_count": {"type": "integer", "minimum": 0}, "parameter_count": {"type": "integer", "minimum": 0},
+        "is_test": {"type": "boolean"},
+        "threshold": {"type": ["integer", "null"], "minimum": 1},
+        "threshold_source": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "complexity_candidate": {
+      "type": "object",
+      "required": ["candidate_id", "function", "reason_code", "threshold", "threshold_source", "head_complexity"],
+      "properties": {
+        "candidate_id": {"type": "string"}, "function": {"$ref": "#/$defs/complexity_function"},
+        "reason_code": {"type": "string"}, "threshold": {"type": "integer", "minimum": 1},
+        "threshold_source": {"type": "string"}, "base_complexity": {"type": ["integer", "null"]},
+        "head_complexity": {"type": "integer", "minimum": 1}, "delta": {"type": ["integer", "null"]},
+        "changed_lines": {"type": "array", "items": {"type": "integer", "minimum": 1}}
+      },
+      "additionalProperties": true
+    },
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "matrix_scenario": {
+      "type": "object",
+      "required": ["scenario_id", "production_state", "test_state", "source_hashes", "selected_tests", "result"],
+      "properties": {
+        "scenario_id": {"enum": ["base-code-base-tests", "base-code-head-tests", "head-code-base-tests", "head-code-head-tests"]},
+        "production_state": {"enum": ["base", "head"]},
+        "test_state": {"enum": ["base", "head"]},
+        "source_hashes": {"type": "object"},
+        "selected_tests": {"type": "array", "items": {"type": "string"}},
+        "result": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
     "coverage_record": {
       "type": "object",
       "required": ["state", "reason"],
@@ -96,7 +172,7 @@
         "checked_files": {"type": "integer", "minimum": 0},
         "skipped_files": {"type": "integer", "minimum": 0},
         "reason": {"type": "string"},
-        "status": {"enum": ["complete", "not_applicable", "partial", "unavailable", "failed"]}
+        "status": {"enum": ["complete", "not_applicable", "partial", "planned", "unavailable", "failed"]}
       },
       "additionalProperties": true
     }

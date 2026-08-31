@@ -9,7 +9,6 @@ import json
 import re
 import time
 import tokenize
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -42,6 +41,10 @@ def _syntax_from_registry() -> dict[str, frozenset[str]]:
 
 SYNTAX = _syntax_from_registry()
 HASH_ATTRIBUTE_SUFFIXES = {".php"}
+
+MAX_NORMALISED_COMMENT_CHARS = 2_000
+MAX_FOLLOWING_CODE_CHARS = 2_000
+MAX_SCORE_TOKENS = 256
 
 # Syntax audit: every suffix named by reference/lang is represented above;
 # C/C++ headers use slash comments, PHP uses slash and hash, and Terraform
@@ -156,6 +159,10 @@ class SourceParseError(ValueError):
     """A source file could not be parsed for bounded comment analysis."""
 
 
+class SourceReadError(OSError):
+    """A source reader could not provide the bounded file snapshot."""
+
+
 def _check_file_deadline(deadline: float | None) -> None:
     if deadline is not None and time.monotonic() >= deadline:
         raise AnalysisBudgetExceeded("file_timeout", "comment file deadline exceeded")
@@ -259,7 +266,12 @@ def _rust_raw_string_end(data: bytes, start: int, deadline: float | None = None)
     return end + len(close)
 
 
-def _generic_comments_detailed(path: str, value: str | bytes, deadline: float | None = None) -> tuple[list[Comment], int]:
+def _generic_comments_detailed(
+    path: str,
+    value: str | bytes,
+    deadline: float | None = None,
+    observer: Callable[[int], None] | None = None,
+) -> tuple[list[Comment], int]:
     suffix = Path(path).suffix.lower()
     syntax = SYNTAX.get(suffix, frozenset())
     line_marker = b"#" if "hash" in syntax else b"--" if "sql" in syntax else None
@@ -283,6 +295,8 @@ def _generic_comments_detailed(path: str, value: str | bytes, deadline: float | 
         else:
             column += end - index
         work += end - index
+        if observer is not None and end > index:
+            observer(end - index)
         index = end
 
     while index < length:
@@ -390,16 +404,26 @@ def _generic_comments(path: str, value: str | bytes) -> list[Comment]:
     return _generic_comments_detailed(path, value)[0]
 
 
-def extract_comments_with_work(path: str, text: str | bytes) -> tuple[list[Comment], int]:
+def extract_comments_with_work(
+    path: str,
+    text: str | bytes,
+    *,
+    observer: Callable[[int], None] | None = None,
+) -> tuple[list[Comment], int]:
     """Extract comments and report the production cursor work performed."""
     if _is_python_path(path):
         return _python_comments(text), len(_source_bytes(text))
-    return _generic_comments_detailed(path, text)
+    return _generic_comments_detailed(path, text, observer=observer)
 
 
-def extract_comments(path: str, text: str | bytes) -> list[Comment]:
+def extract_comments(
+    path: str,
+    text: str | bytes,
+    *,
+    observer: Callable[[int], None] | None = None,
+) -> list[Comment]:
     """Extract comments without treating strings, URLs, regexes, or heredocs as comments."""
-    return extract_comments_with_work(path, text)[0]
+    return extract_comments_with_work(path, text, observer=observer)[0]
 
 
 def _group_comments(comments: list[Comment], lines: list[str | bytes], deadline: float | None = None) -> list[Comment]:
@@ -493,7 +517,7 @@ def _following_code(path: str, lines: list[str | bytes], end_line: int, deadline
             continue
         value = _strip_inline_comment(path, value)
         if value:
-            code.append(value)
+            code.append(value[:MAX_FOLLOWING_CODE_CHARS])
     return code[:3]
 
 
@@ -553,10 +577,35 @@ def _is_behavioural_claim(text: str) -> bool:
     )
 
 
-def _score(text: str, code: list[str], diff_density: float) -> float:
-    comment_tokens = set(_tokens(text))
-    code_tokens = set(_tokens(" ".join(code)))
-    overlap = comment_tokens & code_tokens
+def _bounded_similarity(left: list[str], right: list[str], deadline: float | None = None) -> bool:
+    """Return a bounded token similarity without arbitrary text matching."""
+    _check_file_deadline(deadline)
+    if not left or not right:
+        return False
+    left_set = set(left)
+    right_set = set(right)
+    overlap = len(left_set & right_set)
+    if overlap / max(1, min(len(left_set), len(right_set))) >= 0.55:
+        _check_file_deadline(deadline)
+        return True
+    # Ordered adjacent pairs preserve a little more signal than a set while
+    # keeping the work bounded by the token cap above.
+    left_pairs = set(zip(left, left[1:]))
+    right_pairs = set(zip(right, right[1:]))
+    similar = bool(left_pairs and right_pairs and len(left_pairs & right_pairs) / max(1, min(len(left_pairs), len(right_pairs))) >= 0.5)
+    _check_file_deadline(deadline)
+    return similar
+
+
+def _score(text: str, code: list[str], diff_density: float, deadline: float | None = None) -> float:
+    _check_file_deadline(deadline)
+    bounded_text = text[:MAX_NORMALISED_COMMENT_CHARS]
+    bounded_code = " ".join(code)[:MAX_FOLLOWING_CODE_CHARS]
+    comment_tokens = _tokens(bounded_text)[:MAX_SCORE_TOKENS]
+    code_tokens_list = _tokens(bounded_code)[:MAX_SCORE_TOKENS]
+    comment_token_set = set(comment_tokens)
+    code_tokens = set(code_tokens_list)
+    overlap = comment_token_set & code_tokens
     overlap_ratio = len(overlap) / max(1, len(comment_tokens))
     has_imperative = any(_normalize_verb(token) in IMPERATIVE_VERBS for token in comment_tokens)
     score = 0.0
@@ -566,32 +615,34 @@ def _score(text: str, code: list[str], diff_density: float) -> float:
         score += 1.0
     if has_imperative:
         score += 2.0
-    if code and SequenceMatcher(None, " ".join(_tokens(text)), " ".join(_tokens(" ".join(code)))).ratio() >= 0.55:
+    if _bounded_similarity(comment_tokens, code_tokens_list, deadline):
         score += 2.0
-    if _is_heading(text):
+    _check_file_deadline(deadline)
+    if _is_heading(bounded_text):
         score += 2.0
     if diff_density >= 0.5:
         score += 1.0
-    if NEGATIVE_RE.search(text):
+    if NEGATIVE_RE.search(bounded_text):
         score += 0.5
-    if HISTORICAL_RE.search(text):
+    if HISTORICAL_RE.search(bounded_text):
         score += 1.0
-    if CONVERSATION_RE.search(text):
+    if CONVERSATION_RE.search(bounded_text):
         score += 3.0
-    if EXPLANATORY_RE.search(text):
+    if EXPLANATORY_RE.search(bounded_text):
         score -= 1.0
-    if STRONG_EXPLANATORY_RE.search(text):
+    if STRONG_EXPLANATORY_RE.search(bounded_text):
         score -= 1.5
-    if _is_behavioural_claim(text):
+    if _is_behavioural_claim(bounded_text):
         score += 2.0
-    if re.search(r"\bNOTE\b", text):
+    if re.search(r"\bNOTE\b", bounded_text):
         score += 0.5
-    if URL_RE.search(text):
+    if URL_RE.search(bounded_text):
         score -= 1.0
-    if REFERENCE_RE.search(text):
+    if REFERENCE_RE.search(bounded_text):
         score -= 1.0
     if len(comment_tokens) >= 3:
         score += 0.5
+    _check_file_deadline(deadline)
     return score
 
 
@@ -627,6 +678,7 @@ class FileSkip:
     path: str
     reason_code: str
     detail: str = ""
+    target_id: str = ""
 
 
 @dataclass
@@ -638,14 +690,205 @@ class CommentAnalysisResult:
     bytes_scanned: int
     candidates: list[dict]
     reason_code: str | None = None
+    changed_line_count: int = 0
+    changed_comment_count: int = 0
+    comment_density: float = 0.0
+    skipped_file_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"complete", "not_applicable", "partial", "failed"}:
             raise ValueError(f"invalid comment analysis status: {self.status}")
         if self.applicable_files < 0 or self.checked_files < 0:
             raise ValueError("comment analysis file counts must not be negative")
-        if self.checked_files + len(self.skipped_files) > self.applicable_files:
+        if self.skipped_file_count is None:
+            self.skipped_file_count = len(self.skipped_files)
+        if self.skipped_file_count < 0:
+            raise ValueError("comment skipped file count must not be negative")
+        if self.checked_files + self.skipped_file_count > self.applicable_files:
             raise ValueError("comment analysis counts exceed applicable files")
+
+
+@dataclass(frozen=True)
+class _CommentDraft:
+    path: str
+    comment: Comment
+    code: tuple[str, ...]
+    score: float
+    mode: str
+    source_layer: str
+    content_sha256: str
+    target_id: str
+
+
+@dataclass(frozen=True)
+class _TargetScanOutcome:
+    checked: bool = False
+    bytes_scanned: int = 0
+    changed_line_count: int = 0
+    changed_comment_count: int = 0
+    candidates: tuple[dict, ...] = ()
+    skip: FileSkip | None = None
+    terminal_reason: str | None = None
+    terminal_detail: str = ""
+    internal_failure: bool = False
+
+
+def _normalise_ranges(ranges: Iterable[tuple[int, int]] | None) -> tuple[tuple[int, int], ...]:
+    values = sorted(
+        (max(1, int(start)), max(int(start), int(end)))
+        for start, end in (ranges or ())
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in values:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _range_line_count(ranges: Iterable[tuple[int, int]]) -> int:
+    return sum(end - start + 1 for start, end in ranges)
+
+
+def _target_id(path: str, source_layer: str, content_sha256: str) -> str:
+    return "|".join((Path(path).as_posix(), source_layer or "working-tree", content_sha256 or ""))
+
+
+def _extract_comment_groups(
+    path: str,
+    text: str | bytes,
+    deadline: float | None,
+    *,
+    strict_python: bool,
+) -> tuple[list[str | bytes], list[Comment]]:
+    lines: list[str | bytes] = text.splitlines()
+    if _is_python_path(path):
+        comments, parse_error = _python_comments_detailed(text, deadline)
+        if parse_error is not None and strict_python:
+            raise SourceParseError(parse_error)
+    else:
+        comments = _generic_comments_detailed(path, text, deadline)[0]
+    _check_file_deadline(deadline)
+    return lines, _group_comments(comments, lines, deadline)
+
+
+def _candidate_from_comment(
+    path: str,
+    comment: Comment,
+    code: Iterable[str],
+    source_layer: str,
+    content_sha256: str,
+    target_id: str,
+    score: float,
+    deadline: float | None = None,
+) -> dict:
+    _check_file_deadline(deadline)
+    subtype = _subtype(comment.text, list(code))
+    identity = json.dumps({
+        "analyser": "comment-slop",
+        "rule": f"comment-slop/{subtype}",
+        "path": Path(path).as_posix(),
+        "source_layer": source_layer,
+        "content_sha256": content_sha256,
+        "line": comment.line,
+        "column": comment.column,
+        "discriminator": comment.column,
+    }, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    contract = (
+        "Verify the asserted behaviour exists in the current implementation "
+        "(truthfulness), is in scope (relevance), and describes the current "
+        "invariant (stability)."
+        if subtype == "behavioural-claim"
+        else "Verify truthfulness, relevance, and stability before recommending removal."
+    )
+    candidate = blank_candidate(
+        f"candidate-comment-slop-{digest}",
+        source=f"comment-slop/{subtype}",
+        claim=f"Comment may be redundant or narrational at {Path(path).as_posix()}:{comment.line}",
+        contract=contract,
+    )
+    candidate["trigger_path"] = [f"{Path(path).as_posix()}:{comment.line}"]
+    candidate["supporting_evidence"] = [{
+        "kind": "comment",
+        "file": Path(path).as_posix(),
+        "line": comment.line,
+        "column": comment.column,
+        "message": comment.text[:MAX_NORMALISED_COMMENT_CHARS],
+        "source_layer": source_layer,
+        "content_sha256": content_sha256,
+        "target_id": target_id,
+        "score": score,
+    }]
+    candidate = redact_payload(candidate)
+    errors = validate_candidate(candidate)
+    if errors:
+        raise ValueError("invalid comment-slop candidate: " + "; ".join(errors))
+    _check_file_deadline(deadline)
+    return candidate
+
+
+def _drafts_for_groups(
+    path: str,
+    lines: list[str | bytes],
+    groups: Iterable[Comment],
+    changed_ranges: tuple[tuple[int, int], ...],
+    mode: str,
+    source_layer: str,
+    content_sha256: str,
+    target_id: str,
+    deadline: float | None,
+    diff_density: float,
+) -> list[_CommentDraft]:
+    drafts: list[_CommentDraft] = []
+    for comment in groups:
+        _check_file_deadline(deadline)
+        if mode == "diff" and not _overlaps(comment.line, comment.end_line, list(changed_ranges)):
+            continue
+        code = _following_code(path, lines, comment.end_line, deadline)
+        if not code:
+            continue
+        score = _score(comment.text, code, diff_density, deadline)
+        if mode == "full" and comment.docstring:
+            score -= 4.0
+        drafts.append(_CommentDraft(
+            path, comment, tuple(code), score, mode, source_layer,
+            content_sha256, target_id,
+        ))
+    return drafts
+
+
+def _render_drafts(
+    drafts: Iterable[_CommentDraft],
+    density: float,
+    budget: AnalysisBudget | None,
+    deadline: float | None = None,
+) -> list[dict]:
+    candidates: list[dict] = []
+    try:
+        for draft in drafts:
+            _check_file_deadline(deadline)
+            score = draft.score + (1.0 if draft.mode == "diff" and density >= 0.5 else 0.0)
+            threshold = 3.5 if draft.mode == "full" else 2.0
+            if score < threshold:
+                continue
+            if budget is not None:
+                try:
+                    budget.claim_candidate()
+                except AnalysisBudgetExceeded as error:
+                    error.partial_candidates = candidates
+                    raise
+            candidates.append(_candidate_from_comment(
+                draft.path, draft.comment, draft.code, draft.source_layer,
+                draft.content_sha256, draft.target_id, score, deadline,
+            ))
+            _check_file_deadline(deadline)
+    except AnalysisBudgetExceeded as error:
+        if not hasattr(error, "partial_candidates"):
+            error.partial_candidates = candidates
+        raise
+    return candidates
 
 
 def scan_comments(
@@ -661,83 +904,261 @@ def scan_comments(
     content_sha256: str = "",
     strict_python: bool = True,
 ) -> list[dict]:
-    """Return ledger candidates for comments in the requested review scope."""
+    """Return ledger candidates for one already-loaded source value."""
     if mode == "diff" and changed_line_ranges is None:
         return []
-    lines: list[str | bytes] = text.splitlines()
-    if _is_python_path(path):
-        comments, parse_error = _python_comments_detailed(text, deadline)
-        if parse_error is not None and strict_python:
-            raise SourceParseError(parse_error)
-        if deadline is not None and time.monotonic() >= deadline:
-            raise AnalysisBudgetExceeded("file_timeout", "comment file deadline exceeded")
-    else:
-        comments = _generic_comments_detailed(path, text, deadline)[0]
-    _check_file_deadline(deadline)
-    groups = _group_comments(comments, lines, deadline)
-    candidates: list[dict] = []
-    ranges = changed_line_ranges or []
+    lines, groups = _extract_comment_groups(path, text, deadline, strict_python=strict_python)
+    ranges = _normalise_ranges(changed_line_ranges)
+    target_id = _target_id(path, source_layer, content_sha256)
+    drafts = _drafts_for_groups(
+        path, lines, groups, ranges, mode, source_layer, content_sha256,
+        target_id, deadline, diff_density,
+    )
     try:
-        for comment in groups:
-            _check_file_deadline(deadline)
-            if mode == "diff" and not _overlaps(comment.line, comment.end_line, ranges):
-                continue
-            code = _following_code(path, lines, comment.end_line, deadline)
-            if not code:
-                continue
-            score = _score(comment.text, code, diff_density)
-            _check_file_deadline(deadline)
-            if mode == "full" and comment.docstring:
-                score -= 4.0
-            threshold = 3.5 if mode == "full" else 2.0
-            if score < threshold:
-                continue
-            subtype = _subtype(comment.text, code)
-            identity = json.dumps({
-                "analyser": "comment-slop",
-                "rule": f"comment-slop/{_subtype(comment.text, code)}",
-                "path": Path(path).as_posix(),
-                "source_layer": source_layer,
-                "content_sha256": content_sha256,
-                "line": comment.line,
-                "column": comment.column,
-                "discriminator": comment.column,
-            }, sort_keys=True, separators=(",", ":"))
-            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-            contract = (
-                "Verify the asserted behaviour exists in the current implementation "
-                "(truthfulness), is in scope (relevance), and describes the current "
-                "invariant (stability)."
-                if subtype == "behavioural-claim"
-                else "Verify truthfulness, relevance, and stability before recommending removal."
-            )
-            candidate = blank_candidate(
-                f"candidate-comment-slop-{digest}",
-                source=f"comment-slop/{subtype}",
-                claim=f"Comment may be redundant or narrational at {Path(path).as_posix()}:{comment.line}",
-                contract=contract,
-            )
-            candidate["trigger_path"] = [f"{Path(path).as_posix()}:{comment.line}"]
-            candidate["supporting_evidence"] = [{
-                "kind": "comment",
-                "file": Path(path).as_posix(),
-                "line": comment.line,
-                "column": comment.column,
-                "message": comment.text,
-                "source_layer": source_layer,
-                "content_sha256": content_sha256,
-            }]
-            candidate = redact_payload(candidate)
-            errors = validate_candidate(candidate)
-            if errors:
-                raise ValueError("invalid comment-slop candidate: " + "; ".join(errors))
-            if budget is not None:
-                budget.claim_candidate()
-            candidates.append(candidate)
+        return _render_drafts(drafts, 0.0 if mode == "diff" else diff_density, budget, deadline)
     except AnalysisBudgetExceeded as error:
-        error.partial_candidates = candidates
+        if not hasattr(error, "partial_candidates"):
+            error.partial_candidates = []
         raise
-    return candidates
+
+
+def _select_comment_targets(
+    root: Path,
+    paths: Iterable[str | Path],
+    *,
+    excluded_paths: Iterable[str | Path],
+    targets: Iterable[AnalysisTarget] | None,
+    text_by_path: dict[str, str | bytes] | None,
+    target_contents: dict[str, str | bytes] | None,
+) -> list[tuple[str, Path, str | bytes | None, AnalysisTarget | None]]:
+    excluded = {Path(path).as_posix() for path in excluded_paths}
+    selected: list[tuple[str, Path, str | bytes | None, AnalysisTarget | None]] = []
+    selected_keys: set[tuple[str, str, object]] = set()
+    if targets is not None:
+        for target in targets:
+            logical_path = Path(target.logical_path)
+            if logical_path.is_absolute() or not logical_path.parts or ".." in logical_path.parts:
+                continue
+            relative = logical_path.as_posix()
+            if relative in excluded:
+                continue
+            spec = language_for_path(relative)
+            if spec is None or spec.comment_style is None:
+                continue
+            physical = target.physical_path if target.physical_path.is_absolute() else root / target.physical_path
+            provided = target.data
+            if target_contents is not None:
+                snapshot_value = target_contents.get(target.physical_path.as_posix())
+                if snapshot_value is None:
+                    snapshot_value = target_contents.get(physical.as_posix())
+                if snapshot_value is not None:
+                    provided = snapshot_value
+            if provided is None:
+                try:
+                    physical.resolve().relative_to(root.resolve())
+                except (OSError, ValueError):
+                    continue
+            # The bounded scan claims bytes before calculating the source
+            # digest. Raw supplied bytes are only a pre-read deduplication key.
+            identity = target.content_sha256 or target.data or ""
+            key = (relative, target.source_kind, identity)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            selected.append((relative, physical, provided, target))
+        selected.sort(key=lambda item: (
+            item[0],
+            item[3].source_kind if item[3] is not None else "",
+            item[3].content_sha256 if item[3] is not None else "",
+        ))
+        return selected
+    for value in paths:
+        candidate = Path(value)
+        try:
+            relative = candidate.absolute().relative_to(root).as_posix() if candidate.is_absolute() else candidate.as_posix()
+        except ValueError:
+            continue
+        spec = language_for_path(relative)
+        if spec is None or spec.comment_style is None or relative in excluded:
+            continue
+        try:
+            resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+            resolved.relative_to(root.resolve())
+        except (OSError, ValueError):
+            continue
+        provided = text_by_path.get(relative) if text_by_path is not None else None
+        key = (relative, "working-tree", "")
+        if key in selected_keys:
+            continue
+        selected_keys.add(key)
+        selected.append((relative, resolved, provided, None))
+    selected.sort(key=lambda item: item[0])
+    return selected
+
+
+def _scan_comment_target(
+    root: Path,
+    item: tuple[str, Path, str | bytes | None, AnalysisTarget | None],
+    *,
+    mode: str,
+    changed_ranges: dict[str, list[tuple[int, int]] | None] | None,
+    diff_density: float,
+    result_budget: AnalysisBudget,
+    max_file_bytes: int,
+    per_file_timeout: float,
+    pre_skip_by_id: dict[str, FileSkip],
+    pre_skip_by_path: dict[str, FileSkip],
+    source_reader: Callable[[str, int], tuple[str | bytes | None, str | None]] | None,
+) -> _TargetScanOutcome:
+    relative, path, provided, target = item
+    source_layer = target.source_kind if target is not None else "working-tree"
+    declared_hash = target.content_sha256 if target is not None else ""
+    declared_id = _target_id(relative, source_layer, declared_hash)
+    prior_skip = pre_skip_by_id.get(declared_id) or pre_skip_by_path.get(relative)
+    if prior_skip is not None:
+        return _TargetScanOutcome(skip=prior_skip)
+    ranges_value = (
+        list(target.changed_ranges)
+        if target is not None and target.changed_ranges is not None
+        else changed_ranges.get(relative) if changed_ranges is not None else None
+    )
+    ranges = _normalise_ranges(ranges_value)
+    if mode == "diff" and ranges_value is None:
+        return _TargetScanOutcome(
+            skip=FileSkip(relative, "no_diff_line_evidence", "changed line ranges were unavailable", declared_id),
+        )
+    bytes_scanned = 0
+    try:
+        result_budget.claim_file()
+        remaining = (
+            result_budget.max_total_bytes - result_budget.bytes_claimed
+            if result_budget.max_total_bytes is not None else max_file_bytes
+        )
+        if remaining <= 0:
+            raise AnalysisBudgetExceeded("max_total_bytes", "aggregate byte budget exhausted")
+        size: int | None = None
+        claimed_before_read = False
+        if provided is None:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = None
+            if size is not None:
+                if size > max_file_bytes:
+                    return _TargetScanOutcome(
+                        skip=FileSkip(relative, "max_file_bytes", "source file exceeds file limit", declared_id),
+                    )
+                if size > remaining:
+                    raise AnalysisBudgetExceeded("max_total_bytes", "source file exceeds aggregate byte limit")
+                result_budget.claim_bytes(size)
+                claimed_before_read = True
+        read_limit = size if claimed_before_read and size is not None else min(max_file_bytes, remaining)
+        reader_error: str | None = None
+        if provided is None and source_reader is not None:
+            provided, reader_error = source_reader(relative, read_limit)
+            if reader_error is not None:
+                if provided is not None and not claimed_before_read:
+                    observed = min(len(_source_bytes(provided)), max_file_bytes, remaining)
+                    if observed:
+                        result_budget.claim_bytes(observed)
+                        bytes_scanned += observed
+                code = "max_file_bytes" if "max_file_bytes" in reader_error else "read_failure"
+                raise SourceReadError(f"{code}: {reader_error}")
+        if provided is not None:
+            data = _source_bytes(provided)
+            if not claimed_before_read:
+                result_budget.claim_bytes(min(len(data), max_file_bytes))
+        else:
+            with path.open("rb") as source_file:
+                data = source_file.read(read_limit)
+        observed = len(data)
+        if claimed_before_read:
+            try:
+                unchanged = len(data) == size and path.stat().st_size == size
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                raise SourceReadError("read_failure: source changed during bounded read")
+        bytes_scanned += min(observed, max_file_bytes)
+        if observed > max_file_bytes:
+            return _TargetScanOutcome(
+                bytes_scanned=bytes_scanned,
+                skip=FileSkip(relative, "max_file_bytes", "bounded read exceeded file limit", declared_id),
+            )
+        if not claimed_before_read and observed > remaining:
+            raise AnalysisBudgetExceeded("max_total_bytes", "bounded read exceeded aggregate limit")
+        if b"\0" in data[:4096]:
+            return _TargetScanOutcome(
+                bytes_scanned=bytes_scanned,
+                skip=FileSkip(relative, "binary_source", "NUL byte in bounded source prefix", declared_id),
+            )
+        digest = hashlib.sha256(data).hexdigest()
+        if declared_hash and declared_hash != digest:
+            return _TargetScanOutcome(
+                bytes_scanned=bytes_scanned,
+                skip=FileSkip(relative, "content_hash_mismatch", "loaded source differs from its declared snapshot hash", declared_id),
+            )
+        target_id = _target_id(relative, source_layer, digest)
+        deadline = result_budget.child_deadline(per_file_timeout)
+        lines, groups = _extract_comment_groups(relative, data, deadline, strict_python=True)
+        drafts = _drafts_for_groups(
+            relative, lines, groups, ranges, mode, source_layer, digest,
+            target_id, deadline, 0.0 if mode == "diff" else diff_density,
+        )
+        _check_file_deadline(deadline)
+        changed_comment_count = sum(
+            1 for comment in groups
+            if mode == "diff" and _overlaps(comment.line, comment.end_line, list(ranges))
+        )
+        changed_line_count = _range_line_count(ranges) if mode == "diff" else 0
+        local_density = (
+            changed_comment_count / changed_line_count
+            if mode == "diff" and changed_line_count else diff_density
+        )
+        try:
+            candidates = tuple(_render_drafts(tuple(drafts), local_density, result_budget, deadline))
+        except AnalysisBudgetExceeded as error:
+            partial = tuple(getattr(error, "partial_candidates", ()))
+            terminal = error.reason_code if error.reason_code in {"max_candidates", "total_timeout", "max_total_bytes", "max_files"} else None
+            return _TargetScanOutcome(
+                checked=error.reason_code == "max_candidates",
+                bytes_scanned=bytes_scanned,
+                changed_line_count=changed_line_count,
+                changed_comment_count=changed_comment_count,
+                candidates=partial,
+                skip=None if error.reason_code == "max_candidates" else FileSkip(relative, error.reason_code, error.detail, declared_id),
+                terminal_reason=terminal,
+                terminal_detail=error.detail,
+            )
+        return _TargetScanOutcome(
+            checked=True,
+            bytes_scanned=bytes_scanned,
+            changed_line_count=changed_line_count,
+            changed_comment_count=changed_comment_count,
+            candidates=candidates,
+        )
+    except AnalysisBudgetExceeded as error:
+        terminal = error.reason_code in {"total_timeout", "max_files", "max_total_bytes"}
+        return _TargetScanOutcome(
+            bytes_scanned=bytes_scanned,
+            skip=FileSkip(relative, error.reason_code, error.detail, declared_id),
+            terminal_reason=error.reason_code if terminal else None,
+            terminal_detail=error.detail,
+        )
+    except SourceParseError as error:
+        return _TargetScanOutcome(skip=FileSkip(relative, "parse_error", str(error), declared_id), bytes_scanned=bytes_scanned)
+    except SourceReadError as error:
+        detail = str(error)
+        reason_code = "max_file_bytes" if detail.startswith("max_file_bytes:") else "read_failure"
+        return _TargetScanOutcome(skip=FileSkip(relative, reason_code, detail, declared_id), bytes_scanned=bytes_scanned)
+    except (OSError, UnicodeError) as error:
+        return _TargetScanOutcome(skip=FileSkip(relative, "read_failure", str(error), declared_id), bytes_scanned=bytes_scanned)
+    except Exception as error:
+        return _TargetScanOutcome(
+            skip=FileSkip(relative, "internal_failure", str(error), declared_id),
+            bytes_scanned=bytes_scanned,
+            internal_failure=True,
+        )
 
 
 def scan_comment_targets(
@@ -757,169 +1178,91 @@ def scan_comment_targets(
     target_contents: dict[str, str | bytes] | None = None,
     source_reader: Callable[[str, int], tuple[str | bytes | None, str | None]] | None = None,
 ) -> CommentAnalysisResult:
-    """Read and analyse only supported comment-bearing source targets.
-
-    Scope filtering happens before ``stat`` and before opening a file.  The
-    bounded binary read also lets the generic scanner preserve byte positions
-    without decoding unsupported content.
-    """
+    """Bounded one-pass implementation used by the public target scanner."""
     root = root.absolute()
-    excluded = {Path(path).as_posix() for path in excluded_paths}
-    selected: list[tuple[str, Path, str | bytes | None, AnalysisTarget | None]] = []
-    selected_keys: set[tuple[str, str, str]] = set()
-    if targets is not None:
-        for target in targets:
-            logical_path = Path(target.logical_path)
-            if logical_path.is_absolute() or not logical_path.parts or ".." in logical_path.parts:
-                continue
-            relative = logical_path.as_posix()
-            if relative in excluded:
-                continue
-            spec = language_for_path(relative)
-            if spec is None or spec.comment_style is None:
-                continue
-            physical = target.physical_path if target.physical_path.is_absolute() else root / target.physical_path
-            provided = None
-            if target_contents is not None:
-                provided = target_contents.get(target.physical_path.as_posix())
-                if provided is None:
-                    provided = target_contents.get(physical.as_posix())
-            if provided is None:
-                try:
-                    physical.resolve().relative_to(root.resolve())
-                except (OSError, ValueError):
-                    continue
-            key = (relative, target.source_kind, target.content_sha256)
-            if key in selected_keys:
-                continue
-            selected_keys.add(key)
-            selected.append((relative, physical, provided, target))
-        selected.sort(key=lambda item: (item[0], item[3].source_kind if item[3] is not None else "", item[3].content_sha256 if item[3] is not None else ""))
-    else:
-        for value in paths:
-            candidate = Path(value)
-            try:
-                relative = candidate.absolute().relative_to(root).as_posix() if candidate.is_absolute() else candidate.as_posix()
-            except ValueError:
-                continue
-            spec = language_for_path(relative)
-            if spec is None or spec.comment_style is None:
-                continue
-            try:
-                resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
-                resolved.relative_to(root.resolve())
-            except (OSError, ValueError):
-                continue
-            if relative in excluded:
-                continue
-            provided = text_by_path.get(relative) if text_by_path is not None else None
-            key = (relative, "working-tree", "")
-            if key in selected_keys:
-                continue
-            selected_keys.add(key)
-            selected.append((relative, resolved, provided, None))
-        selected.sort(key=lambda item: item[0])
+    selected = _select_comment_targets(
+        root,
+        paths,
+        excluded_paths=excluded_paths,
+        targets=targets,
+        text_by_path=text_by_path,
+        target_contents=target_contents,
+    )
+
     result_budget = budget or AnalysisBudget(timeout_seconds=300)
-    pre_skip_by_path = {item.path: item for item in pre_skipped}
+    pre_skips = tuple(pre_skipped)
+    pre_skip_by_id = {item.target_id: item for item in pre_skips if item.target_id}
+    pre_skip_by_path = {item.path: item for item in pre_skips if not item.target_id}
     skipped: list[FileSkip] = []
+    skipped_file_count = 0
     candidates: list[dict] = []
     checked = 0
     bytes_scanned = 0
+    changed_line_count = 0
+    changed_comment_count = 0
     internal_failure = False
-    for relative, path, provided, target in selected:
-        if relative in pre_skip_by_path:
-            skipped.append(pre_skip_by_path[relative])
-            continue
-        ranges = (
-            list(target.changed_ranges)
-            if target is not None and target.changed_ranges is not None
-            else changed_ranges.get(relative) if changed_ranges is not None else None
+    terminal_reason: str | None = None
+    terminal_detail = ""
+
+    def record_skip(skip: FileSkip, count: int = 1) -> None:
+        nonlocal skipped_file_count
+        skipped_file_count += max(0, count)
+        if len(skipped) < 3:
+            skipped.append(skip)
+
+    for index, item in enumerate(selected):
+        outcome = _scan_comment_target(
+            root,
+            item,
+            mode=mode,
+            changed_ranges=changed_ranges,
+            diff_density=diff_density,
+            result_budget=result_budget,
+            max_file_bytes=max_file_bytes,
+            per_file_timeout=per_file_timeout,
+            pre_skip_by_id=pre_skip_by_id,
+            pre_skip_by_path=pre_skip_by_path,
+            source_reader=source_reader,
         )
-        if mode == "diff" and ranges is None:
-            skipped.append(FileSkip(relative, "no_diff_line_evidence", "changed line ranges were unavailable"))
-            continue
-        try:
-            result_budget.claim_file()
-        except AnalysisBudgetExceeded as error:
-            skipped.append(FileSkip(relative, error.reason_code, error.detail))
-            continue
-        try:
-            remaining = result_budget.max_total_bytes - result_budget.bytes_claimed if result_budget.max_total_bytes is not None else max_file_bytes
-            if remaining <= 0:
-                skipped.append(FileSkip(relative, "max_total_bytes", "aggregate byte budget exhausted"))
-                continue
-            source_limit = min(max_file_bytes, remaining)
-            if provided is None and source_reader is not None:
-                provided, reader_error = source_reader(relative, source_limit)
-                if reader_error is not None:
-                    observed = len(_source_bytes(provided)) if provided is not None else 0
-                    allowed = min(observed, max_file_bytes, remaining)
-                    if allowed:
-                        result_budget.claim_bytes(allowed)
-                        bytes_scanned += allowed
-                    reason_code = "read_failure" if reader_error.startswith("read_failure:") else "max_total_bytes" if remaining < max_file_bytes else "max_file_bytes"
-                    skipped.append(FileSkip(relative, reason_code, reader_error))
-                    continue
-                size = len(_source_bytes(provided)) if provided is not None else 0
-            else:
-                size = len(_source_bytes(provided)) if provided is not None else path.stat().st_size
-            if size > max_file_bytes:
-                skipped.append(FileSkip(relative, "max_file_bytes", f"file is {size} bytes"))
-                continue
-            read_limit = min(max_file_bytes + 1, remaining + 1)
-            if provided is not None:
-                data = _source_bytes(provided)[:read_limit]
-            else:
-                with path.open("rb") as source_file:
-                    data = source_file.read(read_limit)
-            observed = len(data)
-            allowed = min(observed, max_file_bytes, remaining)
-            if allowed:
-                result_budget.claim_bytes(allowed)
-                bytes_scanned += allowed
-            if observed > max_file_bytes:
-                skipped.append(FileSkip(relative, "max_file_bytes", "bounded read exceeded file limit"))
-                continue
-            if observed > remaining:
-                skipped.append(FileSkip(relative, "max_total_bytes", "bounded read exceeded aggregate limit"))
-                continue
-            if b"\0" in data[:4096]:
-                skipped.append(FileSkip(relative, "binary_source", "NUL byte in bounded source prefix"))
-                continue
-            deadline = result_budget.child_deadline(per_file_timeout)
-            values = scan_comments(
-                relative,
-                data,
-                ranges,
-                mode,
-                diff_density,
-                budget=result_budget,
-                deadline=deadline,
-                source_layer=target.source_kind if target is not None else "working-tree",
-                content_sha256=target.content_sha256 if target is not None else "",
-                strict_python=True,
-            )
-            candidates.extend(values)
-            checked += 1
-        except AnalysisBudgetExceeded as error:
-            candidates.extend(getattr(error, "partial_candidates", ()))
-            skipped.append(FileSkip(relative, error.reason_code, error.detail))
-        except SourceParseError as error:
-            skipped.append(FileSkip(relative, "parse_error", str(error)))
-        except (OSError, UnicodeError) as error:
-            skipped.append(FileSkip(relative, "read_failure", str(error)))
-        except Exception as error:  # one malformed file must not abort the pass
+        checked += int(outcome.checked)
+        bytes_scanned += outcome.bytes_scanned
+        changed_line_count += outcome.changed_line_count
+        changed_comment_count += outcome.changed_comment_count
+        candidates.extend(outcome.candidates)
+        if outcome.skip is not None:
+            record_skip(outcome.skip)
+        if outcome.internal_failure:
             internal_failure = True
-            skipped.append(FileSkip(relative, "internal_failure", str(error)))
+        if outcome.terminal_reason is not None:
+            terminal_reason = outcome.terminal_reason
+            terminal_detail = outcome.terminal_detail
+            skipped_file_count += len(selected) - index - 1
+            break
+        if (
+            result_budget.max_candidates is not None
+            and result_budget.candidates_claimed >= result_budget.max_candidates
+            and index + 1 < len(selected)
+        ):
+            terminal_reason = "max_candidates"
+            terminal_detail = "maximum candidate count reached"
+            skipped_file_count += len(selected) - index - 1
+            break
+
+    density = (
+        changed_comment_count / changed_line_count
+        if changed_line_count else diff_density if mode == "diff" else 0.0
+    )
+    candidate_limit = terminal_reason == "max_candidates"
+
     if not selected:
         status = "not_applicable"
         reason_code = "no_applicable_files"
     elif internal_failure:
         status = "failed"
         reason_code = "internal_failure"
-    elif skipped:
+    elif skipped_file_count or terminal_reason or candidate_limit:
         status = "partial"
-        reason_code = skipped[0].reason_code
+        reason_code = terminal_reason or (skipped[0].reason_code if skipped else None)
     else:
         status = "complete"
         reason_code = None
@@ -931,4 +1274,8 @@ def scan_comment_targets(
         bytes_scanned=bytes_scanned,
         candidates=candidates,
         reason_code=reason_code,
+        changed_line_count=changed_line_count,
+        changed_comment_count=changed_comment_count,
+        comment_density=density,
+        skipped_file_count=skipped_file_count,
     )

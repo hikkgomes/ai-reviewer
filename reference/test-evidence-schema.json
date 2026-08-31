@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dissect.local/test-evidence.schema.json",
+  "title": "Dissect test-integrity evidence",
+  "type": "object",
+  "required": ["status", "state", "artifacts", "subjects", "relations", "changes", "static_candidates", "matrix", "mutations", "proof_tests"],
+  "properties": {
+    "status": {"enum": ["complete", "partial", "not_applicable", "planned", "unavailable", "failed"]},
+    "state": {"enum": ["Finding", "Checked", "Not applicable", "Not verified"]},
+    "reason_code": {"type": ["string", "null"]},
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+    "subjects": {"type": "array", "items": {"$ref": "#/$defs/subject"}},
+    "relations": {"type": "array", "items": {"type": "object"}},
+    "changes": {"type": "array", "items": {"$ref": "#/$defs/change"}},
+    "static_candidates": {"type": "array", "items": {"type": "object"}},
+    "matrix": {"type": "array", "items": {"$ref": "#/$defs/scenario"}},
+    "mutations": {"type": "array", "items": {"$ref": "#/$defs/mutation"}},
+    "targeted_mutation": {"$ref": "#/$defs/mutation_run"},
+    "proof_tests": {"type": "array", "items": {"type": "object"}}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "required": ["id", "logical_path", "framework_id", "role", "source_kind", "content_sha256"],
+      "properties": {
+        "id": {"type": "string"}, "logical_path": {"type": "string"}, "framework_id": {"type": "string"},
+        "role": {"type": "string"}, "source_kind": {"type": "string"}, "content_sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "subject": {
+      "type": "object",
+      "required": ["id", "logical_path", "qualified_name", "start_line", "end_line", "source_kind", "content_sha256"],
+      "properties": {
+        "id": {"type": "string"}, "logical_path": {"type": "string"}, "qualified_name": {"type": "string"},
+        "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
+        "source_kind": {"type": "string"}, "content_sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "change": {
+      "type": "object",
+      "required": ["id", "test", "change_kinds", "affected_subjects", "evidence", "oracle_source"],
+      "properties": {
+        "id": {"type": "string"},
+        "test": {"$ref": "#/$defs/artifact"},
+        "change_kinds": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "affected_subjects": {"type": "array", "items": {"$ref": "#/$defs/subject"}},
+        "evidence": {"type": "array", "items": {"type": "object"}},
+        "oracle_source": {"type": "object", "required": ["kind", "reference"], "properties": {"kind": {"type": "string"}, "reference": {"type": "string"}}}
+      }
+    },
+    "mutation": {
+      "type": "object",
+      "required": ["mutation_id", "subject", "mutation_kind", "patch_sha256", "build_valid", "killed", "killing_tests"],
+      "properties": {
+        "mutation_id": {"type": "string"},
+        "subject": {"$ref": "#/$defs/subject"},
+        "mutation_kind": {"type": "string"},
+        "patch_sha256": {"$ref": "#/$defs/hash"},
+        "command_plan_digest": {"anyOf": [{"$ref": "#/$defs/hash"}, {"const": ""}]},
+        "build_valid": {"type": ["boolean", "null"]},
+        "killed": {"type": ["boolean", "null"]},
+        "killing_tests": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "mutation_run": {
+      "type": "object",
+      "required": ["status", "results", "kill_sets", "unique_kill_sets"],
+      "properties": {
+        "status": {"enum": ["complete", "partial", "not_applicable", "planned", "unavailable", "failed"]},
+        "reason_code": {"type": ["string", "null"]},
+        "results": {"type": "array", "items": {"$ref": "#/$defs/mutation"}},
+        "kill_sets": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+        "unique_kill_sets": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}}
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "required": ["scenario_id", "production_state", "test_state", "source_hashes", "selected_tests", "result"],
+      "properties": {
+        "scenario_id": {"enum": ["base-code-base-tests", "base-code-head-tests", "head-code-base-tests", "head-code-head-tests"]},
+        "production_state": {"enum": ["base", "head"]}, "test_state": {"enum": ["base", "head"]},
+        "source_hashes": {"type": "object"}, "selected_tests": {"type": "array", "items": {"type": "string"}},
+        "result": {"type": "object"}
+      }
+    }
+  }
+}

@@ -90,6 +90,23 @@ uses independent monotonic file, byte, candidate, and deadline limits. See
 `reference/review-context-schema.json` and
 `reference/anti-slop-rule-contract.md` for persisted coverage and rule details.
 
+Test-integrity analysis inventories test artefacts and production subjects,
+partitions the change, and records static candidates separately from dynamic
+evidence. When tests are applicable, the evidence matrix compares base code with
+base tests, base code with head tests, head code with base tests, and head code
+with head tests. Approved execution uses private source trees, isolated home
+and temp directories, exact command-plan digests, hard timeouts, and bounded
+redacted output. Targeted hunk reversion and proof tests are optional
+verification evidence and never modify the real checkout.
+
+> A passing test is evidence only for the exact behaviour it can distinguish. It
+> is not proof that the implementation or oracle is correct.
+
+Complexity analysis measures changed or selected functions with repository
+thresholds first and the pinned Lizard 1.24.0 fallback second. It reports
+function metrics and review candidates without treating complexity or authorship
+as proof of a defect.
+
 In diff mode, optional analysers use the exact source layer: reviewed commit
 content for a commit range, the index for staged content, the worktree for
 unstaged content, and the worktree for untracked files. Identical content at

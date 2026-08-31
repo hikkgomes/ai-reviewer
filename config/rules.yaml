@@ -103,4 +103,6 @@ check_families:
   OPS-DESTRUCTIVE: [1, 2, 4, 5, 6]
   GOV-REGRESSION: [1, 5, 6]
   GOV-AUDIT: [1, 4, 5]
+  GOV-TESTS: [1, 2, 5, 6]
+  COR-COMPLEXITY: [2, 5, 6]
   ABUSE-BRAND: [1, 4, 5]

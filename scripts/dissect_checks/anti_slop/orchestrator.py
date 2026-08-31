@@ -1,18 +1,18 @@
 """Stable orchestration for structural anti-slop backends."""
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
-from analysis_budget import AnalysisBudget, analysis_limits
+from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded, analysis_limits
 from file_paths import is_generated_path, is_ignored_path
 from language_registry import ambiguous_header_paths, language_for_path, paths_for_anti_slop
 from review_ledger import blank_candidate, validate_candidate
 from . import ast_grep_backend, oxlint_backend, python_ast_backend
-from .model import AnalysisTarget, BackendDiagnostic, BackendResult
+from .model import AnalysisTarget, BackendDiagnostic, BackendResult, LoadedAnalysisTarget, canonical_diagnostic_identity, load_target
 
 
 BACKEND_ORDER = (
@@ -24,18 +24,6 @@ BACKEND_LANGUAGES = {
     "python-ast": ("python",),
     **{key: (value[0],) for key, value in ast_grep_backend.BACKENDS.items()},
 }
-
-
-def _content_hash(path: Path) -> str:
-    limit = 10 * 1024 * 1024
-    try:
-        with path.open("rb") as source_file:
-            data = source_file.read(limit + 1)
-        if len(data) > limit:
-            return ""
-        return hashlib.sha256(data).hexdigest()
-    except OSError:
-        return ""
 
 
 def build_targets(
@@ -71,12 +59,41 @@ def build_targets(
                 physical.relative_to(root)
             except ValueError:
                 continue
-            if not physical.is_file():
-                continue
             language_id = language_for_path(relative)
             language = expected_languages[0] if relative.lower().endswith(".h") else language_id.language_id if language_id is not None and language_id.language_id in expected_languages else expected_languages[0]
-            backend_targets.append(AnalysisTarget(relative, physical, language, source_kind, revision, _content_hash(physical)))
+            backend_targets.append(AnalysisTarget(relative, physical, language, source_kind, revision))
     return tuple(sorted({target.logical_path: target for target in backend_targets}.values(), key=lambda item: (BACKEND_ORDER.index(_backend_for_language(item.language_id)), item.logical_path)))
+
+
+@dataclass(frozen=True)
+class TargetLoadSkip:
+    target: AnalysisTarget
+    reason_code: str
+    detail: str = ""
+
+
+def load_targets(
+    root: Path,
+    targets: Sequence[AnalysisTarget],
+    budget: AnalysisBudget,
+    *,
+    max_file_bytes: int,
+) -> tuple[tuple[LoadedAnalysisTarget, ...], tuple[TargetLoadSkip, ...]]:
+    """Load each source once after claiming the shared analysis budget."""
+    loaded: list[LoadedAnalysisTarget] = []
+    skipped: list[TargetLoadSkip] = []
+    root = root.resolve()
+    terminal_reasons = {"total_timeout", "max_files", "max_total_bytes"}
+    for target in targets:
+        try:
+            loaded.append(load_target(root, target, budget, max_file_bytes=max_file_bytes))
+        except AnalysisBudgetExceeded as error:
+            skipped.append(TargetLoadSkip(target, error.reason_code, error.detail))
+            if error.reason_code in terminal_reasons:
+                break
+        except (OSError, ValueError, TypeError) as error:
+            skipped.append(TargetLoadSkip(target, "read_failure", str(error)))
+    return tuple(loaded), tuple(skipped)
 
 
 def _backend_for_language(language_id: str) -> str:
@@ -100,16 +117,7 @@ def _candidate(diagnostics: Sequence[BackendDiagnostic]) -> dict[str, Any]:
     diagnostic = ordered[0]
     identity = json.dumps({
         "analyser": "anti-slop",
-        "diagnostics": [{
-            "backend": item.backend_id,
-            "rule": item.rule_id,
-            "path": item.path,
-            "source_layer": str(item.metadata.get("source_layer", "working-tree")),
-            "content_sha256": item.metadata.get("content_sha256", ""),
-            "line": item.line,
-            "column": item.column,
-            "discriminator": item.metadata.get("discriminator", ""),
-        } for item in ordered],
+        "diagnostics": [canonical_diagnostic_identity(item) for item in ordered],
     }, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
     candidate = blank_candidate(
@@ -154,8 +162,174 @@ def _empty_result(backend_id: str) -> BackendResult:
     return BackendResult(backend_id, "structural", BACKEND_LANGUAGES[backend_id], "not_applicable", 0, 0, 0, [], None, f"No applicable {', '.join(BACKEND_LANGUAGES[backend_id])} files.")
 
 
+def _run_backend(
+    backend_id: str,
+    root: Path,
+    targets: Sequence[LoadedAnalysisTarget],
+    budget: AnalysisBudget,
+    limits: Mapping[str, int | float],
+    config: Mapping[str, Any],
+    vendor_dir: Path,
+) -> BackendResult:
+    max_files = int(limits["external_command_max_files"])
+    max_argument_bytes = int(limits["external_command_max_argument_bytes"])
+    max_file_bytes = int(limits["anti_slop_max_file_bytes"])
+    if backend_id == "oxlint-js-ts":
+        return oxlint_backend.analyse(
+            root, targets, budget, vendor_dir=vendor_dir,
+            max_files=max_files, max_argument_bytes=max_argument_bytes,
+            max_file_bytes=max_file_bytes,
+        )
+    if backend_id == "python-ast":
+        options = config.get("review_options") if isinstance(config, Mapping) else {}
+        enable_getattr = bool(options.get("anti_slop_python_getattr", False)) if isinstance(options, Mapping) else False
+        return python_ast_backend.analyse(
+            root, targets, budget, max_file_bytes=max_file_bytes, enable_getattr=enable_getattr,
+        )
+    return ast_grep_backend.analyse(
+        root, targets, budget, vendor_dir=vendor_dir,
+        max_files=max_files, max_argument_bytes=max_argument_bytes,
+        threads=int(limits["worker_threads"]), max_file_bytes=max_file_bytes,
+    )
+
+
+def _run_backends(
+    root: Path,
+    targets: Sequence[AnalysisTarget],
+    limits: Mapping[str, int | float],
+    config: Mapping[str, Any],
+    vendor_dir: Path,
+    budget: AnalysisBudget | None = None,
+) -> tuple[list[BackendResult], AnalysisBudget]:
+    by_backend: dict[str, list[AnalysisTarget]] = {backend: [] for backend in BACKEND_ORDER}
+    for target in targets:
+        by_backend[_backend_for_language(target.language_id)].append(target)
+    budget = budget or _budget(dict(limits))
+    loaded_targets, load_skips = load_targets(
+        root, targets, budget, max_file_bytes=int(limits["anti_slop_max_file_bytes"]),
+    )
+    loaded_by_backend: dict[str, list[LoadedAnalysisTarget]] = {backend: [] for backend in BACKEND_ORDER}
+    for target in loaded_targets:
+        loaded_by_backend[_backend_for_language(target.language_id)].append(target)
+    skips_by_backend: dict[str, list[TargetLoadSkip]] = {backend: [] for backend in BACKEND_ORDER}
+    for skip in load_skips:
+        try:
+            skips_by_backend[_backend_for_language(skip.target.language_id)].append(skip)
+        except StopIteration:
+            continue
+    results: list[BackendResult] = []
+    for backend_id in BACKEND_ORDER:
+        raw_targets = tuple(sorted(by_backend[backend_id], key=lambda item: (item.logical_path, item.source_kind, item.content_sha256)))
+        backend_targets = tuple(sorted(loaded_by_backend[backend_id], key=lambda item: (item.logical_path, item.source_kind, item.content_sha256)))
+        if not raw_targets:
+            results.append(_empty_result(backend_id))
+            continue
+        if not backend_targets:
+            skip = skips_by_backend[backend_id][0] if skips_by_backend[backend_id] else None
+            results.append(BackendResult(
+                backend_id, "structural", BACKEND_LANGUAGES[backend_id], "unavailable",
+                len(raw_targets), 0, len(raw_targets), [],
+                skip.reason_code if skip else "source_unavailable",
+                skip.detail if skip else "No source file completed structural analysis.",
+            ))
+            continue
+        result = _run_backend(backend_id, root, backend_targets, budget, limits, config, vendor_dir)
+        raw_applicable = len(raw_targets)
+        load_skipped = len(skips_by_backend[backend_id])
+        result.applicable_files = raw_applicable
+        result.skipped_files = min(raw_applicable, result.skipped_files + load_skipped)
+        if load_skipped:
+            first_skip = skips_by_backend[backend_id][0]
+            result.reason_code = result.reason_code or first_skip.reason_code
+            result.reason = result.reason or first_skip.detail
+            if result.status == "complete":
+                result.status = "partial" if result.checked_files else "unavailable"
+        results.append(result)
+    return results, budget
+
+
+def _mark_ambiguous_headers(results: Sequence[BackendResult], paths: Iterable[str | Path]) -> list[str]:
+    ambiguous = list(ambiguous_header_paths(paths))
+    if not ambiguous:
+        return ambiguous
+    for backend_id in ("ast-grep-c", "ast-grep-cpp"):
+        current = next((item for item in results if item.backend_id == backend_id), None)
+        if current is None:
+            continue
+        current.applicable_files += len(ambiguous)
+        current.skipped_files += len(ambiguous)
+        current.status = "partial" if current.checked_files else "unavailable"
+        current.reason_code = "ambiguous_header_language"
+        current.reason = "C/C++ header language is ambiguous in this scope."
+    return ambiguous
+
+
+def _candidate_ledger(
+    results: Sequence[BackendResult],
+    budget: AnalysisBudget,
+) -> list[dict[str, Any]]:
+    groups: dict[str, list[BackendDiagnostic]] = {}
+    for result in results:
+        try:
+            for diagnostic in result.diagnostics:
+                groups.setdefault(canonical_diagnostic_identity(diagnostic), []).append(diagnostic)
+        except Exception as error:
+            result.status = "failed"
+            result.reason_code = "candidate_conversion"
+            result.reason = str(error)
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key in sorted(groups):
+        try:
+            budget.claim_candidate()
+            candidate = _candidate(groups[key])
+            if candidate["id"] in seen:
+                raise ValueError(f"duplicate anti-slop candidate id: {candidate['id']}")
+            seen.add(candidate["id"])
+            candidates.append(candidate)
+        except AnalysisBudgetExceeded as error:
+            for result in results:
+                if result.applicable_files and result.status == "complete":
+                    result.status = "partial" if result.checked_files else "unavailable"
+                    result.reason_code = error.reason_code
+                    result.reason = error.detail
+            break
+        except Exception as error:
+            for result in results:
+                if result.applicable_files:
+                    result.status = "failed"
+                    result.reason_code = "candidate_conversion"
+                    result.reason = str(error)
+            break
+    candidates.sort(key=lambda item: (
+        item["supporting_evidence"][0].get("file", ""),
+        item["supporting_evidence"][0].get("source_layer", ""),
+        item["supporting_evidence"][0].get("line", 0),
+        item["supporting_evidence"][0].get("column", 0),
+        item["source"],
+        item["claim"],
+    ))
+    for index, candidate in enumerate(candidates):
+        locations = {
+            (item.get("file"), item.get("line"), item.get("source_layer", "working-tree"))
+            for item in candidate.get("supporting_evidence", []) if isinstance(item, dict)
+        }
+        related = [
+            other["id"]
+            for other_index, other in enumerate(candidates)
+            if other_index != index
+            and locations & {
+                (item.get("file"), item.get("line"), item.get("source_layer", "working-tree"))
+                for item in other.get("supporting_evidence", []) if isinstance(item, dict)
+            }
+        ]
+        if related:
+            candidate["related_candidate_ids"] = sorted(set(related))
+    return candidates
+
+
 def _validated_targets(root: Path, targets: Iterable[AnalysisTarget], config: dict[str, Any]) -> tuple[AnalysisTarget, ...]:
-    selected: dict[tuple[str, str, str], AnalysisTarget] = {}
+    selected: dict[tuple[str, str, object], AnalysisTarget] = {}
     root_resolved = root.resolve()
     for target in targets:
         logical = Path(target.logical_path)
@@ -181,9 +355,10 @@ def _validated_targets(root: Path, targets: Iterable[AnalysisTarget], config: di
         source_layers = set(target.source_kind.split("+"))
         if not inside_root and not source_layers <= {"commit", "index"}:
             continue
-        if not resolved.is_file():
-            continue
-        key = (relative, target.source_kind, target.content_sha256)
+        # Do not hash supplied source bytes before the shared budget claims
+        # them. The loader calculates the SHA-256 after the claim.
+        identity = target.content_sha256 or target.data or ""
+        key = (relative, target.source_kind, identity)
         selected[key] = replace(target, logical_path=relative, physical_path=resolved)
     return tuple(sorted(selected.values(), key=lambda item: (item.logical_path, item.source_kind, item.content_sha256)))
 
@@ -209,108 +384,18 @@ def analyse(
             if not is_generated_path(root, root / Path(value), config or {})
         )
         target_values = build_targets(root, selected_paths)
-    by_backend: dict[str, list[AnalysisTarget]] = {backend: [] for backend in BACKEND_ORDER}
-    for target in target_values:
-        backend = _backend_for_language(target.language_id)
-        by_backend[backend].append(target)
-
-    results: list[BackendResult] = []
-    anti_budget = _budget(limits)
-    for backend_id in BACKEND_ORDER:
-        backend_targets = tuple(sorted(by_backend[backend_id], key=lambda item: item.logical_path))
-        if not backend_targets:
-            results.append(_empty_result(backend_id))
-            continue
-        if backend_id == "oxlint-js-ts":
-            result = oxlint_backend.analyse(
-                root, backend_targets, anti_budget, vendor_dir=vendor_dir,
-                max_files=int(limits["external_command_max_files"]),
-                max_argument_bytes=int(limits["external_command_max_argument_bytes"]),
-                max_file_bytes=int(limits["anti_slop_max_file_bytes"]),
-            )
-        elif backend_id == "python-ast":
-            result = python_ast_backend.analyse(
-                root, backend_targets, anti_budget,
-                max_file_bytes=int(limits["anti_slop_max_file_bytes"]),
-            )
-        else:
-            result = ast_grep_backend.analyse(
-                root, backend_targets, anti_budget, vendor_dir=vendor_dir,
-                max_files=int(limits["external_command_max_files"]),
-                max_argument_bytes=int(limits["external_command_max_argument_bytes"]),
-                threads=int(limits["worker_threads"]),
-                max_file_bytes=int(limits["anti_slop_max_file_bytes"]),
-            )
-        results.append(result)
-
+    anti_budget = _budget(dict(limits))
+    target_values = oxlint_backend.enrich_targets(
+        root,
+        target_values,
+        max_file_bytes=int(limits["anti_slop_max_file_bytes"]),
+        budget=anti_budget,
+    )
+    results, anti_budget = _run_backends(root, target_values, limits, config or {}, vendor_dir, anti_budget)
     ambiguous_scope = ambiguous_paths if ambiguous_paths is not None else selected_paths
-    ambiguous = list(ambiguous_header_paths(ambiguous_scope))
-    if ambiguous:
-        for backend_id in ("ast-grep-c", "ast-grep-cpp"):
-            current = next((item for item in results if item.backend_id == backend_id), None)
-            if current is None:
-                continue
-            current.applicable_files += len(ambiguous)
-            current.skipped_files += len(ambiguous)
-            current.status = "partial" if current.checked_files else "unavailable"
-            current.reason_code = "ambiguous_header_language"
-            current.reason = "C/C++ header language is ambiguous in this scope."
-
-    candidates: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    diagnostic_groups: dict[tuple[str, str, int], list[BackendDiagnostic]] = {}
-    normalised_results: list[BackendResult] = []
-    for result in results:
-        try:
-            for diagnostic in result.diagnostics:
-                metadata = dict(diagnostic.metadata)
-                nested_metadata = metadata.get("metadata")
-                contract = str(
-                    metadata.get("contract")
-                    or (nested_metadata.get("contract") if isinstance(nested_metadata, dict) else "")
-                    or diagnostic.rule_id
-                )
-                diagnostic_groups.setdefault((contract, diagnostic.path, diagnostic.line), []).append(diagnostic)
-        except Exception as error:
-            result.status = "failed"
-            result.reason_code = "candidate_conversion"
-            result.reason = str(error)
-        normalised_results.append(result)
-
-    candidate_budget_error: AnalysisBudgetExceeded | None = None
-    for group_key in sorted(diagnostic_groups):
-        try:
-            anti_budget.claim_candidate()
-            candidate = _candidate(diagnostic_groups[group_key])
-            if candidate["id"] in seen_ids:
-                raise ValueError(f"duplicate anti-slop candidate id: {candidate['id']}")
-            seen_ids.add(candidate["id"])
-            candidates.append(candidate)
-        except AnalysisBudgetExceeded as error:
-            candidate_budget_error = error
-            break
-        except Exception as error:
-            for result in normalised_results:
-                if result.applicable_files:
-                    result.status = "failed"
-                    result.reason_code = "candidate_conversion"
-                    result.reason = str(error)
-            break
-    if candidate_budget_error is not None:
-        for result in normalised_results:
-            if result.applicable_files and result.status == "complete":
-                result.status = "partial" if result.checked_files else "unavailable"
-                result.reason_code = candidate_budget_error.reason_code
-                result.reason = candidate_budget_error.detail
-
-    candidates.sort(key=lambda item: (
-        item["supporting_evidence"][0].get("file", ""),
-        item["supporting_evidence"][0].get("source_layer", ""),
-        item["supporting_evidence"][0].get("line", 0),
-        item["supporting_evidence"][0].get("column", 0),
-        item["source"],
-        item["claim"],
-    ))
+    ambiguous = _mark_ambiguous_headers(results, ambiguous_scope)
+    candidates = _candidate_ledger(results, anti_budget)
+    normalised_results = results
     applicable = sum(result.applicable_files for result in normalised_results)
     incomplete = any(result.applicable_files and result.status != "complete" for result in normalised_results)
     state = "Not applicable" if applicable == 0 else "Not verified" if incomplete else "Checked"

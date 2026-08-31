@@ -13,12 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded, analysis_limits  # noqa: E402
-from build_review_context import _diff_optional_targets, _terminate_process_group  # noqa: E402
+from build_review_context import _diff_optional_targets, _terminate_process_group, main  # noqa: E402
 from dissect_checks import comment_slop  # noqa: E402
 from dissect_checks.anti_slop import orchestrator  # noqa: E402
 from dissect_checks.anti_slop.chunking import CommandChunkError, iter_command_chunks  # noqa: E402
 from dissect_checks.anti_slop.ast_grep_backend import _matches_to_diagnostics  # noqa: E402
-from dissect_checks.anti_slop.model import AnalysisTarget, BackendResult  # noqa: E402
+from dissect_checks.anti_slop.model import AnalysisTarget, BackendDiagnostic, BackendResult, canonical_diagnostic_identity  # noqa: E402
 from dissect_checks.anti_slop.python_ast_backend import analyse as analyse_python  # noqa: E402
 from dissect_checks.anti_slop.rules import owner_for  # noqa: E402
 from diff_file_list import DiffEntry, changed_entries  # noqa: E402
@@ -30,6 +30,7 @@ from language_registry import (  # noqa: E402
     paths_for_anti_slop,
 )
 from validate_review_context import validate  # noqa: E402
+from validate_rule_effectiveness import validate_rule_ownership  # noqa: E402
 
 
 class AnalysisContractTests(unittest.TestCase):
@@ -150,7 +151,7 @@ class AnalysisContractTests(unittest.TestCase):
             result = analyse_python(root, targets, AnalysisBudget(1))
             rules = {diagnostic.rule_id for diagnostic in result.diagnostics}
             self.assertIn("anti-slop-python/no-widen-then-cast", rules)
-            self.assertIn("anti-slop-python/no-literal-getattr-without-default", rules)
+            self.assertNotIn("anti-slop-python/no-literal-getattr-without-default", rules)
             self.assertEqual(result.status, "partial")
             self.assertEqual(result.reason_code, "parse_error")
             self.assertEqual(result.checked_files, 2)
@@ -174,7 +175,7 @@ class AnalysisContractTests(unittest.TestCase):
         with self.assertRaises(CommandChunkError):
             list(iter_command_chunks(["a" * 7], max_files=2, max_argument_bytes=6))
 
-    def test_python_ast_rule_corpus_has_three_positives_and_eight_negatives(self) -> None:
+    def test_python_ast_rule_corpus_asserts_exact_case_locations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             casts = root / "casts.py"
@@ -278,11 +279,18 @@ class AnalysisContractTests(unittest.TestCase):
                 for path in paths
             )
             result = analyse_python(root, targets, AnalysisBudget(5))
-            rule_counts = {}
-            for diagnostic in result.diagnostics:
-                rule_counts[diagnostic.rule_id] = rule_counts.get(diagnostic.rule_id, 0) + 1
-            self.assertEqual(rule_counts["anti-slop-python/no-widen-then-cast"], 3)
-            self.assertEqual(rule_counts["anti-slop-python/no-literal-getattr-without-default"], 3)
+            locations = {
+                (diagnostic.rule_id, diagnostic.path, diagnostic.line, diagnostic.column)
+                for diagnostic in result.diagnostics
+            }
+            self.assertEqual(
+                locations,
+                {
+                    ("anti-slop-python/no-widen-then-cast", "casts.py", 7, 11),
+                    ("anti-slop-python/no-widen-then-cast", "casts.py", 10, 11),
+                    ("anti-slop-python/no-widen-then-cast", "casts.py", 14, 15),
+                },
+            )
             self.assertEqual(result.status, "partial")
             self.assertEqual(result.reason_code, "parse_error")
             self.assertEqual(result.checked_files, 4)
@@ -292,9 +300,16 @@ class AnalysisContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             BackendResult("python-ast", "structural", ("python",), "complete", 1, 2, 0)
         context = {
-            "schema_version": "1.1", "mode": "full", "scope": {}, "intent": {},
+            "schema_version": "1.2", "mode": "full", "scope": {}, "intent": {},
             "repository": {}, "behavioural_units": [], "candidates": [], "commands": [],
-            "limitations": [], "coverage": {
+            "limitations": [], "test_evidence": {
+                "status": "complete", "state": "Checked", "artifacts": [], "subjects": [],
+                "relations": [], "changes": [], "static_candidates": [], "matrix": [],
+                "mutations": [], "proof_tests": [],
+            }, "complexity": {
+                "status": "complete", "backend_id": "lizard-fallback", "functions": [],
+                "candidates": [], "policy": {},
+            }, "coverage": {
                 "anti-slop": {"state": "Checked", "reason": "ok", "backends": {
                     "python-ast": {
                         "state": "Checked", "level": "structural", "languages": ["python"],
@@ -325,6 +340,11 @@ class AnalysisContractTests(unittest.TestCase):
             match = {"file": "main.go", "ruleId": "no-interface-round-trip", "range": {"start": {"line": 1, "column": 4}}}
             diagnostics = _matches_to_diagnostics([match], root, [target], "anti-slop-go")
             self.assertEqual((diagnostics[0].line, diagnostics[0].column), (2, 4))
+
+    def test_same_line_different_columns_keep_distinct_evidence(self) -> None:
+        first = BackendDiagnostic("backend", "python", "rule", "app.py", 4, 2, "same", {"source_layer": "index", "content_sha256": "a" * 64, "rule_discriminator": "left"})
+        second = BackendDiagnostic("backend", "python", "rule", "app.py", 4, 9, "same", {"source_layer": "index", "content_sha256": "a" * 64, "rule_discriminator": "right"})
+        self.assertNotEqual(canonical_diagnostic_identity(first), canonical_diagnostic_identity(second))
 
     def test_optional_analyser_targets_preserve_diff_source_layers(self) -> None:
         violation = (
@@ -405,7 +425,7 @@ class AnalysisContractTests(unittest.TestCase):
             entries = changed_entries(root, f"{base}...HEAD")
             result, layers, _physical, _outside_snapshot = evidence(root, "committed.py", entries, base)
             self.assertEqual(result["state"], "Checked")
-            self.assertEqual(layers, ("commit+working-tree",))
+            self.assertEqual(layers, ("commit", "working-tree"))
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -432,14 +452,24 @@ class AnalysisContractTests(unittest.TestCase):
                 DiffEntry("M", "same.py", "same.py", True, "working-tree"),
             ]
             with _diff_optional_targets(root, ["same.py"], identical_entries, "", {}) as snapshot:
-                self.assertEqual(len(snapshot.anti_targets), 1)
-                self.assertEqual(snapshot.anti_targets[0].source_kind, "index+working-tree")
+                self.assertEqual(len(snapshot.anti_targets), 2)
+                self.assertEqual(
+                    {target.source_kind for target in snapshot.anti_targets},
+                    {"index", "working-tree"},
+                )
                 result = orchestrator.analyse(root, targets=snapshot.anti_targets, config={})
             self.assertEqual(result["state"], "Checked")
-            self.assertEqual(len(result["candidates"]), 1)
             self.assertEqual(
-                result["candidates"][0]["supporting_evidence"][0]["source_layer"],
-                "index+working-tree",
+                len(result["candidates"]),
+                2,
+            )
+            self.assertEqual(
+                {
+                    evidence["source_layer"]
+                    for candidate in result["candidates"]
+                    for evidence in candidate["supporting_evidence"]
+                },
+                {"index", "working-tree"},
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -453,6 +483,10 @@ class AnalysisContractTests(unittest.TestCase):
             source.write_text("value = getattr(source, 'name')\n")
             with _diff_optional_targets(root, ["different.py"], changed_entries(root), "", {}) as snapshot:
                 self.assertEqual(len(snapshot.anti_targets), 2)
+                self.assertEqual(
+                    {target.source_kind for target in snapshot.anti_targets},
+                    {"index", "working-tree"},
+                )
                 result = orchestrator.analyse(root, targets=snapshot.anti_targets, config={})
             self.assertEqual(result["state"], "Checked")
             evidence_layers = {
@@ -460,13 +494,10 @@ class AnalysisContractTests(unittest.TestCase):
                 for candidate in result["candidates"]
                 for evidence_item in candidate["supporting_evidence"]
             }
-            self.assertEqual(evidence_layers, {"index", "working-tree"})
+            self.assertEqual(evidence_layers, {"index"})
             self.assertEqual(
                 {candidate["source"] for candidate in result["candidates"]},
-                {
-                    "anti-slop-python/no-widen-then-cast",
-                    "anti-slop-python/no-literal-getattr-without-default",
-                },
+                {"anti-slop-python/no-widen-then-cast"},
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -481,7 +512,7 @@ class AnalysisContractTests(unittest.TestCase):
             entries = changed_entries(root, f"{base}...HEAD")
             result, layers, _physical, _outside_snapshot = evidence(root, "new.py", entries, base)
             self.assertEqual(result["state"], "Checked")
-            self.assertEqual(layers, ("commit+working-tree",))
+            self.assertEqual(layers, ("commit", "working-tree"))
             self.assertEqual(result["candidates"][0]["trigger_path"], ["new.py:2"])
 
         with tempfile.TemporaryDirectory() as directory:
@@ -545,7 +576,24 @@ class AnalysisContractTests(unittest.TestCase):
             self.assertIn("context construction exceeded", result.stderr)
             self.assertEqual(output.read_text(), "previous context\n")
 
-    def test_rule_ownership_is_unique_for_all_ast_rule_files(self) -> None:
+    def test_context_cli_has_no_mock_type_control_path(self) -> None:
+        source = (ROOT / "scripts" / "build_review_context.py").read_text(encoding="utf-8")
+        self.assertNotIn("types.FunctionType", source)
+        self.assertNotIn("threading.Thread", source)
+
+    def test_context_cli_rejects_success_without_worker_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "build_review_context._worker_arguments",
+            return_value=[sys.executable, "-c", "pass"],
+        ), patch.object(
+            sys,
+            "argv",
+            ["build_review_context.py", "--mode", "full", "--timeout", "2", "--output", str(Path(directory) / "context.json")],
+        ):
+            self.assertEqual(main(), 1)
+            self.assertFalse((Path(directory) / "context.json").exists())
+
+    def test_rule_ownership_is_unique_for_all_backend_contracts(self) -> None:
         rule_ids: list[str] = []
         for path in (ROOT / "scripts" / "vendor" / "anti-slop" / "ast-grep" / "rules").rglob("*.yml"):
             first = path.read_text(encoding="utf-8").splitlines()[0]
@@ -554,6 +602,7 @@ class AnalysisContractTests(unittest.TestCase):
             rule_ids.append(rule_id)
             self.assertEqual(owner_for(rule_id), "ast-grep-" + path.parent.name)
         self.assertEqual(len(rule_ids), len(set(rule_ids)))
+        self.assertEqual(validate_rule_ownership(ROOT), [])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,8 @@ _ORIGINAL_SUBPROCESS_RUN = subprocess.run
 PLAN_SCHEMA_VERSION = 3
 APPROVAL_DOMAIN = b"dissect-execution-plan-v3\0"
 _ENV_NAME = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")
+_BINDING_NAME = _ENV_NAME | {"-", "."}
+_BINDING_START = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
 
 
 def _sha256_file(path: Path) -> str:
@@ -42,6 +45,28 @@ def _sha256_handle(fd: int) -> str:
 
 def _valid_environment_name(name: str) -> bool:
     return bool(name) and name[0] not in "0123456789" and all(char in _ENV_NAME for char in name)
+
+
+def _normalise_bindings(bindings: Mapping[str, str] | tuple[tuple[str, str], ...] | None) -> tuple[tuple[str, str], ...]:
+    """Validate the execution facts included in an approval digest."""
+    if bindings is None:
+        return ()
+    items = list(bindings.items()) if isinstance(bindings, Mapping) else list(bindings)
+    output: list[tuple[str, str]] = []
+    names: set[str] = set()
+    for item in items:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("execution-plan bindings must contain name/value pairs")
+        name, value = item
+        if not isinstance(name, str) or not name or name[0] not in _BINDING_START or not all(char in _BINDING_NAME for char in name):
+            raise ValueError("execution-plan binding names are invalid")
+        if not isinstance(value, str) or len(value) > 1024 * 1024:
+            raise ValueError("execution-plan binding values must be bounded strings")
+        if name in names:
+            raise ValueError("execution-plan binding names must be unique")
+        names.add(name)
+        output.append((name, value))
+    return tuple(sorted(output))
 
 
 def canonical_environment(configured: Mapping[str, str] | None = None) -> tuple[tuple[str, str], ...]:
@@ -167,6 +192,9 @@ class ExecutionPlan:
     interpreter_arguments: tuple[str, ...] = ()
     interpreter_environment_options: tuple[str, ...] = ()
     shell_semantics: str = ""
+    timeout_seconds: float = 300.0
+    output_limit: int = 64 * 1024
+    bindings: tuple[tuple[str, str], ...] = ()
 
     @property
     def environment_dict(self) -> dict[str, str]:
@@ -189,6 +217,9 @@ class ExecutionPlan:
             "interpreter_arguments": list(self.interpreter_arguments),
             "interpreter_environment_options": list(self.interpreter_environment_options),
             "shell_semantics": self.shell_semantics,
+            "timeout_seconds": self.timeout_seconds,
+            "output_limit": self.output_limit,
+            "bindings": [{"name": key, "value": value} for key, value in self.bindings],
         }
 
     @property
@@ -212,11 +243,16 @@ class ExecutionPlan:
         return payload
 
 
-def build_execution_plan(*, kind: str, name: str, argv: list[str] | tuple[str, ...], working_directory: Path, finding_exit_codes: set[int] | tuple[int, ...] = (), environment: Mapping[str, str] | None = None) -> tuple[ExecutionPlan | None, str | None]:
+def build_execution_plan(*, kind: str, name: str, argv: list[str] | tuple[str, ...], working_directory: Path, finding_exit_codes: set[int] | tuple[int, ...] = (), environment: Mapping[str, str] | None = None, timeout_seconds: float = 300.0, output_limit: int = 64 * 1024, bindings: Mapping[str, str] | tuple[tuple[str, str], ...] | None = None) -> tuple[ExecutionPlan | None, str | None]:
     if not argv or not all(isinstance(value, str) and value for value in argv):
         return None, "execution plan requires a non-empty string argv array"
+    if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
+        return None, "execution plan timeout must be greater than zero"
+    if isinstance(output_limit, bool) or not isinstance(output_limit, int) or output_limit <= 0:
+        return None, "execution plan output limit must be greater than zero"
     try:
         approved_environment = canonical_environment(environment)
+        approved_bindings = _normalise_bindings(bindings)
         env = dict(approved_environment)
         resolved = _resolve_executable(argv[0], env)
         if resolved is None:
@@ -248,6 +284,9 @@ def build_execution_plan(*, kind: str, name: str, argv: list[str] | tuple[str, .
         interpreter_arguments=interpreter.arguments if interpreter else (),
         interpreter_environment_options=interpreter.environment_options if interpreter else (),
         shell_semantics=shell_semantics,
+        timeout_seconds=float(timeout_seconds),
+        output_limit=output_limit,
+        bindings=approved_bindings,
     )
     return plan, None
 
@@ -289,6 +328,26 @@ def _copy_snapshot(source_fd: int, directory: Path, name: str) -> tuple[Path, in
     return path, read_fd
 
 
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        try:
+            process.terminate()
+        except (OSError, ProcessLookupError):
+            return
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+
+
 def _run_snapshot(plan: ExecutionPlan, executable_snapshot: Path, interpreter_snapshot: Path | None) -> subprocess.CompletedProcess[str]:
     if interpreter_snapshot is not None:
         command = [str(interpreter_snapshot), *plan.interpreter_arguments, str(executable_snapshot), *plan.argv[1:]]
@@ -314,7 +373,29 @@ def _run_snapshot(plan: ExecutionPlan, executable_snapshot: Path, interpreter_sn
             index += 1
         else:
             index += 1
-    return subprocess.run(command, executable=executable, shell=False, cwd=plan.working_directory, env=runtime_environment, text=True, capture_output=True, check=False)
+    process = subprocess.Popen(
+        command,
+        executable=executable,
+        shell=False,
+        cwd=plan.working_directory,
+        env=runtime_environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=plan.timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        _terminate_process_group(process)
+        stdout, stderr = process.communicate()
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            (stdout or error.stdout or "")[:plan.output_limit],
+            ((stderr or error.stderr or "") + "execution timed out")[:plan.output_limit],
+        )
+    return subprocess.CompletedProcess(command, process.returncode, (stdout or "")[:plan.output_limit], (stderr or "")[:plan.output_limit])
 
 
 _ORIGINAL_RUN_SNAPSHOT = _run_snapshot

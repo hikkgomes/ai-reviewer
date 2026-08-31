@@ -161,6 +161,36 @@ reported as semantic findings.
   prototype/preview production use, and unapproved agent publishing.
 - Report supported organisational risks separately from vulnerabilities.
 
+## GOV-TESTS — Test integrity and regression evidence
+
+- Layers: 1, 2, 5, 6
+- Inventory tests, fixtures, snapshots, helpers, CI commands, test configuration,
+  production subjects, and the relations between them. Preserve source-layer
+  and content-hash identity for every artifact and subject.
+- Check disabled or bypassed tests, weakened assertions, circular or symmetric
+  oracles, focal-subject mocking, tautologies, catch-all assertions, test-only
+  production markers, and missing test oracles. Structural matches are
+  candidates until the affected contract is verified.
+- Require explicit base-code/base-tests, base-code/head-tests,
+  head-code/base-tests, and head-code/head-tests evidence when runtime tests are
+  applicable. Bind approved execution to exact repository, patch, selector,
+  environment, timeout, and output-limit evidence.
+- Use mutation and proof-test evidence only within the configured budgets. A
+  test passing is evidence of execution, not proof that the test is meaningful.
+
+## COR-COMPLEXITY — Complexity and maintainability
+
+- Layers: 2, 5, 6
+- Measure changed or full-scope functions with a bounded AST or pinned Lizard
+  fallback, using repository-configured thresholds where they exist.
+- Report absolute complexity above the effective threshold, increases above the
+  configured delta, and newly introduced functions above the configured lower
+  bound. Include function identity, source-layer, content hash, line span,
+  metric, threshold, and measurement backend.
+- Keep test and fixture code separate from production code. Missing language
+  tooling, unreadable files, ambiguous source mapping, and exhausted budgets are
+  Not verified or partial evidence, not proof of a complexity finding.
+
 ## ABUSE-BRAND — Phishing and brand impersonation
 
 - Layers: 1, 4, 5

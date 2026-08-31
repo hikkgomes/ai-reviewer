@@ -19,8 +19,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
-import types
 from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +31,9 @@ from dissect_checks import comment_slop  # noqa: E402
 from dissect_checks.redaction import redact_sensitive_text  # noqa: E402
 from dissect_checks.anti_slop import orchestrator as anti_slop_orchestrator  # noqa: E402
 from dissect_checks.anti_slop.model import AnalysisTarget  # noqa: E402
+from dissect_checks.test_integrity import orchestrator as test_integrity_orchestrator  # noqa: E402
+from dissect_checks.complexity import orchestrator as complexity_orchestrator  # noqa: E402
+from review_ledger import blank_candidate, validate_candidate  # noqa: E402
 from file_paths import is_generated_path, is_ignored_path, iter_files  # noqa: E402
 from language_registry import ambiguous_header_paths, LANGUAGE_SPECS, detect_languages, language_for_path, paths_for_anti_slop, paths_for_comment_analysis  # noqa: E402
 from validate_review_context import validate as validate_context  # noqa: E402
@@ -297,35 +298,6 @@ def changed_line_ranges(
     return ranges if git_succeeded else None
 
 
-def _comment_density(
-    paths: list[str],
-    ranges_by_path: dict[str, list[tuple[int, int]] | None],
-    text_by_path: dict[str, str | bytes],
-) -> float:
-    changed_lines = sum(
-        end - start + 1
-        for ranges in ranges_by_path.values()
-        if ranges
-        for start, end in ranges
-    )
-    comment_lines = 0
-    for path in paths:
-        ranges = ranges_by_path.get(path)
-        if not ranges:
-            continue
-        text = text_by_path.get(path)
-        if text is None:
-            continue
-        comments = comment_slop.extract_comments(path, text)
-        comment_lines += sum(
-            1 for comment in comments
-            if any(comment.line <= end and comment.end_line >= start for start, end in ranges)
-        )
-    if changed_lines == 0:
-        return 0.0
-    return comment_lines / changed_lines
-
-
 def detected_repository(root: Path) -> dict[str, Any]:
     try:
         result = subprocess.run([sys.executable, str(ROOT / "scripts" / "detect_commands.py")], cwd=root, text=True, capture_output=True, check=False)
@@ -437,12 +409,63 @@ def candidates(root: Path, entries: list[DiffEntry], paths: list[str]) -> tuple[
     return output, list(report.coverage_errors)
 
 
+def _complexity_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for item in payload.get("candidates", []):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        path = str(function.get("logical_path", ""))
+        line = int(function.get("start_line", 1) or 1)
+        reason_code = str(item.get("reason_code", "complexity_candidate"))
+        head = function.get("cyclomatic", item.get("head_complexity", "unknown"))
+        candidate = blank_candidate(
+            str(item.get("candidate_id", "")),
+            source="COR-COMPLEXITY",
+            claim=f"{function.get('qualified_name', '<unknown>')} has complexity {head} ({reason_code}).",
+            contract="Review branch cohesion, failure paths, state transitions, and testability before treating complexity as a defect.",
+        )
+        candidate["trigger_path"] = [f"{path}:{line}"]
+        candidate["supporting_evidence"] = [{
+            "kind": "complexity",
+            "file": path,
+            "line": line,
+            "source_layer": function.get("source_layer", "working-tree"),
+            "content_sha256": function.get("content_sha256", ""),
+            "qualified_name": function.get("qualified_name", ""),
+            "function_id": function.get("function_id", ""),
+            "reason_code": reason_code,
+            "threshold": item.get("threshold"),
+            "threshold_source": item.get("threshold_source"),
+            "base_complexity": item.get("base_complexity"),
+            "head_complexity": item.get("head_complexity"),
+            "delta": item.get("delta"),
+            "changed_lines": item.get("changed_lines", []),
+            "is_test": function.get("is_test", False),
+            "analysis_level": "structural",
+            "does_not_prove": ["automatic defect", "poor design", "missing test", "unsafe behaviour"],
+        }]
+        if not validate_candidate(candidate):
+            output.append(candidate)
+    return output
+
+
+def _head_source_layer(mode: str, entries: list[DiffEntry]) -> str:
+    if mode != "diff":
+        return "working-tree"
+    layers = {entry.source_kind for entry in entries if not entry.status.startswith("D")}
+    for layer in ("working-tree", "untracked", "index", "commit"):
+        if layer in layers:
+            return layer
+    return "working-tree"
+
+
 @dataclass
 class _SnapshotRecord:
     logical_path: str
     data: bytes
-    source_kinds: set[str]
-    revisions: set[str]
+    source_kind: str
+    revision: str
     changed_ranges: set[tuple[int, int]]
     has_range_evidence: bool = False
 
@@ -456,6 +479,181 @@ class _OptionalTargets:
     ambiguous_paths: tuple[str, ...]
 
 
+def _materialise_optional_records(
+    root: Path,
+    records: Iterable[_SnapshotRecord],
+    source_entries: list[DiffEntry],
+    anti_language_by_path: dict[str, str],
+    manifest_cache: dict[tuple[str, str, str, str], tuple[str, str, str, bool] | None],
+    snapshot_root: Path,
+    *,
+    source_limit: int,
+    snapshot_limit: int,
+    snapshot_file_limit: int,
+    skips: list[comment_slop.FileSkip],
+) -> tuple[list[AnalysisTarget], list[AnalysisTarget], dict[str, bytes]]:
+    target_contents: dict[str, bytes] = {}
+    anti_targets: list[AnalysisTarget] = []
+    comment_targets: list[AnalysisTarget] = []
+    materialised_bytes = 0
+    materialised_files = 0
+    ordered_records = sorted(records, key=lambda item: (item.logical_path, hashlib.sha256(item.data).hexdigest()))
+    for index, record in enumerate(ordered_records):
+        if materialised_files >= snapshot_file_limit:
+            skips.append(comment_slop.FileSkip(record.logical_path, "max_files", "source snapshot file budget exhausted"))
+            continue
+        if materialised_bytes + len(record.data) > snapshot_limit:
+            skips.append(comment_slop.FileSkip(record.logical_path, "max_total_bytes", "snapshot tree byte budget exhausted"))
+            continue
+        materialised_bytes += len(record.data)
+        materialised_files += 1
+        current_path = root / record.logical_path
+        use_worktree = record.source_kind in {"working-tree", "untracked"}
+        physical = current_path if use_worktree and current_path.is_file() else _safe_snapshot_destination(snapshot_root, index, record.logical_path)
+        if physical is None:
+            skips.append(comment_slop.FileSkip(record.logical_path, "snapshot_path_invalid", "source snapshot path is invalid"))
+            continue
+        if physical != current_path:
+            try:
+                physical.parent.mkdir(parents=True, exist_ok=True)
+                physical.write_bytes(record.data)
+            except OSError as error:
+                skips.append(comment_slop.FileSkip(record.logical_path, "snapshot_write_failure", str(error)))
+                continue
+        target_contents[physical.as_posix()] = record.data
+        source_layer = record.source_kind
+        revision = record.revision or "WORKTREE"
+        manifest_entry = next(
+            (
+                item for item in source_entries
+                if item.reviewed_path == record.logical_path
+                and item.source_kind == record.source_kind
+                and (item.commit_revision or "") == record.revision
+            ),
+            None,
+        )
+        manifest_path, manifest_source_layer, manifest_sha256, has_effect = (
+            _snapshot_manifest_metadata(root, manifest_entry, record.logical_path, source_limit, manifest_cache)
+            if manifest_entry is not None else ("", "", "", False)
+        )
+        digest = hashlib.sha256(record.data).hexdigest()
+        changed_ranges = tuple(sorted(record.changed_ranges)) if record.has_range_evidence else None
+        if record.logical_path in anti_language_by_path:
+            anti_targets.append(AnalysisTarget(
+                record.logical_path, physical, anti_language_by_path[record.logical_path],
+                source_layer, revision, digest, changed_ranges, record.data,
+                "effect" if has_effect else "generic", manifest_path,
+                manifest_source_layer, manifest_sha256,
+            ))
+        spec = language_for_path(record.logical_path)
+        if spec is not None and spec.comment_style is not None:
+            comment_targets.append(AnalysisTarget(
+                record.logical_path, physical, spec.language_id,
+                source_layer, revision, digest, changed_ranges, record.data,
+            ))
+    return anti_targets, comment_targets, target_contents
+
+
+def _collect_optional_records(
+    root: Path,
+    source_entries: list[DiffEntry],
+    scope_set: set[str],
+    relevant: tuple[str, ...],
+    committed_paths: set[str],
+    base: str,
+    *,
+    source_limit: int,
+    snapshot_limit: int,
+    snapshot_budget: AnalysisBudget,
+    use_fallback_ranges: bool,
+) -> tuple[dict[tuple[str, str, str], _SnapshotRecord], dict[tuple[str, str, str, str], tuple[str, str, str, bool] | None], list[comment_slop.FileSkip]]:
+    records: dict[tuple[str, str, str], _SnapshotRecord] = {}
+    manifest_cache: dict[tuple[str, str, str, str], tuple[str, str, str, bool] | None] = {}
+    skips: list[comment_slop.FileSkip] = []
+    current_cache: dict[str, tuple[bytes | None, str | None]] = {}
+    record_bytes = 0
+    snapshot_keys: set[tuple[str, str, str, str, int | None]] = set()
+    for entry in source_entries:
+        logical = Path(entry.reviewed_path).as_posix()
+        if logical not in scope_set or logical not in relevant:
+            continue
+        if not entry.exists_in_worktree and (entry.source_kind not in {"commit", "index"} or entry.status.startswith("D")):
+            continue
+        if entry.source_kind == "commit" and (not base or logical not in committed_paths):
+            continue
+        blob_path = _safe_relative_path(entry.blob_path or logical)
+        if blob_path is None:
+            skips.append(comment_slop.FileSkip(logical, "snapshot_path_invalid", "source snapshot path is invalid"))
+            continue
+        if blob_path != logical and not entry.status.startswith(("R", "C")):
+            skips.append(comment_slop.FileSkip(logical, "snapshot_path_invalid", "source snapshot path is inconsistent"))
+            continue
+        source_key = (logical, entry.source_kind, entry.commit_revision or "", blob_path, entry.index_stage)
+        unique_source = source_key not in snapshot_keys
+        if unique_source:
+            try:
+                snapshot_budget.claim_file()
+            except AnalysisBudgetExceeded as error:
+                skips.append(comment_slop.FileSkip(logical, error.reason_code, error.detail))
+                if error.reason_code in {"total_timeout", "max_files", "max_total_bytes"}:
+                    break
+                continue
+        source_size = _snapshot_source_size(root, entry)
+        if unique_source and source_size is not None:
+            if source_size > source_limit:
+                skips.append(comment_slop.FileSkip(logical, "max_file_bytes", "source snapshot file exceeds its limit"))
+                continue
+            try:
+                snapshot_budget.claim_bytes(source_size)
+            except AnalysisBudgetExceeded as error:
+                skips.append(comment_slop.FileSkip(logical, error.reason_code, error.detail))
+                if error.reason_code in {"total_timeout", "max_files", "max_total_bytes"}:
+                    break
+                continue
+        if entry.source_kind in {"working-tree", "untracked"} and logical in current_cache:
+            data, error = current_cache[logical]
+        else:
+            data, error = _snapshot_source_bytes(root, entry, source_limit)
+            if entry.source_kind in {"working-tree", "untracked"}:
+                current_cache[logical] = (data, error)
+        if data is None or error is not None:
+            reason_code = "read_failure" if (error or "").startswith("read_failure:") else "snapshot_unavailable"
+            if error and "max_file_bytes" in error:
+                reason_code = "max_file_bytes"
+            skips.append(comment_slop.FileSkip(logical, reason_code, error or "source snapshot unavailable"))
+            continue
+        if source_size is not None and len(data) != source_size:
+            skips.append(comment_slop.FileSkip(logical, "read_failure", "source changed during bounded snapshot read"))
+            continue
+        if unique_source and source_size is None:
+            try:
+                snapshot_budget.claim_bytes(min(len(data), source_limit))
+            except AnalysisBudgetExceeded as error:
+                skips.append(comment_slop.FileSkip(logical, error.reason_code, error.detail))
+                if error.reason_code in {"total_timeout", "max_files", "max_total_bytes"}:
+                    break
+                continue
+        if b"\0" in data[:4096]:
+            skips.append(comment_slop.FileSkip(logical, "binary_source", "NUL byte in bounded source prefix"))
+            continue
+        ranges = changed_line_ranges(root, logical, [], base, "") if use_fallback_ranges and entry.source_kind == "working-tree" else _ranges_for_snapshot(root, entry, base, data)
+        digest = hashlib.sha256(data).hexdigest()
+        key = (logical, entry.source_kind, digest)
+        record = records.get(key)
+        if record is None:
+            if record_bytes + len(data) > snapshot_limit:
+                skips.append(comment_slop.FileSkip(logical, "max_total_bytes", "source snapshot byte budget exhausted"))
+                continue
+            record_bytes += len(data)
+            record = _SnapshotRecord(logical, data, entry.source_kind, entry.commit_revision or "", set())
+            records[key] = record
+            snapshot_keys.add(source_key)
+        if ranges is not None:
+            record.has_range_evidence = True
+            record.changed_ranges.update(ranges)
+    return records, manifest_cache, skips
+
+
 def _bounded_file_bytes(path: Path, limit: int) -> tuple[bytes | None, str | None]:
     """Read a current source file at most one byte past its configured limit."""
     try:
@@ -467,9 +665,13 @@ def _bounded_file_bytes(path: Path, limit: int) -> tuple[bytes | None, str | Non
             # Python source may declare an encoding other than UTF-8.  Keep
             # the bytes intact so the AST and comment tokenisers can honour it.
             with path.open("rb") as source_file:
-                value = source_file.read(limit + 1)
+                value = source_file.read(limit)
         else:
-            value = read_full(path, limit)
+            try:
+                with path.open("rb") as source_file:
+                    value = source_file.read(limit)
+            except OSError as error:
+                raise SourceReadError(str(error)) from error
     except (OSError, SourceReadError, UnicodeError) as error:
         return None, f"read_failure: {error}"
     if isinstance(value, str):
@@ -559,6 +761,95 @@ def _snapshot_source_bytes(root: Path, entry: DiffEntry, limit: int) -> tuple[by
     return _bounded_git_blob(root, f"{revision}:{blob_path}", limit)
 
 
+def _snapshot_source_size(root: Path, entry: DiffEntry) -> int | None:
+    """Return source size from metadata without reading the source bytes."""
+    logical = _safe_relative_path(entry.reviewed_path)
+    if logical is None:
+        return None
+    if entry.source_kind in {"working-tree", "untracked"}:
+        try:
+            return (root / logical).stat().st_size
+        except OSError:
+            return None
+    blob_path = _safe_relative_path(entry.blob_path or logical)
+    if blob_path is None:
+        return None
+    if entry.source_kind == "index":
+        stage = entry.index_stage if entry.index_stage is not None else 0
+        reference = f":{stage}:{blob_path}"
+    else:
+        reference = f"{entry.commit_revision or 'HEAD'}:{blob_path}"
+    try:
+        result = subprocess.run(
+            ["git", "cat-file", "-s", reference],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _effect_manifest(data: bytes) -> bool:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    return any(
+        isinstance(value.get(section), dict) and "effect" in value[section]
+        for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+    )
+
+
+def _snapshot_manifest_metadata(
+    root: Path,
+    entry: DiffEntry,
+    logical_path: str,
+    limit: int,
+    cache: dict[tuple[str, str, str, str], tuple[str, str, str, bool] | None],
+) -> tuple[str, str, str, bool]:
+    """Resolve the nearest package manifest from the target's source layer."""
+    directory = Path(logical_path).parent
+    revision = entry.commit_revision or "HEAD"
+    layer_key = (entry.source_kind, str(entry.index_stage or 0), revision)
+    while True:
+        manifest_path = (directory / "package.json").as_posix()
+        cache_key = (*layer_key, manifest_path)
+        if cache_key not in cache:
+            if entry.source_kind in {"working-tree", "untracked"}:
+                data, error = _bounded_file_bytes(root / manifest_path, limit)
+            elif entry.source_kind == "index":
+                stage = entry.index_stage if entry.index_stage is not None else 0
+                data, error = _bounded_git_blob(root, f":{stage}:{manifest_path}", limit)
+            else:
+                data, error = _bounded_git_blob(root, f"{revision}:{manifest_path}", limit)
+            if data is None or error is not None:
+                cache[cache_key] = None
+            else:
+                cache[cache_key] = (
+                    manifest_path,
+                    entry.source_kind,
+                    hashlib.sha256(data).hexdigest(),
+                    _effect_manifest(data),
+                )
+        metadata = cache[cache_key]
+        if metadata is not None:
+            return metadata
+        if directory == Path("."):
+            break
+        directory = directory.parent
+    return "", "", "", False
+
+
 def _ranges_for_snapshot(root: Path, entry: DiffEntry, base: str, text: str | bytes) -> list[tuple[int, int]] | None:
     """Return changed lines for the exact source layer represented by entry."""
     if entry.source_kind == "untracked":
@@ -645,6 +936,16 @@ def _diff_optional_targets(
         int(limits["comment_slop_max_files"]) if need_comments else 0,
         1,
     )
+    snapshot_budget = AnalysisBudget(
+        float(max(
+            int(limits["anti_slop_timeout_seconds"]) if need_anti else 0,
+            int(limits["comment_slop_timeout_seconds"]) if need_comments else 0,
+            1,
+        )),
+        snapshot_file_limit,
+        snapshot_limit,
+        None,
+    )
     scope = tuple(
         dict.fromkeys(
             normalised for path in source_scope
@@ -680,112 +981,32 @@ def _diff_optional_targets(
     ]
     source_entries = entries or fallback_entries
     committed_paths = _committed_review_paths(root, base)
-    current_cache: dict[str, tuple[bytes | None, str | None]] = {}
-    records: dict[tuple[str, str], _SnapshotRecord] = {}
-    skips: list[comment_slop.FileSkip] = []
-    record_bytes = 0
-    for entry in source_entries:
-        logical = Path(entry.reviewed_path).as_posix()
-        if logical not in scope_set or logical not in relevant:
-            continue
-        if (
-            not entry.exists_in_worktree
-            and (entry.source_kind not in {"commit", "index"} or entry.status.startswith("D"))
-        ):
-            continue
-        # In a local staged or unstaged review, ``commit`` entries are the
-        # unchanged HEAD side used as a diff baseline.  They are not review
-        # targets.  A non-empty base identifies an explicit commit-range
-        # review, where only paths in that range are reviewed commit content.
-        if entry.source_kind == "commit" and (
-            not base or logical not in committed_paths
-        ):
-            continue
-        blob_path = _safe_relative_path(entry.blob_path or logical)
-        if blob_path is None:
-            skips.append(comment_slop.FileSkip(logical, "snapshot_path_invalid", "source snapshot path is invalid"))
-            continue
-        if blob_path != logical and not entry.status.startswith(("R", "C")):
-            skips.append(comment_slop.FileSkip(logical, "snapshot_path_invalid", "source snapshot path is inconsistent"))
-            continue
-        if entry.source_kind in {"working-tree", "untracked"} and logical in current_cache:
-            data, error = current_cache[logical]
-        else:
-            data, error = _snapshot_source_bytes(root, entry, source_limit)
-            if entry.source_kind in {"working-tree", "untracked"}:
-                current_cache[logical] = (data, error)
-        if data is None:
-            reason_code = "read_failure" if (error or "").startswith("read_failure:") else "snapshot_unavailable"
-            skips.append(comment_slop.FileSkip(logical, reason_code, error or "source snapshot unavailable"))
-            continue
-        if b"\0" in data[:4096]:
-            skips.append(comment_slop.FileSkip(logical, "binary_source", "NUL byte in bounded source prefix"))
-            continue
-        if not entries and entry.source_kind == "working-tree":
-            ranges = changed_line_ranges(root, logical, entries, base, "")
-        else:
-            ranges = _ranges_for_snapshot(root, entry, base, data)
-        digest = hashlib.sha256(data).hexdigest()
-        key = (logical, digest)
-        record = records.get(key)
-        if record is None:
-            if record_bytes + len(data) > snapshot_limit:
-                skips.append(comment_slop.FileSkip(logical, "max_total_bytes", "source snapshot byte budget exhausted"))
-                continue
-            record_bytes += len(data)
-            record = _SnapshotRecord(logical, data, set(), set(), set())
-            records[key] = record
-        record.source_kinds.add(entry.source_kind)
-        if entry.commit_revision:
-            record.revisions.add(entry.commit_revision)
-        if ranges is not None:
-            record.has_range_evidence = True
-            record.changed_ranges.update(ranges)
+    records, manifest_cache, skips = _collect_optional_records(
+        root,
+        source_entries,
+        scope_set,
+        relevant,
+        committed_paths,
+        base,
+        source_limit=source_limit,
+        snapshot_limit=snapshot_limit,
+        snapshot_budget=snapshot_budget,
+        use_fallback_ranges=not entries,
+    )
 
     with tempfile.TemporaryDirectory(prefix="dissect-analysis-") as directory:
-        snapshot_root = Path(directory)
-        target_contents: dict[str, bytes] = {}
-        anti_targets: list[AnalysisTarget] = []
-        comment_targets: list[AnalysisTarget] = []
-        materialised_bytes = 0
-        materialised_files = 0
-        for index, record in enumerate(sorted(records.values(), key=lambda item: (item.logical_path, hashlib.sha256(item.data).hexdigest()))):
-            if materialised_files >= snapshot_file_limit:
-                skips.append(comment_slop.FileSkip(record.logical_path, "max_files", "source snapshot file budget exhausted"))
-                continue
-            if materialised_bytes + len(record.data) > snapshot_limit:
-                skips.append(comment_slop.FileSkip(record.logical_path, "max_total_bytes", "snapshot tree byte budget exhausted"))
-                continue
-            materialised_bytes += len(record.data)
-            materialised_files += 1
-            current_path = root / record.logical_path
-            use_worktree = "working-tree" in record.source_kinds or "untracked" in record.source_kinds
-            physical = current_path if use_worktree and current_path.is_file() else _safe_snapshot_destination(snapshot_root, index, record.logical_path)
-            if physical is None:
-                skips.append(comment_slop.FileSkip(record.logical_path, "snapshot_path_invalid", "source snapshot path is invalid"))
-                continue
-            if physical != current_path:
-                try:
-                    physical.parent.mkdir(parents=True, exist_ok=True)
-                    physical.write_bytes(record.data)
-                except OSError as error:
-                    skips.append(comment_slop.FileSkip(record.logical_path, "snapshot_write_failure", str(error)))
-                    continue
-            target_contents[physical.as_posix()] = record.data
-            source_layer = "+".join(sorted(record.source_kinds))
-            revision = "+".join(sorted(record.revisions)) or "WORKTREE"
-            changed_ranges = tuple(sorted(record.changed_ranges)) if record.has_range_evidence else None
-            if record.logical_path in anti_language_by_path:
-                anti_targets.append(AnalysisTarget(
-                    record.logical_path, physical, anti_language_by_path[record.logical_path],
-                    source_layer, revision, hashlib.sha256(record.data).hexdigest(), changed_ranges,
-                ))
-            spec = language_for_path(record.logical_path)
-            if spec is not None and spec.comment_style is not None:
-                comment_targets.append(AnalysisTarget(
-                    record.logical_path, physical, spec.language_id,
-                    source_layer, revision, hashlib.sha256(record.data).hexdigest(), changed_ranges,
-                ))
+        anti_targets, comment_targets, target_contents = _materialise_optional_records(
+            root,
+            records.values(),
+            source_entries,
+            anti_language_by_path,
+            manifest_cache,
+            Path(directory),
+            source_limit=source_limit,
+            snapshot_limit=snapshot_limit,
+            snapshot_file_limit=snapshot_file_limit,
+            skips=skips,
+        )
         yield _OptionalTargets(
             tuple(sorted(anti_targets, key=lambda item: (item.logical_path, item.source_kind, item.content_sha256))),
             tuple(sorted(comment_targets, key=lambda item: (item.logical_path, item.source_kind, item.content_sha256))),
@@ -793,6 +1014,184 @@ def _diff_optional_targets(
             tuple(skips),
             tuple(sorted(ambiguous_header_paths(relevant))),
         )
+
+
+def _anti_backend_records(anti: dict[str, Any]) -> dict[str, Any]:
+    records: dict[str, Any] = {}
+    for backend_id, record in sorted((anti.get("backends") or {}).items()):
+        status = str(record.get("status", "failed"))
+        state = "Checked" if status == "complete" else "Not applicable" if status == "not_applicable" else "Not verified"
+        records[backend_id] = {
+            "state": state,
+            "level": record.get("level", "structural"),
+            "languages": list(record.get("languages", [])),
+            "applicable_files": max(0, int(record.get("applicable_files", 0))),
+            "checked_files": max(0, int(record.get("checked_files", 0))),
+            "skipped_files": max(0, int(record.get("skipped_files", 0))),
+            "reason": record.get("reason") or record.get("reason_code") or "Completed.",
+        }
+    return records
+
+
+def _anti_slop_evidence(
+    root: Path,
+    source_scope: list[str],
+    config: dict[str, Any],
+    snapshot: _OptionalTargets | None,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], list[dict[str, Any]]]:
+    if not analyser_enabled(config, "anti_slop"):
+        reason = "anti-slop disabled by review_options"
+        return [], [reason], {"anti-slop": {"state": "Not verified", "reason": reason}}, [{"name": "anti-slop", "executed": False, "complete": False, "reason": reason}]
+    try:
+        anti = (
+            anti_slop_orchestrator.analyse(root, targets=snapshot.anti_targets, config=config, ambiguous_paths=snapshot.ambiguous_paths)
+            if snapshot is not None else
+            anti_slop_orchestrator.analyse(
+                root,
+                [path for path in source_scope if not is_generated_path(root, root / path, config)],
+                config=config,
+            )
+        )
+    except Exception as error:
+        anti = {
+            "tool": "anti-slop", "status": "failed", "state": "Not verified",
+            "reason": str(error), "files_scanned": 0, "candidates": [], "backends": {},
+        }
+    values = list(anti.get("candidates", []))
+    backend_records = _anti_backend_records(anti)
+    ambiguous = anti.get("ambiguous_header_paths") or []
+    for backend_id in ("ast-grep-c", "ast-grep-cpp"):
+        record = backend_records.get(backend_id)
+        if record is not None and record["state"] == "Not applicable" and ambiguous:
+            record.update({
+                "state": "Not verified",
+                "applicable_files": len(ambiguous),
+                "skipped_files": len(ambiguous),
+                "reason": "ambiguous_header_language",
+            })
+    state = anti.get("state", "Not verified")
+    reason = anti.get("reason", "Anti-slop analysis did not complete.")
+    limitations: list[str] = []
+    if snapshot is not None:
+        snapshot_skips = [
+            item for item in snapshot.snapshot_skips
+            if (language_for_path(item.path) is not None and language_for_path(item.path).anti_slop_backend is not None)
+            or Path(item.path).suffix.lower() == ".h"
+        ]
+        if snapshot_skips and state in {"Checked", "Not applicable"}:
+            reason = "Not verified — anti-slop source snapshot was incomplete"
+            state = "Not verified"
+            limitations.append(reason)
+    if state == "Not verified":
+        reasons = [
+            str(record.get("reason_code"))
+            for record in (anti.get("backends") or {}).values()
+            if isinstance(record, dict) and record.get("reason_code")
+        ]
+        reason = reason if reason.startswith("Not verified") else f"Not verified — anti-slop pass unavailable ({reasons[0] if reasons else 'analysis_incomplete'})"
+        limitations.append(reason)
+    coverage = {"anti-slop": {"state": state, "reason": reason, "backends": backend_records}}
+    commands = [{"name": "anti-slop", "executed": True, "complete": state in {"Checked", "Not applicable"}, "status": anti.get("status"), "state": state}]
+    return values, limitations, coverage, commands
+
+
+def _comment_scope(
+    root: Path,
+    source_scope: list[str],
+    config: dict[str, Any],
+    snapshot: _OptionalTargets | None,
+) -> tuple[tuple[AnalysisTarget, ...] | None, list[str]]:
+    if snapshot is not None:
+        return snapshot.comment_targets, sorted({target.logical_path for target in snapshot.comment_targets})
+    paths = [
+        path for path in source_scope
+        if path in set(paths_for_comment_analysis(source_scope))
+        and not is_generated_path(root, root / path, config)
+    ]
+    return None, paths
+
+
+def _comment_skip_limitations(skips: Iterable[comment_slop.FileSkip]) -> tuple[list[str], set[str]]:
+    grouped: dict[str, list[str]] = {}
+    for item in skips:
+        grouped.setdefault(item.reason_code, []).append(item.path)
+    limitations: list[str] = []
+    for reason_code, paths in sorted(grouped.items()):
+        for path in paths[:3]:
+            if reason_code == "max_file_bytes":
+                limitations.append(redact_sensitive_text(f"comment-slop: file too large for comment analysis {path}"))
+            elif reason_code == "read_failure":
+                limitations.append(redact_sensitive_text(f"comment-slop: source unreadable for comment analysis {path}"))
+            else:
+                limitations.append(redact_sensitive_text(f"comment-slop: {reason_code} for {path}"))
+        if len(paths) > 3:
+            limitations.append(f"comment-slop: {reason_code} affected {len(paths)} file(s)")
+    return limitations, {item.path for item in skips}
+
+
+def _comment_slop_evidence(
+    root: Path,
+    mode: str,
+    source_scope: list[str],
+    config: dict[str, Any],
+    snapshot: _OptionalTargets | None,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], list[dict[str, Any]]]:
+    if not analyser_enabled(config, "comment_slop"):
+        reason = "comment-slop disabled by review_options"
+        return [], [reason], {"comment-slop": {"state": "Not verified", "reason": reason}}, [{"name": "comment-slop", "executed": False, "complete": False, "reason": reason}]
+    limits = analysis_limits(config)
+    target_values, comment_scope = _comment_scope(root, source_scope, config, snapshot)
+    budget = AnalysisBudget(
+        float(limits["comment_slop_timeout_seconds"]),
+        int(limits["comment_slop_max_files"]),
+        int(limits["comment_slop_max_total_bytes"]),
+        int(limits["comment_slop_max_candidates"]),
+    )
+    try:
+        result = (
+            comment_slop.scan_comment_targets(
+                root, (), mode=mode, diff_density=0.0, budget=budget,
+                max_file_bytes=int(limits["comment_slop_max_file_bytes"]),
+                per_file_timeout=float(limits["comment_slop_per_file_timeout_seconds"]),
+                targets=target_values, target_contents=snapshot.target_contents,
+            )
+            if snapshot is not None else
+            comment_slop.scan_comment_targets(
+                root, comment_scope, mode=mode, changed_ranges=None,
+                diff_density=0.0, budget=budget,
+                max_file_bytes=int(limits["comment_slop_max_file_bytes"]),
+                per_file_timeout=float(limits["comment_slop_per_file_timeout_seconds"]),
+                source_reader=lambda path, limit: _bounded_file_bytes(root / path, limit),
+            )
+        )
+    except Exception as error:
+        reason = redact_sensitive_text(f"Not verified — comment-slop pass unavailable (runner_error: {error})")
+        return [], [reason], {"comment-slop": {"state": "Not verified", "reason": reason}}, [{"name": "comment-slop", "executed": True, "complete": False, "reason": reason}]
+    skips = list(result.skipped_files)
+    if snapshot is not None:
+        skips.extend(item for item in snapshot.snapshot_skips if language_for_path(item.path) is not None and language_for_path(item.path).comment_style is not None)
+    limitations, skipped_paths = _comment_skip_limitations(skips)
+    unevidenced = sorted({
+        target.logical_path for target in snapshot.comment_targets
+        if target.changed_ranges is None and target.logical_path not in skipped_paths
+    }) if snapshot is not None else []
+    limitations.extend(redact_sensitive_text(f"comment-slop: no diff-line evidence for {path}") for path in unevidenced[:3])
+    skipped_count = max(len(skips), int(result.skipped_file_count or 0))
+    incomplete = bool(skipped_count or unevidenced or result.status != "complete")
+    record = {
+        "applicable_files": result.applicable_files,
+        "checked_files": result.checked_files,
+        "skipped_files": skipped_count,
+        "bytes_scanned": result.bytes_scanned,
+        "changed_line_count": result.changed_line_count,
+        "changed_comment_count": result.changed_comment_count,
+        "comment_density": result.comment_density,
+    }
+    state = "Not applicable" if result.status == "not_applicable" and not incomplete else "Not verified" if incomplete else "Checked"
+    reason = "No applicable comment-bearing source files." if state == "Not applicable" else f"Comment analysis skipped {skipped_count + len(unevidenced)} applicable file(s)." if incomplete else "Comment candidates are scoped to the selected source and remain subject to semantic verification."
+    coverage = {"comment-slop": {"state": state, "reason": reason, **record}}
+    commands = [{"name": "comment-slop", "executed": True, "complete": state in {"Checked", "Not applicable"}, "status": result.status}]
+    return list(result.candidates), limitations, coverage, commands
 
 
 def _optional_analyser_evidence_impl(
@@ -804,207 +1203,19 @@ def _optional_analyser_evidence_impl(
     config: dict[str, Any],
     snapshot: _OptionalTargets | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], list[dict[str, Any]]]:
-    """Run optional analysers with separate bounded scopes and budgets."""
-    values: list[dict[str, Any]] = []
-    limitations: list[str] = []
-    coverage: dict[str, Any] = {}
-    commands: list[dict[str, Any]] = []
-
-    if not analyser_enabled(config, "anti_slop"):
-        limitation = "anti-slop disabled by review_options"
-        limitations.append(limitation)
-        coverage["anti-slop"] = {"state": "Not verified", "reason": limitation}
-        commands.append({"name": "anti-slop", "executed": False, "complete": False, "reason": limitation})
-    else:
-        try:
-            if snapshot is not None:
-                anti = anti_slop_orchestrator.analyse(
-                    root,
-                    targets=snapshot.anti_targets,
-                    config=config,
-                    ambiguous_paths=snapshot.ambiguous_paths,
-                )
-            else:
-                anti_paths = [path for path in source_scope if not is_generated_path(root, root / path, config)]
-                anti = anti_slop_orchestrator.analyse(root, anti_paths, config=config)
-        except Exception as error:  # optional tooling must remain non-fatal
-            anti = {
-                "tool": "anti-slop", "status": "failed", "state": "Not verified",
-                "reason": str(error), "files_scanned": 0, "candidates": [], "backends": {},
-            }
-        values.extend(anti.get("candidates", []))
-        backend_records: dict[str, Any] = {}
-        for backend_id, record in sorted((anti.get("backends") or {}).items()):
-            status = str(record.get("status", "failed"))
-            state = "Checked" if status == "complete" else "Not applicable" if status == "not_applicable" else "Not verified"
-            backend_records[backend_id] = {
-                "state": state,
-                "level": record.get("level", "structural"),
-                "languages": list(record.get("languages", [])),
-                "applicable_files": max(0, int(record.get("applicable_files", 0))),
-                "checked_files": max(0, int(record.get("checked_files", 0))),
-                "skipped_files": max(0, int(record.get("skipped_files", 0))),
-                "reason": record.get("reason") or record.get("reason_code") or "Completed.",
-            }
-        if anti.get("ambiguous_header_paths"):
-            for backend_id in ("ast-grep-c", "ast-grep-cpp"):
-                record = backend_records.get(backend_id)
-                if record is not None and record["state"] == "Not applicable":
-                    record.update({
-                        "state": "Not verified", "applicable_files": len(anti["ambiguous_header_paths"]),
-                        "skipped_files": len(anti["ambiguous_header_paths"]),
-                        "reason": "ambiguous_header_language",
-                    })
-        coverage["anti-slop"] = {
-            "state": anti.get("state", "Not verified"),
-            "reason": anti.get("reason", "Anti-slop analysis did not complete."),
-            "backends": backend_records,
-        }
-        anti_snapshot_skips = [
-            item for item in (snapshot.snapshot_skips if snapshot is not None else ())
-            if (language_for_path(item.path) is not None and language_for_path(item.path).anti_slop_backend is not None)
-            or Path(item.path).suffix.lower() == ".h"
-        ]
-        if anti_snapshot_skips and anti.get("state") in {"Checked", "Not applicable"}:
-            reason = "source_snapshot_incomplete"
-            limitation = "Not verified — anti-slop source snapshot was incomplete"
-            limitations.append(limitation)
-            coverage["anti-slop"] = {
-                "state": "Not verified", "reason": limitation, "backends": backend_records,
-            }
-        final_anti_state = coverage["anti-slop"]["state"]
-        commands.append({
-            "name": "anti-slop", "executed": True,
-            "complete": final_anti_state in {"Checked", "Not applicable"},
-            "status": anti.get("status"), "state": final_anti_state,
-        })
-        if anti.get("state") == "Not verified":
-            reasons = [
-                str(record.get("reason_code"))
-                for record in (anti.get("backends") or {}).values()
-                if record.get("reason_code")
-            ]
-            reason = reasons[0] if reasons else "analysis_incomplete"
-            limitation = f"Not verified — anti-slop pass unavailable ({reason})"
-            limitations.append(limitation)
-            coverage["anti-slop"] = {"state": "Not verified", "reason": limitation}
-            coverage["anti-slop"]["backends"] = backend_records
-
-    if not analyser_enabled(config, "comment_slop"):
-        limitation = "comment-slop disabled by review_options"
-        limitations.append(limitation)
-        coverage["comment-slop"] = {"state": "Not verified", "reason": limitation}
-        commands.append({"name": "comment-slop", "executed": False, "complete": False, "reason": limitation})
-        return values, limitations, coverage, commands
-
-    limits = analysis_limits(config)
-    budget = AnalysisBudget(
-        float(limits["comment_slop_timeout_seconds"]),
-        int(limits["comment_slop_max_files"]),
-        int(limits["comment_slop_max_total_bytes"]),
-        int(limits["comment_slop_max_candidates"]),
+    """Compose independent anti-slop and comment-slop evidence passes."""
+    anti_values, anti_limits, anti_coverage, anti_commands = _anti_slop_evidence(
+        root, source_scope, config, snapshot,
     )
-    if snapshot is not None:
-        comment_targets = snapshot.comment_targets
-        comment_scope = sorted({target.logical_path for target in comment_targets})
-        ranges_by_path = {
-            target.logical_path: list(target.changed_ranges) if target.changed_ranges is not None else None
-            for target in comment_targets
-        }
-        text_by_path: dict[str, str | bytes] = {}
-        for target in comment_targets:
-            content = snapshot.target_contents.get(target.physical_path.as_posix())
-            if content is not None:
-                text_by_path.setdefault(target.logical_path, content)
-        pre_skipped: list[comment_slop.FileSkip] = []
-        density = _comment_density(comment_scope, ranges_by_path, text_by_path)
-    else:
-        supported_comment_paths = set(paths_for_comment_analysis(source_scope))
-        comment_scope = [
-            path for path in source_scope
-            if path in supported_comment_paths and not is_generated_path(root, root / path, config)
-        ]
-        ranges_by_path = {}
-        text_by_path: dict[str, str | bytes] = {}
-        pre_skipped: list[comment_slop.FileSkip] = []
-        density = 0.0
-    try:
-        if snapshot is not None:
-            result = comment_slop.scan_comment_targets(
-                root,
-                (),
-                mode=mode,
-                diff_density=density,
-                budget=budget,
-                max_file_bytes=int(limits["comment_slop_max_file_bytes"]),
-                per_file_timeout=float(limits["comment_slop_per_file_timeout_seconds"]),
-                targets=snapshot.comment_targets,
-                target_contents=snapshot.target_contents,
-            )
-        else:
-            result = comment_slop.scan_comment_targets(
-                root,
-                comment_scope,
-                mode=mode,
-                changed_ranges=ranges_by_path if mode == "diff" else None,
-                diff_density=density,
-                budget=budget,
-                max_file_bytes=int(limits["comment_slop_max_file_bytes"]),
-                per_file_timeout=float(limits["comment_slop_per_file_timeout_seconds"]),
-                text_by_path=text_by_path,
-                pre_skipped=pre_skipped,
-                source_reader=lambda path, limit: _bounded_file_bytes(root / path, limit),
-            )
-        values.extend(result.candidates)
-    except Exception as error:  # optional tooling must remain non-fatal
-        limitation = redact_sensitive_text(f"Not verified — comment-slop pass unavailable (runner_error: {error})")
-        limitations.append(limitation)
-        coverage["comment-slop"] = {"state": "Not verified", "reason": limitation}
-        commands.append({"name": "comment-slop", "executed": True, "complete": False, "reason": redact_sensitive_text(str(error))})
-        return values, limitations, coverage, commands
-
-    skipped_by_reason: dict[str, list[str]] = {}
-    all_skips = [*result.skipped_files]
-    if snapshot is not None:
-        all_skips.extend(
-            item for item in snapshot.snapshot_skips
-            if (language_for_path(item.path) is not None and language_for_path(item.path).comment_style is not None)
-        )
-    for skipped in all_skips:
-        skipped_by_reason.setdefault(skipped.reason_code, []).append(skipped.path)
-    for reason_code, skipped_paths in sorted(skipped_by_reason.items()):
-        for path in skipped_paths[:3]:
-            if reason_code == "max_file_bytes":
-                limitations.append(redact_sensitive_text(f"comment-slop: file too large for comment analysis {path}"))
-            elif reason_code == "read_failure":
-                limitations.append(redact_sensitive_text(f"comment-slop: source unreadable for comment analysis {path}"))
-            else:
-                limitations.append(redact_sensitive_text(f"comment-slop: {reason_code} for {path}"))
-        if len(skipped_paths) > 3:
-            limitations.append(f"comment-slop: {reason_code} affected {len(skipped_paths)} file(s)")
-    skipped_paths = {item.path for item in all_skips}
-    if snapshot is not None:
-        unevidenced = sorted({
-            target.logical_path
-            for target in snapshot.comment_targets
-            if target.changed_ranges is None and target.logical_path not in skipped_paths
-        })
-    else:
-        unevidenced = sorted(
-            path for path, ranges in ranges_by_path.items()
-            if ranges is None and path not in skipped_paths
-        )
-    for path in unevidenced[:3]:
-        limitations.append(redact_sensitive_text(f"comment-slop: no diff-line evidence for {path}"))
-    incomplete = bool(all_skips or unevidenced)
-    if result.status == "not_applicable" and not incomplete:
-        coverage["comment-slop"] = {"state": "Not applicable", "reason": "No applicable comment-bearing source files."}
-    elif incomplete:
-        coverage["comment-slop"] = {"state": "Not verified", "reason": f"Comment analysis skipped {len(all_skips) + len(unevidenced)} applicable file(s)."}
-    else:
-        coverage["comment-slop"] = {"state": "Checked", "reason": "Comment candidates are scoped to the selected source and remain subject to semantic verification."}
-    commands.append({"name": "comment-slop", "executed": True, "complete": not incomplete and result.status == "complete", "status": result.status})
-    return values, limitations, coverage, commands
+    comment_values, comment_limits, comment_coverage, comment_commands = _comment_slop_evidence(
+        root, mode, source_scope, config, snapshot,
+    )
+    return (
+        [*anti_values, *comment_values],
+        [*anti_limits, *comment_limits],
+        {**anti_coverage, **comment_coverage},
+        [*anti_commands, *comment_commands],
+    )
 
 
 def optional_analyser_evidence(
@@ -1032,6 +1243,54 @@ def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file:
         root, mode, primary_paths, entries, base, config,
     )
     candidate_values.extend(optional_values)
+    head_revision = git(root, "rev-parse", "HEAD") or "HEAD"
+    source_base_revision = base if mode == "diff" else ""
+    test_integrity_paths = sorted({
+        *semantic_context_paths,
+        *(
+            entry.reviewed_path
+            for entry in entries
+            if _safe_relative_path(entry.reviewed_path) is not None
+        ),
+    })
+    base_contents, head_contents = test_integrity_orchestrator.source_maps(
+        root,
+        entries,
+        test_integrity_paths,
+        base_revision=source_base_revision,
+        head_revision=head_revision,
+    )
+    changed_paths = tuple(sorted({entry.reviewed_path for entry in entries if entry.reviewed_path}))
+    changed_ranges = {
+        path: changed_line_ranges(root, path, entries, base, head_contents.get(path, ""))
+        for path in changed_paths
+        if not Path(path).is_absolute()
+    } if mode == "diff" else None
+    test_integrity = test_integrity_orchestrator.analyse(
+        root,
+        test_integrity_paths,
+        entries=entries,
+        config=config,
+        mode=mode,
+        base_contents=base_contents,
+        head_contents=head_contents,
+        base_revision=source_base_revision,
+        head_revision=head_revision,
+    )
+    complexity = complexity_orchestrator.analyse(
+        root,
+        semantic_context_paths,
+        mode=mode,
+        config=config,
+        base_contents=base_contents,
+        head_contents=head_contents,
+        changed_ranges=changed_ranges,
+        source_kind=_head_source_layer(mode, entries),
+    ) if analyser_enabled(config, "complexity") else complexity_orchestrator.ComplexityResult("partial", (), (), {"disabled": True}, 0, 0, 0, "disabled")
+    test_evidence = test_integrity.as_dict()
+    complexity_evidence = complexity.as_dict()
+    candidate_values.extend(test_evidence.get("static_candidates", []))
+    candidate_values.extend(_complexity_candidates(complexity_evidence))
     instructions = [rel(path, root) for path in iter_files(root) if path.name in INSTRUCTION_NAMES]
     manifests = [path for path in semantic_context_paths if Path(path).name in {"package.json", "pyproject.toml", "go.mod", "Cargo.toml", "composer.json", "pom.xml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}]
     languages = list(detect_languages(semantic_context_paths))
@@ -1055,18 +1314,70 @@ def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file:
         families.append(match.group(1))
     coverage = {family: {"state": "Not verified", "reason": "Deterministic candidates require semantic confirmation."} for family in families}
     coverage.update(analyser_coverage)
+    test_backends = {
+        "static-test-analysis": {
+            "state": "Checked" if test_integrity.static.status == "complete" else "Not applicable" if test_integrity.static.status == "not_applicable" else "Not verified",
+            "level": "structural",
+            "languages": ["python", "javascript", "typescript", "go", "rust", "c", "cpp", "java", "csharp"],
+            "applicable_files": test_integrity.static.applicable_files,
+            "checked_files": test_integrity.static.checked_files,
+            "skipped_files": test_integrity.static.skipped_files,
+            "reason": test_integrity.static.reason_code or "Static test-integrity analysis completed.",
+            "status": test_integrity.static.status,
+        },
+    }
+    if test_integrity.matrix is not None:
+        test_backends["dynamic-test-matrix"] = {
+            "state": "Checked" if test_integrity.matrix.status == "complete" else "Not applicable" if test_integrity.matrix.status == "not_applicable" else "Not verified",
+            "level": "structural", "languages": [], "applicable_files": len(test_integrity.matrix.scenarios),
+            "checked_files": sum(1 for item in test_integrity.matrix.scenarios if item.result.completed),
+            "skipped_files": sum(1 for item in test_integrity.matrix.scenarios if not item.result.completed),
+            "reason": test_integrity.matrix.reason_code or "Dynamic test matrix completed.",
+            "status": test_integrity.matrix.status,
+        }
+    if test_integrity.mutations is not None:
+        test_backends["targeted-mutation"] = {
+            "state": "Checked" if test_integrity.mutations.status == "complete" else "Not applicable" if test_integrity.mutations.status == "not_applicable" else "Not verified",
+            "level": "structural", "languages": [], "applicable_files": len(test_integrity.mutations.results),
+            "checked_files": sum(1 for item in test_integrity.mutations.results if item.build_valid is not None),
+            "skipped_files": sum(1 for item in test_integrity.mutations.results if item.build_valid is None),
+            "reason": test_integrity.mutations.reason_code or "Targeted mutation analysis completed.",
+            "status": test_integrity.mutations.status,
+        }
+    coverage["test-integrity"] = {
+        "state": test_evidence["state"],
+        "reason": test_evidence.get("reason_code") or "Static test-integrity analysis completed; dynamic evidence remains approval-bound.",
+        "backends": test_backends,
+    }
+    complexity_state = "Checked" if complexity.status == "complete" else "Not applicable" if complexity.status == "not_applicable" else "Not verified"
+    coverage["complexity"] = {
+        "state": complexity_state,
+        "reason": complexity.reason_code or "Complexity is a review signal and requires contextual confirmation.",
+        "backends": {
+            complexity.backend_id: {
+                "state": complexity_state, "level": "structural", "languages": sorted(complexity.policy.get("languages", {}).keys()),
+                "applicable_files": complexity.applicable_files, "checked_files": complexity.checked_files,
+                "skipped_files": complexity.skipped_files, "reason": complexity.reason_code or "Completed.", "status": complexity.status,
+            },
+        },
+    }
     commands = [
         {"name": "git evidence collection", "executed": True, "complete": True},
         {"name": "architecture detection", "executed": True, "complete": bool(arch)},
         {"name": "deterministic scanner", "executed": True, "complete": not coverage_errors},
         *analyser_commands,
+        {"name": "test-integrity static analysis", "executed": True, "complete": test_integrity.static.status == "complete"},
+        {"name": "test-integrity dynamic matrix", "executed": False, "complete": False, "reason": "approval required"},
+        {"name": "complexity analysis", "executed": True, "complete": complexity.status == "complete"},
     ]
     return {
-        "schema_version": "1.1", "mode": mode,
+        "schema_version": "1.2", "mode": mode,
         "scope": {"root": str(root), "base": base, "branch": git(root, "branch", "--show-current"), "head": git(root, "rev-parse", "HEAD"), "merge_base": git(root, "merge-base", base, "HEAD") if base else "", "files": semantic_context_paths, "entries": [asdict(entry) for entry in entries]},
         "intent": intent(root, intent_file),
         "repository": {"instructions": instructions, "languages": languages, "frameworks": list(dict.fromkeys([*(arch.get("key_libraries") or {}).get("framework", []), *requested_frameworks])), "framework_packs": loaded_framework_packs(root, arch, semantic_context_paths, requested_frameworks), "package_managers": detected.get("package_managers", []), "test_commands": detected.get("commands", {}), "architecture": arch, "manifests": manifests, "touchpoints": touchpoints},
         "behavioural_units": behavioural_units(root, semantic_context_paths, entries, scope_reasons), "candidates": candidate_values,
+        "test_evidence": test_evidence,
+        "complexity": complexity_evidence,
         "commands": commands,
         "coverage": coverage,
         "limitations": coverage_errors + analyser_limitations + ["Semantic confirmation, falsification, and runtime evidence are performed by the reviewer."],
@@ -1159,7 +1470,7 @@ def _run_supervisor(args: argparse.Namespace) -> int:
         except (OSError, ValueError) as error:
             print(f"context worker produced invalid output: {error}", file=sys.stderr)
             return 1
-        if not isinstance(payload, dict) or payload.get("schema_version") != "1.1":
+        if not isinstance(payload, dict) or payload.get("schema_version") != "1.2":
             print("context worker produced an invalid review context", file=sys.stderr)
             return 1
         validation_errors = validate_context(payload)
@@ -1209,26 +1520,6 @@ def main() -> int:
         except Exception as error:
             print(f"context worker failed: {redact_sensitive_text(str(error))}", file=sys.stderr)
             return 1
-    # Unit callers may replace build with a blocking fixture.  Keep that
-    # narrow in-process test seam without putting a catchable alarm in the
-    # production worker.
-    if not isinstance(build, types.FunctionType):
-        result: list[BaseException] = []
-
-        def invoke() -> None:
-            try:
-                build(args.root.resolve(), args.mode, args.base, args.file_list, args.intent_file, tuple(args.framework))
-            except BaseException as error:  # test seam only
-                result.append(error)
-
-        thread = threading.Thread(target=invoke, daemon=True)
-        thread.start()
-        thread.join(args.timeout)
-        if thread.is_alive():
-            raise TimeoutError(f"review context construction exceeded {_timeout_label(args.timeout)} seconds")
-        if result:
-            raise result[0]
-        return 0
     return _run_supervisor(args)
 
 
