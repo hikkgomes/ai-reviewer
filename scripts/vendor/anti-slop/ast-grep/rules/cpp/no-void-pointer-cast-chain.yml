@@ -1,0 +1,24 @@
+id: anti-slop-cpp/no-void-pointer-cast-chain
+language: Cpp
+message: Nested C++ casts pass through void pointer without visible boundary evidence.
+severity: warning
+metadata:
+  contract: anti-slop-cpp/no-void-pointer-cast-chain
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: medium
+rule:
+  kind: call_expression
+  any:
+    - pattern: static_cast<$TYPE>($INNER)
+      has:
+        any:
+          - pattern: static_cast<void *>($VALUE)
+          - pattern: reinterpret_cast<void *>($VALUE)
+        stopBy: end
+    - pattern: reinterpret_cast<$TYPE>($INNER)
+      has:
+        any:
+          - pattern: static_cast<void *>($VALUE)
+          - pattern: reinterpret_cast<void *>($VALUE)
+        stopBy: end

@@ -1,0 +1,23 @@
+id: anti-slop-java/no-literal-class-reflection
+snapshots:
+  ? |
+    class C { void f() { KnownType.class.getDeclaredField("literalName"); } }
+  : labels:
+    - source: KnownType.class.getDeclaredField("literalName")
+      style: primary
+      start: 21
+      end: 68
+  ? |
+    class C { void f() { KnownType.class.getDeclaredMethod("literalName"); } }
+  : labels:
+    - source: KnownType.class.getDeclaredMethod("literalName")
+      style: primary
+      start: 21
+      end: 69
+  ? |
+    class C { void f() { OtherType.class.getDeclaredMethod("otherName", String.class); } }
+  : labels:
+    - source: OtherType.class.getDeclaredMethod("otherName", String.class)
+      style: primary
+      start: 21
+      end: 81

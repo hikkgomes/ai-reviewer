@@ -21,6 +21,8 @@ CURSOR_ADAPTER = ADAPTERS_ROOT / "cursor-rules.md"
 CURSOR_START = "<!-- DISSECT-START -->"
 CURSOR_END = "<!-- DISSECT-END -->"
 MIN_NODE = (22, 18)
+OXLINT_VERSION = "1.78.0"
+AST_GREP_VERSION = "0.45.2"
 SKILL_ITEMS = [
     "SKILL.md",
     "README.md",
@@ -60,8 +62,8 @@ def command_exists(name: str) -> bool:
 
 def node_version(node: str) -> tuple[int, int, int] | None:
     try:
-        result = subprocess.run([node, "--version"], capture_output=True, text=True, check=False)
-    except OSError:
+        result = subprocess.run([node, "--version"], capture_output=True, text=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     value = result.stdout or result.stderr or ""
     if isinstance(value, bytes):
@@ -73,22 +75,19 @@ def node_version(node: str) -> tuple[int, int, int] | None:
 
 
 def provision_anti_slop(skill_root: Path) -> bool:
-    """Install analyser dependencies in this skill copy, without touching a target checkout."""
+    """Install and verify analyser dependencies in this skill copy."""
     vendor = skill_root / "scripts" / "vendor" / "anti-slop"
     if not vendor.is_dir():
         return False
     node = shutil.which("node")
     npm = shutil.which("npm")
     if node is None:
-        print("Warning: Node.js is unavailable; anti-slop will remain optional.", file=sys.stderr)
-        return False
+        raise RuntimeError("Node.js is unavailable; anti-slop runtime provisioning failed")
     version = node_version(node)
     if version is None or version[:2] < MIN_NODE:
-        print("Warning: Node.js 22.18 or newer is required; anti-slop will remain optional.", file=sys.stderr)
-        return False
+        raise RuntimeError("Node.js 22.18 or newer is required for anti-slop runtime provisioning")
     if npm is None:
-        print("Warning: npm is unavailable; anti-slop will remain optional.", file=sys.stderr)
-        return False
+        raise RuntimeError("npm is unavailable; anti-slop runtime provisioning failed")
     try:
         result = subprocess.run(
             [npm, "ci"],
@@ -98,14 +97,29 @@ def provision_anti_slop(skill_root: Path) -> bool:
             check=False,
         )
     except OSError as error:
-        print(f"Warning: could not provision anti-slop ({error}); continuing without it.", file=sys.stderr)
-        return False
+        raise RuntimeError(f"could not provision anti-slop: {error}") from error
     if result.returncode:
         detail = (result.stderr or result.stdout or "").strip().splitlines()
         suffix = f" {detail[-1]}" if detail else ""
-        print(f"Warning: npm ci for anti-slop failed; continuing without it.{suffix}", file=sys.stderr)
-        return False
+        raise RuntimeError(f"npm ci for anti-slop failed.{suffix}")
+
+    binaries = {
+        "Oxlint": (vendor / "node_modules" / ".bin" / "oxlint", OXLINT_VERSION),
+        "ast-grep": (vendor / "node_modules" / ".bin" / "ast-grep", AST_GREP_VERSION),
+    }
+    for label, (binary, expected) in binaries.items():
+        if not binary.is_file():
+            raise RuntimeError(f"{label} binary was not provisioned at {binary}")
+        try:
+            check = subprocess.run([str(binary), "--version"], capture_output=True, text=True, check=False)
+        except OSError as error:
+            raise RuntimeError(f"could not execute provisioned {label} binary {binary}: {error}") from error
+        reported = f"{check.stdout}\n{check.stderr}"
+        if check.returncode != 0 or expected not in reported:
+            raise RuntimeError(f"provisioned {label} binary reported an unexpected version: {reported.strip()}")
     print(f"Provisioned anti-slop runtime: {vendor}")
+    print(f"  Oxlint: {binaries['Oxlint'][0]}")
+    print(f"  ast-grep: {binaries['ast-grep'][0]}")
     return True
 
 
@@ -364,6 +378,8 @@ def run_install(selected: list[str]) -> None:
             INSTALLERS[key]()
         except PermissionError as exc:
             raise SystemExit(f"Permission denied while installing {key}: {exc}") from exc
+        except RuntimeError as exc:
+            raise SystemExit(f"Could not install {key}: {exc}") from exc
     print("Install complete. Restart installed AI editors to reload skills.")
 
 

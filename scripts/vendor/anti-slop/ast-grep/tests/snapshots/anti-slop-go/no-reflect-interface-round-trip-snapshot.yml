@@ -1,0 +1,29 @@
+id: anti-slop-go/no-reflect-interface-round-trip
+snapshots:
+  ? |
+    package p
+    import "reflect"
+    func f(value any) { _ = reflect.ValueOf(value).Interface().(Other) }
+  : labels:
+    - source: reflect.ValueOf(value).Interface().(Other)
+      style: primary
+      start: 51
+      end: 93
+  ? |
+    package p
+    import "reflect"
+    func f(value any) { _ = reflect.ValueOf(value).Interface().(Result) }
+  : labels:
+    - source: reflect.ValueOf(value).Interface().(Result)
+      style: primary
+      start: 51
+      end: 94
+  ? |
+    package p
+    import "reflect"
+    func f(value any) { _ = reflect.ValueOf(value).Interface().(Target) }
+  : labels:
+    - source: reflect.ValueOf(value).Interface().(Target)
+      style: primary
+      start: 51
+      end: 94

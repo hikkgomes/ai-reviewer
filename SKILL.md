@@ -33,10 +33,18 @@ for full reviews.
 
 ## Deterministic tooling
 
-The optional anti-slop analyser runs only on JavaScript and TypeScript files with
-a skill-local Node runtime. It is a deterministic smell detector: its output is
-ledger candidate evidence, never an automatic finding. Comment-slop detection is
-cross-language and follows the same falsify/verify requirement.
+Optional anti-slop analysis uses skill-local Oxlint for JavaScript and
+TypeScript, Python's standard-library AST, and pinned ast-grep packs for Go,
+Rust, C, C++, Java, and C#. Comment-slop uses the canonical language registry.
+Both are structural candidate generators only. No match is a finding without
+falsification and semantic verification.
+
+No applicable backend is `Not applicable`. Disabled, missing, malformed,
+ambiguous, timed-out, or budget-limited applicable work is `Not verified`.
+Generated files are excluded only by explicit `paths.generated` patterns.
+Unknown `.h` language is reported as `ambiguous_header_language` for the
+affected C/C++ backend. See `reference/anti-slop-rule-contract.md` and
+`reference/review-context-schema.json` for rule and coverage contracts.
 
 ## Setup
 

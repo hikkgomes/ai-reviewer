@@ -1,0 +1,25 @@
+id: anti-slop-csharp/no-object-cast-round-trip
+valid:
+  - |
+      class C { void M(Target value) { Target x = value; } }
+  - |
+      class C { void M(Target value) { object x = value; } }
+  - |
+      class C { void M(object value) { Target x = (Target)value; } }
+  - |
+      class C { void M(Target value) { string x = (string)value; } }
+  - |
+      class C { void M(Target value) { Use(value); } }
+  - |
+      class C { void M(Target value) { object x = (object)value; } }
+  - |
+      class C { void M(Target value) { if (value != null) Use(value); } }
+  - |
+      class C { void M(Target value) { ReturnValue(value); } }
+invalid:
+  - |
+      class C { void M(Target value) { Target x = (Target)(object)value; } }
+  - |
+      class C { void M(Target value) { Other x = (Other)(object)value; } }
+  - |
+      class C { void M(Target value) { Result x = (Result)(dynamic)value; } }

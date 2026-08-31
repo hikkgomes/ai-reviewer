@@ -1,0 +1,12 @@
+id: anti-slop-c/no-void-pointer-round-trip
+language: C
+message: An object pointer is immediately widened through void pointer and narrowed again.
+severity: warning
+metadata:
+  contract: anti-slop-c/no-void-pointer-round-trip
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: medium
+rule:
+  kind: cast_expression
+  pattern: ($TYPE)(void *)$VALUE

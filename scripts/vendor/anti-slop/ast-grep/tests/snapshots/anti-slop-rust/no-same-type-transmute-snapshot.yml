@@ -1,0 +1,23 @@
+id: anti-slop-rust/no-same-type-transmute
+snapshots:
+  ? |
+    fn f(value: T) { let _ = std::mem::transmute::<T, T>(value); }
+  : labels:
+    - source: std::mem::transmute::<T, T>(value)
+      style: primary
+      start: 25
+      end: 59
+  ? |
+    fn f(value: T) { let _ = transmute::<T, T>(value); }
+  : labels:
+    - source: transmute::<T, T>(value)
+      style: primary
+      start: 25
+      end: 49
+  ? |
+    fn f(value: U) { let _ = std::mem::transmute::<U, U>(value); }
+  : labels:
+    - source: std::mem::transmute::<U, U>(value)
+      style: primary
+      start: 25
+      end: 59

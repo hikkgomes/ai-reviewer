@@ -14,6 +14,7 @@ if sys.version_info < (3, 11):
 import tomllib
 
 from file_paths import iter_files as walk_files
+from language_registry import LANGUAGE_SPECS, language_for_path
 
 
 SKIP_DIRS = {
@@ -29,7 +30,7 @@ SKIP_DIRS = {
     "target",
     "__pycache__",
 }
-SOURCE_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".php", ".java", ".kt", ".kts", ".cs"}
+SOURCE_EXTENSIONS = frozenset({suffix for spec in LANGUAGE_SPECS for suffix in spec.suffixes})
 LIBRARY_CATEGORIES = {
     "framework": [
         "react",
@@ -399,14 +400,15 @@ def detect_naming(root: Path, files: list[Path]) -> dict[str, str]:
     for path in files[:80]:
         file_styles[detect_name_style(strip_known_suffixes(path))] += 1
         text = read_text(path)
-        if path.suffix in {".py"}:
+        spec = language_for_path(path)
+        if spec is not None and spec.language_id == "python":
             for match in re.finditer(r"^\s*(?:def|async\s+def)\s+([A-Za-z_][A-Za-z0-9_]*)|^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", text, re.M):
                 name = next(group for group in match.groups() if group)
                 variable_styles[detect_name_style(name)] += 1
-        elif path.suffix in {".js", ".jsx", ".ts", ".tsx"}:
+        elif spec is not None and spec.language_id in {"javascript", "typescript"}:
             for match in re.finditer(r"\b(?:const|let|var|function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)", text):
                 variable_styles[detect_name_style(match.group(1))] += 1
-            if path.suffix in {".jsx", ".tsx"}:
+            if path.suffix.lower() in {".jsx", ".tsx"}:
                 for match in re.finditer(r"(?:export\s+default\s+function|export\s+function|const)\s+([A-Z][A-Za-z0-9]*)", text):
                     component_styles["PascalCase"] += 1
 

@@ -2,6 +2,13 @@
 
 Activate for `.go`.
 
+## Structural anti-slop backend
+
+The optional ast-grep backend reports narrow candidates for immediate
+interface widening followed by type assertion, and for an immediate reflective
+interface round trip. It does not ban `any`, interfaces, reflection, type
+switches, or values that cross a storage or API boundary.
+
 ## Highest-Impact Checks
 
 - Ignored errors via `_`, overwritten errors, or returned nil errors after failure.

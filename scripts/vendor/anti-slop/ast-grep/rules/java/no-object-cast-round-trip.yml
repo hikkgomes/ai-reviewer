@@ -1,0 +1,12 @@
+id: anti-slop-java/no-object-cast-round-trip
+language: Java
+message: A value is immediately widened to Object and narrowed to a target type.
+severity: warning
+metadata:
+  contract: anti-slop-java/no-object-cast-round-trip
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: high
+rule:
+  kind: cast_expression
+  pattern: ($TARGET) (Object) $VALUE

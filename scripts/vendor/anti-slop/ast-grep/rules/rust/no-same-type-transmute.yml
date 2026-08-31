@@ -1,0 +1,14 @@
+id: anti-slop-rust/no-same-type-transmute
+language: Rust
+message: Transmute uses textually identical source and destination types.
+severity: warning
+metadata:
+  contract: anti-slop-rust/no-same-type-transmute
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: high
+rule:
+  kind: call_expression
+  any:
+    - pattern: std::mem::transmute::<$T, $T>($VALUE)
+    - pattern: transmute::<$T, $T>($VALUE)

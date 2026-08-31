@@ -65,7 +65,11 @@ class SelfReviewTests(unittest.TestCase):
             if item.check_id == "SEC-SECRETS-002"
         ]
         self.assertEqual(len(secrets), 1)
-        self.assertEqual(secrets[0].line, 201)
+        expected_line = next(
+            index for index, line in enumerate(text.splitlines(), 1)
+            if changed in line
+        )
+        self.assertEqual(secrets[0].line, expected_line)
 
     def test_arbitrary_fixture_marker_never_suppresses_target_repository(self) -> None:
         findings = scan_text(

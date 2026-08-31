@@ -1,0 +1,25 @@
+id: anti-slop-cpp/no-redundant-same-type-cast
+valid:
+  - |
+      int f(int *value) { return value; }
+  - |
+      int f(int *value) { return static_cast<long *>(value); }
+  - |
+      int f(int value) { return static_cast<long>(value); }
+  - |
+      int f(int *value) { return reinterpret_cast<long *>(value); }
+  - |
+      int f(int value) { return value + 1; }
+  - |
+      int f(int *value) { return *value; }
+  - |
+      int f(int *value) { return value != nullptr; }
+  - |
+      int f(int value) { return static_cast<int *>(value); }
+invalid:
+  - |
+      int f(int *value) { return static_cast<int *>(static_cast<int *>(value)); }
+  - |
+      int f(int *value) { return static_cast<int *>(reinterpret_cast<int *>(value)); }
+  - |
+      int f(int *value) { return reinterpret_cast<int *>(static_cast<int *>(value)); }

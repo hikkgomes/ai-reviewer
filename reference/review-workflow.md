@@ -68,14 +68,34 @@ tests. The candidate ledger is internal reasoning state and is not dumped in a
 routine report.
 
 The integrated optional analysers run during context construction. Anti-slop
-uses the skill-local Oxlint runtime on changed files in diff mode and on the
-configured full traversal in full mode. Comment-slop uses language-aware
-comment extraction and, in diff mode, only comments whose lines have current
-diff evidence. A missing Node runtime, missing dependencies, timeout, disabled
-toggle, or missing diff-line evidence is recorded as Not verified. Both
-analysers produce candidate evidence only. Falsify each candidate, then verify
+uses skill-local Oxlint for JavaScript and TypeScript, Python's standard-library
+AST for Python, and pinned ast-grep packs for Go, Rust, C, C++, Java, and C#.
+Comment-slop uses the canonical language registry. In diff mode, comment
+findings require current changed-line evidence. Both analysers produce
+structural candidate evidence only. Falsify each candidate, then verify
 truthfulness, relevance, stability, and the concrete contract or evidence gap
 before reporting it.
+
+Optional analyser coverage is backend-aware. No applicable files or enabled
+rules is `Not applicable`. Disabled analysis, missing runtimes, parse errors,
+ambiguous `.h` files, timeouts, source snapshot failures, and resource-limit
+exhaustion are `Not verified`. The four evidence states remain
+`Finding`, `Checked`, `Not applicable`, and `Not verified`; there is no
+additional `Not run` state. Generated files are excluded only by explicit
+`paths.generated` configuration.
+
+The context builder supervises its worker in a separate process group. Its hard
+timeout is outside optional analyser exception handling. Each analyser also
+uses independent monotonic file, byte, candidate, and deadline limits. See
+`reference/review-context-schema.json` and
+`reference/anti-slop-rule-contract.md` for persisted coverage and rule details.
+
+In diff mode, optional analysers use the exact source layer: reviewed commit
+content for a commit range, the index for staged content, the worktree for
+unstaged content, and the worktree for untracked files. Identical content at
+several layers is scanned once and records all layers. Deleted content does
+not create new optional candidates. Temporary Git snapshots stay outside the
+reviewed repository and are removed after analysis.
 
 ## Phase 6 — Falsify every candidate
 

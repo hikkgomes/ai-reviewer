@@ -1,0 +1,25 @@
+id: anti-slop-c/no-void-pointer-round-trip
+valid:
+  - |
+      int f(int *value) { return value; }
+  - |
+      int f(int *value) { return (int *)value; }
+  - |
+      int f(int value) { return (int)value; }
+  - |
+      void *f(void *value) { return value; }
+  - |
+      int f(int *value) { return (long *)value; }
+  - |
+      int f(int *value) { return value != 0; }
+  - |
+      int f(int value) { return value + 1; }
+  - |
+      int f(int *value) { return *value; }
+invalid:
+  - |
+      int f(void *value) { return (int *) (void *) value; }
+  - |
+      int f(void *value) { return (char *) (void *) value; }
+  - |
+      int f(void *value) { return (Target *) (void *) value; }

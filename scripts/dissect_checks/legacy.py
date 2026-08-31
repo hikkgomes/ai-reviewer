@@ -7,6 +7,7 @@ import fnmatch
 import re
 
 from .model import Finding
+from language_registry import language_for_path
 
 
 @dataclass(frozen=True)
@@ -213,23 +214,25 @@ def scan_legacy(path: str, text: str, source: str = "working-tree") -> list[Find
         findings.append(_finding("LEG-TODO-001", "high_todo_density", path, text.count("\n", 0, todo[0].start()) + 1, f"{len(todo)} TODO/FIXME markers", source))
 
     suffix = Path(path).suffix.lower()
-    if suffix == ".py":
+    spec = language_for_path(path)
+    language_id = spec.language_id if spec is not None else ""
+    if language_id == "python":
         for line, name in _python_long_functions(text):
             findings.append(_finding("LEG-LONG-FUNCTION-001", "long_function", path, line, f"{name} exceeds 80 lines", source))
         for line, name in _long_docstrings(text):
             findings.append(_finding("LEG-DOCSTRING-001", "excessive_docstring", path, line, f"{name} has a long docstring", source))
-    elif suffix in {".js", ".jsx", ".ts", ".tsx"}:
+    elif language_id in {"javascript", "typescript"}:
         for line, name in _brace_long_functions(text):
             findings.append(_finding("LEG-LONG-FUNCTION-001", "long_function", path, line, f"{name} exceeds 80 lines", source))
 
-    if suffix in {".ts", ".tsx"}:
+    if language_id == "typescript":
         assertions = list(re.finditer(r"\bas\s+(?:any|unknown|[A-Za-z_$][\w$]*(?:<[^>\n]+>)?)", text))
         if len(assertions) > 5:
             findings.append(_finding("LEG-TS-ASSERT-001", "typescript_as_density", path, text.count("\n", 0, assertions[0].start()) + 1, f"{len(assertions)} assertions", source))
-    if suffix == ".php" and text.lstrip().startswith("<?php"):
+    if language_id == "php" and text.lstrip().startswith("<?php"):
         if "declare(strict_types=1)" not in "\n".join(text.lstrip().splitlines()[:5]).replace(" ", ""):
             findings.append(_finding("LEG-PHP-STRICT-001", "php_missing_strict_types", path, 1, "missing declare(strict_types=1)", source))
-    if suffix == ".rs":
+    if language_id == "rust":
         occurrences = list(re.finditer(r"Rc\s*<\s*RefCell\s*<", text))
         if len(occurrences) > 2:
             findings.append(_finding("LEG-RUST-REFCELL-001", "rust_refcell_overuse", path, text.count("\n", 0, occurrences[0].start()) + 1, f"{len(occurrences)} occurrences", source))

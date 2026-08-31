@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export DISSECT_SCRIPT_DIR="$SCRIPT_DIR"
@@ -16,39 +16,31 @@ trap 'rm -f "$DETECTED_JSON"' EXIT
 python3 "$SCRIPT_DIR/detect_commands.py" >"$DETECTED_JSON" 2>/dev/null || true
 
 CONTEXT_PATH="${AI_REVIEW_CONTEXT_PATH:-$(mktemp /tmp/ai_review_context.XXXXXX 2>/dev/null || mktemp -t ai_review_context)}"
-python3 "$SCRIPT_DIR/build_review_context.py" \
-  --root "$ROOT" --mode full --output "$CONTEXT_PATH" >/dev/null
+CONTEXT_COMMAND=(python3 "$SCRIPT_DIR/build_review_context.py" --root "$ROOT" --mode full --output "$CONTEXT_PATH")
+if [ -n "${AI_REVIEW_CONTEXT_TIMEOUT_SECONDS:-}" ]; then
+  CONTEXT_COMMAND+=(--timeout "$AI_REVIEW_CONTEXT_TIMEOUT_SECONDS")
+fi
+if "${CONTEXT_COMMAND[@]}" >/dev/null; then
+  :
+else
+  CONTEXT_STATUS=$?
+  echo "Dissect context construction failed (exit $CONTEXT_STATUS)." >&2
+  exit "$CONTEXT_STATUS"
+fi
 echo "Review context: $CONTEXT_PATH"
 
 echo "== Universal AI Review: full repo =="
 echo "Repo: $ROOT"
 echo
 echo "== Detected languages =="
-python3 - <<'PY'
-import os
-from pathlib import Path
-import sys
-
-sys.path.insert(0, os.environ["DISSECT_SCRIPT_DIR"])
-from file_paths import iter_files
-
-extensions = {
-    ".ts": "typescript", ".tsx": "typescript", ".js": "javascript",
-    ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
-    ".py": "python", ".sql": "sql", ".java": "java-csharp",
-    ".cs": "java-csharp", ".go": "go", ".rs": "rust", ".cpp": "cpp",
-    ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
-    ".h": "cpp", ".c": "cpp", ".php": "php",
-}
-ignored = {".git", "node_modules", "vendor", "dist", "build", "target", ".next"}
-languages = {
-    extensions[path.suffix.lower()]
-    for path in iter_files(Path.cwd(), ignored_dirs=frozenset(ignored))
-    and path.suffix.lower() in extensions
-}
-print(", ".join(sorted(languages)) if languages else "none")
-print()
-PY
+if python3 "$SCRIPT_DIR/detect_languages.py" --root "$ROOT"; then
+  :
+else
+  DETECT_STATUS=$?
+  echo "Dissect language detection failed (exit $DETECT_STATUS)." >&2
+  exit "$DETECT_STATUS"
+fi
+echo
 
 echo "== Review command plans =="
 python3 "$SCRIPT_DIR/review_commands.py" \

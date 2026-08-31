@@ -1,0 +1,24 @@
+id: anti-slop-cpp/no-redundant-same-type-cast
+language: Cpp
+message: Nested C++ casts use the same textual destination type.
+severity: warning
+metadata:
+  contract: anti-slop-cpp/no-redundant-same-type-cast
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: medium
+rule:
+  kind: call_expression
+  any:
+    - pattern: static_cast<$TYPE>($INNER)
+      has:
+        any:
+          - pattern: static_cast<$TYPE>($VALUE)
+          - pattern: reinterpret_cast<$TYPE>($VALUE)
+        stopBy: end
+    - pattern: reinterpret_cast<$TYPE>($INNER)
+      has:
+        any:
+          - pattern: static_cast<$TYPE>($VALUE)
+          - pattern: reinterpret_cast<$TYPE>($VALUE)
+        stopBy: end

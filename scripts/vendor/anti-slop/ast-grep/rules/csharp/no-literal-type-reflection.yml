@@ -1,0 +1,14 @@
+id: anti-slop-csharp/no-literal-type-reflection
+language: CSharp
+message: Literal type reflection may duplicate a direct member contract.
+severity: warning
+metadata:
+  contract: anti-slop-csharp/no-literal-type-reflection
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: medium
+rule:
+  kind: invocation_expression
+  any:
+    - pattern: typeof($TYPE).GetMethod("$NAME")
+    - pattern: typeof($TYPE).GetProperty("$NAME")

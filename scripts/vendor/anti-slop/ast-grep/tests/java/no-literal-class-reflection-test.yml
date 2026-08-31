@@ -1,0 +1,27 @@
+id: anti-slop-java/no-literal-class-reflection
+valid:
+  - |
+      class C { void f() { getMethodName(); } }
+  - |
+      class C { void f(Class<?> type) { type.getDeclaredMethod(name); } }
+  - |
+      class C { void f() { KnownType.class.getDeclaredMethod(name); } }
+  - |
+      class C { void f() { KnownType.class.getMethods(); } }
+  - |
+      class C { void f() { KnownType.class.getDeclaredMethods(); } }
+  - |
+      class C { void f() { getFieldName(); } }
+  - |
+      class C { void f() { String name = "literal"; use(name); } }
+  - |
+      class C { void f() { this.getDeclaredMethod("x"); } }
+  - |
+      class C { void f() { KnownType.class.getName(); } }
+invalid:
+  - |
+      class C { void f() { KnownType.class.getDeclaredMethod("literalName"); } }
+  - |
+      class C { void f() { KnownType.class.getDeclaredField("literalName"); } }
+  - |
+      class C { void f() { OtherType.class.getDeclaredMethod("otherName", String.class); } }

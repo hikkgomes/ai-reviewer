@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export DISSECT_SCRIPT_DIR="$SCRIPT_DIR"
@@ -70,11 +70,12 @@ else
 fi
 
 CONTEXT_PATH="${AI_REVIEW_CONTEXT_PATH:-$(mktemp /tmp/ai_review_context.XXXXXX 2>/dev/null || mktemp -t ai_review_context)}"
+CONTEXT_COMMAND=(python3 "$SCRIPT_DIR/build_review_context.py" --root "$ROOT" --mode diff --base "${MERGE_BASE:-$BASE_REF}" --file-list "$CHANGED_FILE_LIST" --output "$CONTEXT_PATH")
+if [ -n "${AI_REVIEW_CONTEXT_TIMEOUT_SECONDS:-}" ]; then
+  CONTEXT_COMMAND+=(--timeout "$AI_REVIEW_CONTEXT_TIMEOUT_SECONDS")
+fi
 CALLER_PID="$PPID"
-python3 "$SCRIPT_DIR/build_review_context.py" \
-  --root "$ROOT" --mode diff --base "${MERGE_BASE:-$BASE_REF}" \
-  --file-list "$CHANGED_FILE_LIST" --output "$CONTEXT_PATH" \
-  --timeout "${AI_REVIEW_CONTEXT_TIMEOUT_SECONDS:-300}" >/dev/null &
+"${CONTEXT_COMMAND[@]}" >/dev/null &
 CONTEXT_PID=$!
 (
   while kill -0 "$CALLER_PID" 2>/dev/null; do sleep 1; done
@@ -95,31 +96,15 @@ echo "Review context: $CONTEXT_PATH"
 
 echo
 echo "== Detected languages =="
-python3 - <<'PY'
-import os
-from pathlib import Path
-import sys
-
-sys.path.insert(0, os.environ["DISSECT_SCRIPT_DIR"])
-from diff_file_list import read_file_list
-
-extensions = {
-    ".ts": "typescript", ".tsx": "typescript", ".js": "javascript",
-    ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
-    ".py": "python", ".sql": "sql", ".java": "java-csharp",
-    ".cs": "java-csharp", ".go": "go", ".rs": "rust", ".cpp": "cpp",
-    ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
-    ".h": "cpp", ".c": "cpp", ".php": "php",
-}
-changed = read_file_list(Path(os.environ["AI_REVIEW_FILE_LIST"]))
-languages = {
-    extensions[Path(path).suffix.lower()]
-    for path in changed
-    if Path(path).suffix.lower() in extensions
-}
-print(", ".join(sorted(languages)) if languages else "none")
-print()
-PY
+if python3 "$SCRIPT_DIR/detect_languages.py" \
+  --root "$ROOT" --entries-from "$CHANGED_FILE_LIST"; then
+  :
+else
+  DETECT_STATUS=$?
+  echo "Dissect language detection failed (exit $DETECT_STATUS)." >&2
+  exit "$DETECT_STATUS"
+fi
+echo
 
 echo "== Review command plans =="
 python3 "$SCRIPT_DIR/review_commands.py" --scope diff

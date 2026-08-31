@@ -1,0 +1,14 @@
+id: anti-slop-go/no-interface-round-trip
+language: Go
+message: Immediate interface widening and narrowing is a structural review candidate.
+severity: warning
+metadata:
+  contract: anti-slop-go/no-interface-round-trip
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: high
+rule:
+  kind: type_assertion_expression
+  any:
+    - pattern: any($VALUE).($TARGET)
+    - pattern: interface{}($VALUE).($TARGET)

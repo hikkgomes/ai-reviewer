@@ -1,0 +1,25 @@
+id: anti-slop-rust/no-same-type-transmute
+valid:
+  - |
+      fn f(value: T) { let _ = value; }
+  - |
+      fn f(value: T) { let _ = std::mem::transmute::<T, U>(value); }
+  - |
+      fn f(value: T) { let _ = std::mem::transmute::<U, T>(value); }
+  - |
+      fn f(value: T) { let _ = transmute::<T, U>(value); }
+  - |
+      fn f(value: T) { let _ = value as U; }
+  - |
+      fn f(value: T) { let _ = std::mem::size_of::<T>(); }
+  - |
+      fn f(value: T) { let _ = value; }
+  - |
+      fn f(value: T) { let _ = Some(value); }
+invalid:
+  - |
+      fn f(value: T) { let _ = std::mem::transmute::<T, T>(value); }
+  - |
+      fn f(value: U) { let _ = std::mem::transmute::<U, U>(value); }
+  - |
+      fn f(value: T) { let _ = transmute::<T, T>(value); }

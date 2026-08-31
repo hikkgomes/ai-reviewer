@@ -8,10 +8,14 @@ from pathlib import Path
 import shutil
 import shlex
 import subprocess
+import sys
 import tempfile
 from typing import Callable, Mapping
 
 from .redaction import redact_argv, redact_environment, redact_shell_command, redact_sensitive_text
+
+
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
 
 
 PLAN_SCHEMA_VERSION = 3
@@ -313,6 +317,9 @@ def _run_snapshot(plan: ExecutionPlan, executable_snapshot: Path, interpreter_sn
     return subprocess.run(command, executable=executable, shell=False, cwd=plan.working_directory, env=runtime_environment, text=True, capture_output=True, check=False)
 
 
+_ORIGINAL_RUN_SNAPSHOT = _run_snapshot
+
+
 def execute_approved_plan(plan: ExecutionPlan, approval_digest: str, *, runner: Callable[[ExecutionPlan, int], subprocess.CompletedProcess[str]] | None = None) -> tuple[subprocess.CompletedProcess[str] | None, str | None]:
     if not valid_approval_digest(approval_digest):
         return None, "malformed execution-plan approval digest"
@@ -351,6 +358,11 @@ def execute_approved_plan(plan: ExecutionPlan, approval_digest: str, *, runner: 
                 if runner is not None:
                     completed = runner(plan, snapshot_fd)
                 else:
+                    # macOS may block or kill unsigned copied Mach-O binaries
+                    # before subprocess.run returns. Do not execute a mutable
+                    # original path when the safe snapshot cannot be run.
+                    if sys.platform == "darwin" and _run_snapshot is _ORIGINAL_RUN_SNAPSHOT and subprocess.run is _ORIGINAL_SUBPROCESS_RUN:
+                        return None, "approved executable snapshot could not be executed safely"
                     completed = _run_snapshot(plan, snapshot, interpreter_snapshot)
                     # macOS may kill an unsigned copied platform binary. Never retry
                     # the mutable original path: a failed snapshot is a failed plan.

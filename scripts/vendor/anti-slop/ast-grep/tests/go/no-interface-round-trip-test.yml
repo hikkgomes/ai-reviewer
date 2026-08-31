@@ -1,0 +1,36 @@
+id: anti-slop-go/no-interface-round-trip
+valid:
+  - |
+      package p
+      func f(value any) { _ = value }
+  - |
+      package p
+      func f(value any) { switch value.(type) {} }
+  - |
+      package p
+      func f(value Target) { _ = value }
+  - |
+      package p
+      func f(value any) { var x any = value; _ = x }
+  - |
+      package p
+      func f(value any) { _ = interface{}(value) }
+  - |
+      package p
+      func f(value any) { _ = value.(Target) }
+  - |
+      package p
+      func f(value any) { _ = any(value) }
+  - |
+      package p
+      func f(value any) { _ = value }
+invalid:
+  - |
+      package p
+      func f(value any) { _ = any(value).(Target) }
+  - |
+      package p
+      func f(value any) { _ = interface{}(value).(Target) }
+  - |
+      package p
+      func f(value any) { _ = any(value).(Other) }

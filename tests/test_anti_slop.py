@@ -109,9 +109,21 @@ class AntiSlopTests(unittest.TestCase):
 
     def test_empty_scope_is_a_non_fatal_skip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            result = run_anti_slop.analyse(Path(directory), [])
+            root = Path(directory)
+            result = run_anti_slop.analyse(root, [])
         self.assertEqual(result["status"], "skipped")
         self.assertEqual(result["skip_reason"], "no_js_ts_files")
+        self.assertEqual(result["state"], "Not applicable")
+
+    def test_unsupported_scope_is_not_applicable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "data.parquet"
+            source.write_bytes(b"not source")
+            result = run_anti_slop.analyse(root, [source])
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["skip_reason"], "no_supported_files")
+        self.assertEqual(result["state"], "Not applicable")
 
     @unittest.skipUnless(
         shutil.which("node") and (ROOT / "scripts/vendor/anti-slop/node_modules/.bin/oxlint").exists(),

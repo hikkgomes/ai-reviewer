@@ -112,22 +112,56 @@ isolation, payment semantics, governance, backup restoration, and production
 reachability require human, runtime, or operational evidence. Scanner candidates
 for these areas must be confirmed against surrounding configuration and code.
 
-### Optional deterministic analysers
+### Optional structural analysers
 
-Dissect can run two optional candidate generators during context construction:
+Dissect can run two optional candidate generators during context construction.
+They never promote syntax matches to findings:
 
-- Anti-slop vendors the pinned Oxlint plugin for JavaScript and TypeScript. It
-  detects low-evidence type and implementation patterns using a skill-local Node
-  runtime.
-- Comment-slop uses language-aware comment extraction across the supported
-  language families to find redundant narration, section headers, historical
-  claims, and conversation leaks.
+- Anti-slop uses skill-local Oxlint for JavaScript and TypeScript, Python's
+  standard-library AST for Python, and pinned ast-grep rule packs for Go, Rust,
+  C, C++, Java, and C#.
+- Comment-slop uses the canonical language registry for comments in Python,
+  JavaScript, TypeScript, Go, Rust, C, C++, Java, C#, SQL, PHP, Ruby,
+  Terraform, YAML, Kotlin, Swift, Shell, PowerShell, HTML, Markdown, XML,
+  SVG, and configuration files.
 
-Both analysers are optional, respect `paths.ignore` and the
-`review_options.anti_slop` and `review_options.comment_slop` toggles, and emit
-ledger candidates only. Every candidate needs falsification and semantic
-verification before it can become a finding. A skipped analyser is recorded as
-Not verified.
+All structural matches remain ledger candidates. Falsify and semantically
+verify each candidate before reporting it. No applicable files produce
+`Not applicable`. Applicable work that is disabled, unavailable, incomplete,
+malformed, ambiguous, or over a limit produces `Not verified`. Unsupported
+languages do not make anti-slop incomplete.
+
+Generated files are excluded from these analysers only when they match an
+explicit `paths.generated` pattern. There are no filename guesses. C/C++ `.h`
+files are scanned for comments, but anti-slop skips them as
+`ambiguous_header_language` when the scope cannot distinguish C from C++.
+
+The skill-local runtime is provisioned by the installer and is not downloaded
+during a review. Oxlint and ast-grep use exact pinned versions. The initial
+limits are configurable under `review_options.analysis_limits`:
+
+```json
+{
+  "context_timeout_seconds": 300,
+  "comment_slop_timeout_seconds": 60,
+  "comment_slop_per_file_timeout_seconds": 5,
+  "comment_slop_max_file_bytes": 5242880,
+  "comment_slop_max_total_bytes": 67108864,
+  "comment_slop_max_files": 10000,
+  "comment_slop_max_candidates": 2000,
+  "anti_slop_timeout_seconds": 120,
+  "anti_slop_max_file_bytes": 10485760,
+  "anti_slop_max_total_bytes": 268435456,
+  "anti_slop_max_files": 20000,
+  "anti_slop_max_candidates": 5000,
+  "external_command_max_argument_bytes": 24000,
+  "external_command_max_files": 250,
+  "worker_threads": 0
+}
+```
+
+See `reference/anti-slop-rule-contract.md` for rule boundaries and
+`reference/review-context-schema.json` for backend-aware coverage.
 
 Static/local review is the default. Dissect does not probe public applications,
 bypass authentication, create production accounts, retrieve private data,
@@ -185,6 +219,40 @@ Generated bundles and recent Git history are disabled by default:
   }
 }
 ```
+
+Optional structural analysis uses the safe limits below unless overridden.
+`paths.generated` is the only generated-file policy for comment-slop and
+anti-slop. Unsupported files are filtered before any analyser read, and the
+full context worker has an external hard timeout.
+
+```json
+{
+  "review_options": {
+    "analysis_limits": {
+      "context_timeout_seconds": 300,
+      "comment_slop_timeout_seconds": 60,
+      "comment_slop_per_file_timeout_seconds": 5,
+      "comment_slop_max_file_bytes": 5242880,
+      "comment_slop_max_total_bytes": 67108864,
+      "comment_slop_max_files": 10000,
+      "comment_slop_max_candidates": 2000,
+      "anti_slop_timeout_seconds": 120,
+      "anti_slop_max_file_bytes": 10485760,
+      "anti_slop_max_total_bytes": 268435456,
+      "anti_slop_max_files": 20000,
+      "anti_slop_max_candidates": 5000,
+      "external_command_max_argument_bytes": 24000,
+      "external_command_max_files": 250,
+      "worker_threads": 0
+    }
+  },
+  "paths": {"generated": ["src/generated/"]}
+}
+```
+
+The context schema version for this coverage is `1.1`. A CLI
+`--timeout` value, or `AI_REVIEW_CONTEXT_TIMEOUT_SECONDS` in the shell entry
+points, overrides the configured context timeout.
 
 Installed tools are detected but never execute from repository configuration
 alone. Tool entries must use argument arrays (shell command strings are

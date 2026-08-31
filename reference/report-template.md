@@ -27,7 +27,9 @@ Include only questions that materially affect correctness or severity.
 
 List commands, local definitions, tests, reproductions, and whether output was
 complete. Approved external tools are optional and their results remain
-candidates until contextually confirmed.
+structural candidates until contextually confirmed. State optional backend
+coverage as `Finding`, `Checked`, `Not applicable`, or `Not verified`; do not
+add a `Not run` state.
 
 ## Scope and Residual Risk
 

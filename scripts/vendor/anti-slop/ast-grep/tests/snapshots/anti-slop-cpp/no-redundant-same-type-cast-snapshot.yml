@@ -1,0 +1,35 @@
+id: anti-slop-cpp/no-redundant-same-type-cast
+snapshots:
+  ? |
+    int f(int *value) { return reinterpret_cast<int *>(static_cast<int *>(value)); }
+  : labels:
+    - source: reinterpret_cast<int *>(static_cast<int *>(value))
+      style: primary
+      start: 27
+      end: 77
+    - source: static_cast<int *>(value)
+      style: secondary
+      start: 51
+      end: 76
+  ? |
+    int f(int *value) { return static_cast<int *>(reinterpret_cast<int *>(value)); }
+  : labels:
+    - source: static_cast<int *>(reinterpret_cast<int *>(value))
+      style: primary
+      start: 27
+      end: 77
+    - source: reinterpret_cast<int *>(value)
+      style: secondary
+      start: 46
+      end: 76
+  ? |
+    int f(int *value) { return static_cast<int *>(static_cast<int *>(value)); }
+  : labels:
+    - source: static_cast<int *>(static_cast<int *>(value))
+      style: primary
+      start: 27
+      end: 72
+    - source: static_cast<int *>(value)
+      style: secondary
+      start: 46
+      end: 71

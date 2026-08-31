@@ -1,0 +1,13 @@
+id: anti-slop-rust/no-immediate-any-round-trip
+language: Rust
+message: Immediate dynamic Any construction and downcast is a structural review candidate.
+severity: warning
+metadata:
+  contract: anti-slop-rust/no-immediate-any-round-trip
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: medium
+rule:
+  any:
+    - pattern: (Box::new($VALUE) as Box<dyn Any>).downcast::<$TARGET>()
+    - pattern: (Box::new($VALUE) as Box<dyn std::any::Any>).downcast::<$TARGET>()

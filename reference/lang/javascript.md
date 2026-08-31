@@ -21,6 +21,13 @@ Activate for `.js`, `.jsx`, `.mjs`, and `.cjs`.
 
 - Loose equality used intentionally for nullish checks when local style permits it.
 - Framework-generated globals in legacy code.
+
+## Structural anti-slop backend
+
+The optional skill-local Oxlint backend covers `.js`, `.jsx`, `.mjs`, and
+`.cjs`. It reports the pinned anti-slop rules as structural candidates only.
+Runtime type checks, reflection, mocks, broad object types, and assertions
+require semantic review before they become findings.
 # Operational tracing playbook
 
 Read route/bootstrap files, validators, callers, tests, package manifests and

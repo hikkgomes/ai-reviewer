@@ -6,6 +6,7 @@
     "@oxlint/plugins": "1.78.0"
   },
   "devDependencies": {
+    "@ast-grep/cli": "0.45.2",
     "oxlint": "1.78.0"
   }
 }

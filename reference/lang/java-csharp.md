@@ -2,6 +2,13 @@
 
 Activate for `.java` and `.cs`.
 
+## Structural anti-slop backend
+
+The optional ast-grep backend reports same-expression widening to `Object`,
+`object`, or `dynamic` followed by a target cast, and narrow literal reflection
+calls. These are review candidates only. Framework bridges, serialisation
+adapters, dynamic type discovery, and deliberate reflection require context.
+
 ## Highest-Impact Checks
 
 - Exception propagation: in C#, `throw ex` resets stack traces; prefer `throw`.

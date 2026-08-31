@@ -1,6 +1,6 @@
 # Python Review Module
 
-Activate for `.py`.
+Activate for `.py` and `.pyi`.
 
 ## Highest-Impact Checks
 
@@ -23,6 +23,14 @@ Activate for `.py`.
 
 - Sentinel defaults using `None` with explicit initialization.
 - Broad exceptions at process boundaries that log and re-raise or convert to a documented error.
+
+## Structural anti-slop backend
+
+The optional standard-library AST backend reports candidate evidence for an
+immediate `typing.cast` widening and narrowing, and for literal `getattr`
+without a default outside recognised dynamic protocols. It honours Python
+source encodings and reports syntax errors as incomplete coverage. It does not
+ban `Any`, reflection, or normal API-boundary casts.
 # Operational tracing playbook
 
 Inspect task intent, import declarations, callers, schemas, settings,

@@ -2,6 +2,14 @@
 
 Activate for `.rs`.
 
+## Structural anti-slop backend
+
+The optional ast-grep backend reports textually identical `transmute` source
+and destination types, and an explicit same-expression `Box<dyn Any>`
+construction followed by downcast. These are structural candidates only. The
+rules do not ban `unsafe`, trait objects, dynamic registries, or justified
+type-erasure boundaries.
+
 ## Highest-Impact Checks
 
 - Lifetime misconceptions: `T: 'static` confused with `&'static T`.

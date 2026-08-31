@@ -10,6 +10,23 @@
     "fail_on_severity": "none",
     "anti_slop": true,
     "comment_slop": true,
+    "analysis_limits": {
+      "context_timeout_seconds": 300,
+      "comment_slop_timeout_seconds": 60,
+      "comment_slop_per_file_timeout_seconds": 5,
+      "comment_slop_max_file_bytes": 5242880,
+      "comment_slop_max_total_bytes": 67108864,
+      "comment_slop_max_files": 10000,
+      "comment_slop_max_candidates": 2000,
+      "anti_slop_timeout_seconds": 120,
+      "anti_slop_max_file_bytes": 10485760,
+      "anti_slop_max_total_bytes": 268435456,
+      "anti_slop_max_files": 20000,
+      "anti_slop_max_candidates": 5000,
+      "external_command_max_argument_bytes": 24000,
+      "external_command_max_files": 250,
+      "worker_threads": 0
+    },
     "execution_environment": {}
   },
   "commands": {

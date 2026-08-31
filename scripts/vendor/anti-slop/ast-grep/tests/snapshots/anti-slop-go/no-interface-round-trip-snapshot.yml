@@ -1,0 +1,26 @@
+id: anti-slop-go/no-interface-round-trip
+snapshots:
+  ? |
+    package p
+    func f(value any) { _ = any(value).(Other) }
+  : labels:
+    - source: any(value).(Other)
+      style: primary
+      start: 34
+      end: 52
+  ? |
+    package p
+    func f(value any) { _ = any(value).(Target) }
+  : labels:
+    - source: any(value).(Target)
+      style: primary
+      start: 34
+      end: 53
+  ? |
+    package p
+    func f(value any) { _ = interface{}(value).(Target) }
+  : labels:
+    - source: interface{}(value).(Target)
+      style: primary
+      start: 34
+      end: 61

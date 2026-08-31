@@ -2,6 +2,14 @@
 
 Activate for `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.h`, and `.c`.
 
+## Structural anti-slop backend
+
+The optional ast-grep backend reports narrow nested cast chains through
+`void *` and identical textual C++ cast destinations. Mixed or header-only
+scopes do not classify `.h` files for anti-slop and report
+`ambiguous_header_language`. The rules do not ban raw pointers, casts,
+allocators, placement construction, FFI, serialisation, or ABI code.
+
 ## Highest-Impact Checks
 
 - Dangling pointers, references to temporaries, iterator invalidation.

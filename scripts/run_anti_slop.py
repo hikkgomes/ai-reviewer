@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Run the skill-local anti-slop Oxlint plugin and emit ledger candidates."""
+"""Thin CLI and compatibility entry point for anti-slop backends."""
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
-import re
 import shutil
-import subprocess
 import sys
 from typing import Any, Iterable
 
@@ -19,67 +16,39 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from diff_file_list import DiffEntry, deserialize_entries, read_diff_entries  # noqa: E402
+from dissect_checks.anti_slop import orchestrator  # noqa: E402
+from dissect_checks.anti_slop.oxlint_backend import (  # noqa: E402
+    AnalysisSkip,
+    PathEscapeError,
+    RunnerError,
+    _node_version as _backend_node_version,
+    _oxlint_path as _backend_oxlint_path,
+    detect_effect,
+    filter_files,
+    parse_diagnostics,
+    run_oxlint,
+    to_candidates,
+)
 from dissect_checks.redaction import redact_payload, redact_sensitive_text  # noqa: E402
-from file_paths import is_ignored_path  # noqa: E402
-from review_ledger import blank_candidate, validate_candidate  # noqa: E402
+from file_paths import is_generated_path, is_ignored_path  # noqa: E402
+from language_registry import language_for_path, paths_for_anti_slop  # noqa: E402
 
 
-JS_TS_SUFFIXES = {".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
-RULE_PREFIXES = ("anti-slop/", "anti-slop-effect/")
+VENDOR_DIR = ROOT / "scripts" / "vendor" / "anti-slop"
 MIN_NODE = (22, 18)
-MAX_FILES_PER_INVOCATION = 2000
-VENDOR_DIR = Path(__file__).resolve().parent / "vendor" / "anti-slop"
-
-
-class RunnerError(RuntimeError):
-    """An invalid invocation or an internal scope error."""
-
-
-class PathEscapeError(RunnerError):
-    """A requested file is outside the review root."""
-
-
-class AnalysisSkip(RuntimeError):
-    def __init__(self, reason: str, detail: str = "") -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.detail = detail
-
-
-class RunnerArgumentParser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:
-        raise RunnerError(message)
+MAX_FILES_PER_INVOCATION = 250
 
 
 def _node_version(node: str) -> tuple[int, int, int] | None:
-    try:
-        result = subprocess.run(
-            [node, "--version"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    value = result.stdout or result.stderr or ""
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="replace")
-    value = value.strip()
-    match = re.search(r"v?(\d+)\.(\d+)(?:\.(\d+))?", value)
-    if match is None:
-        return None
-    return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+    return _backend_node_version(node)
 
 
 def _oxlint_path(vendor_dir: Path) -> Path:
-    binary = vendor_dir / "node_modules" / ".bin" / "oxlint"
-    if os.name == "nt" and not binary.exists():
-        return binary.with_suffix(".cmd")
-    return binary
+    return _backend_oxlint_path(vendor_dir)
 
 
 def preflight(vendor_dir: Path) -> str | None:
-    """Return a stable skip reason, or ``None`` when the runtime is ready."""
+    """Compatibility preflight kept patchable for existing integrations."""
     node = shutil.which("node")
     if node is None:
         return "node_unavailable"
@@ -91,230 +60,41 @@ def preflight(vendor_dir: Path) -> str | None:
     return None
 
 
-def filter_files(paths: Iterable[str | Path], target_root: Path) -> list[Path]:
-    """Select existing JavaScript/TypeScript files inside ``target_root``."""
+def _analysis_paths(
+    target_root: Path,
+    paths: Iterable[str | Path],
+    config: dict[str, Any],
+) -> list[str]:
+    """Validate and select every supported structural target for the CLI."""
     root = target_root.resolve()
-    selected: dict[str, Path] = {}
+    selected: dict[str, str] = {}
     for value in paths:
-        raw = str(value)
-        if not raw:
-            continue
-        candidate = Path(raw)
-        resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
-        if not resolved.is_relative_to(root):
-            raise PathEscapeError(f"path escapes target root: {raw}")
-        if is_ignored_path(root, resolved):
-            continue
-        if resolved.suffix.lower() not in JS_TS_SUFFIXES or not resolved.is_file():
-            continue
-        selected[resolved.as_posix()] = resolved
-    return [selected[key] for key in sorted(selected)]
-
-
-def _has_effect_dependency(data: Any) -> bool:
-    if not isinstance(data, dict):
-        return False
-    return any(
-        isinstance(data.get(section), dict) and "effect" in data[section]
-        for section in ("dependencies", "devDependencies", "peerDependencies")
-    )
-
-
-def _workspace_patterns(data: dict[str, Any]) -> list[str]:
-    workspaces = data.get("workspaces")
-    if isinstance(workspaces, list):
-        return [item for item in workspaces if isinstance(item, str)]
-    if isinstance(workspaces, dict) and isinstance(workspaces.get("packages"), list):
-        return [item for item in workspaces["packages"] if isinstance(item, str)]
-    return []
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def detect_effect(target_root: Path) -> bool:
-    """Detect Effect in the root manifest or one workspace expansion."""
-    manifest = _read_json(target_root / "package.json")
-    if manifest is None:
-        return False
-    if _has_effect_dependency(manifest):
-        return True
-    for pattern in _workspace_patterns(manifest):
-        try:
-            matches = target_root.glob(pattern)
-        except (OSError, ValueError):
-            continue
-        for match in matches:
+        candidate = Path(value)
+        if candidate.is_absolute():
             try:
-                if not match.resolve().is_relative_to(target_root.resolve()):
-                    continue
-            except OSError:
-                continue
-            package_path = match / "package.json" if match.is_dir() else match
-            if package_path.name != "package.json":
-                continue
-            package = _read_json(package_path)
-            if package is not None and _has_effect_dependency(package):
-                return True
-    return False
-
-
-def _merge_chunk_output(outputs: list[str]) -> str:
-    if len(outputs) <= 1:
-        return outputs[0] if outputs else ""
-    diagnostics: list[Any] = []
-    for output in outputs:
-        try:
-            payload = json.loads(output)
-        except (TypeError, ValueError):
-            return "\n".join(outputs)
-        if isinstance(payload, dict) and isinstance(payload.get("diagnostics"), list):
-            diagnostics.extend(payload["diagnostics"])
-        elif isinstance(payload, list):
-            diagnostics.extend(payload)
-    return json.dumps({"diagnostics": diagnostics}, separators=(",", ":"))
-
-
-def run_oxlint(
-    oxlint_bin: Path,
-    config_path: Path,
-    files: Iterable[str | Path],
-    timeout: float,
-) -> tuple[str, str]:
-    """Run Oxlint in chunks and return merged stdout plus stderr."""
-    file_values = [str(path) for path in files]
-    vendor_dir = config_path.resolve().parent
-    outputs: list[str] = []
-    errors: list[str] = []
-    for index in range(0, len(file_values), MAX_FILES_PER_INVOCATION):
-        chunk = file_values[index:index + MAX_FILES_PER_INVOCATION]
-        argv = [str(oxlint_bin), "--config", str(config_path), "--format", "json", *chunk]
-        try:
-            result = subprocess.run(
-                argv,
-                cwd=vendor_dir,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise AnalysisSkip("timeout", str(error)) from error
-        except OSError as error:
-            raise AnalysisSkip("runner_error", str(error)) from error
-        outputs.append(result.stdout or "")
-        if result.stderr:
-            errors.append(result.stderr)
-    return _merge_chunk_output(outputs), "\n".join(errors)
-
-
-def _canonical_rule_id(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    for prefix in RULE_PREFIXES:
-        if value.startswith(prefix):
-            return value
-    for plugin in ("anti-slop", "anti-slop-effect"):
-        marker = f"{plugin}("
-        if value.startswith(marker) and value.endswith(")"):
-            return f"{plugin}/{value[len(marker):-1]}"
-    return ""
-
-
-def _diagnostic_location(diagnostic: dict[str, Any]) -> tuple[int, int]:
-    labels = diagnostic.get("labels")
-    if isinstance(labels, list) and labels and isinstance(labels[0], dict):
-        span = labels[0].get("span")
-        if isinstance(span, dict):
-            try:
-                return int(span.get("line", 0)), int(span.get("column", 0))
-            except (TypeError, ValueError):
-                pass
-    location = diagnostic.get("location")
-    if isinstance(location, dict):
-        start = location.get("start") if isinstance(location.get("start"), dict) else location
-        try:
-            return int(start.get("line", 0)), int(start.get("column", 0))
-        except (AttributeError, TypeError, ValueError):
-            pass
-    return int(diagnostic.get("line", 0) or 0), int(diagnostic.get("column", 0) or 0)
-
-
-def parse_diagnostics(stdout: str, stderr: str = "") -> list[dict[str, Any]]:
-    """Parse the Oxlint JSON shape and retain only anti-slop plugin rules."""
-    try:
-        payload = json.loads(stdout)
-    except (TypeError, ValueError) as error:
-        detail = redact_sensitive_text((stderr or "")[:500])
-        raise AnalysisSkip("unparseable_output", detail) from error
-    raw_diagnostics = payload.get("diagnostics", []) if isinstance(payload, dict) else payload
-    if not isinstance(raw_diagnostics, list):
-        raise AnalysisSkip("unparseable_output", redact_sensitive_text((stderr or "")[:500]))
-    parsed: list[dict[str, Any]] = []
-    for diagnostic in raw_diagnostics:
-        if not isinstance(diagnostic, dict):
+                relative = candidate.resolve().relative_to(root).as_posix()
+            except ValueError as error:
+                raise PathEscapeError(f"path escapes target root: {value}") from error
+        else:
+            if not candidate.parts or ".." in candidate.parts:
+                raise PathEscapeError(f"path escapes target root: {value}")
+            relative = candidate.as_posix()
+        physical = (root / relative).resolve()
+        if not physical.is_relative_to(root):
+            raise PathEscapeError(f"path escapes target root: {value}")
+        spec = language_for_path(relative)
+        if (
+            spec is None
+            or (spec.anti_slop_backend is None and candidate.suffix.lower() != ".h")
+            or is_ignored_path(root, relative)
+            or is_generated_path(root, physical, config)
+            or not physical.is_file()
+        ):
             continue
-        rule = _canonical_rule_id(
-            diagnostic.get("code", diagnostic.get("rule_id", diagnostic.get("ruleId", diagnostic.get("rule"))))
-        )
-        if not rule.startswith(RULE_PREFIXES):
-            continue
-        line, column = _diagnostic_location(diagnostic)
-        parsed.append({
-            "rule": rule,
-            "message": str(diagnostic.get("message", "")),
-            "filename": str(diagnostic.get("filename", diagnostic.get("file", diagnostic.get("path", "")))),
-            "line": line,
-            "column": column,
-        })
-    return parsed
-
-
-def _relative_path(filename: str, target_root: Path) -> str:
-    root = target_root.resolve()
-    path = Path(filename.replace("\\", "/"))
-    if not path.is_absolute():
-        value = path.as_posix()
-        while value.startswith("./"):
-            value = value[2:]
-        return value
-    try:
-        return path.resolve().relative_to(root).as_posix()
-    except ValueError:
-        return path.as_posix()
-
-
-def to_candidates(diagnostics: Iterable[dict[str, Any]], target_root: Path) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for index, diagnostic in enumerate(diagnostics, 1):
-        rule = str(diagnostic.get("rule", ""))
-        message = str(diagnostic.get("message", ""))
-        relpath = _relative_path(str(diagnostic.get("filename", "")), target_root)
-        line = int(diagnostic.get("line", 0) or 0)
-        column = int(diagnostic.get("column", 0) or 0)
-        candidate = blank_candidate(
-            f"candidate-anti-slop-{index}",
-            source=rule,
-            claim=f"{rule}: {message} at {relpath}:{line}",
-        )
-        candidate["trigger_path"] = [f"{relpath}:{line}"]
-        candidate["supporting_evidence"] = [{
-            "kind": "lint_diagnostic",
-            "file": relpath,
-            "line": line,
-            "column": column,
-            "message": message,
-        }]
-        errors = validate_candidate(candidate)
-        if errors:
-            raise RunnerError("invalid anti-slop candidate: " + "; ".join(errors))
-        candidates.append(candidate)
-    return candidates
+        selected[relative] = relative
+    grouped = paths_for_anti_slop(selected)
+    supported = {path for values in grouped.values() for path in values}
+    return [path for path in sorted(selected) if path in supported]
 
 
 def _envelope(
@@ -329,6 +109,7 @@ def _envelope(
     payload: dict[str, Any] = {
         "tool": "anti-slop",
         "status": status,
+        "state": "Checked" if status == "ok" else "Not applicable" if skip_reason in {"no_js_ts_files", "no_supported_files"} else "Not verified",
         "skip_reason": skip_reason,
         "config_variant": config_variant,
         "files_scanned": files_scanned,
@@ -346,60 +127,75 @@ def analyse(
     timeout: float = 300,
     vendor_dir: Path = VENDOR_DIR,
 ) -> dict[str, Any]:
+    """Run the new orchestrator while retaining the documented CLI envelope."""
     target_root = target_root.resolve()
-    config_variant = "effect" if detect_effect(target_root) else "generic"
+    config: dict[str, Any] = {}
     try:
-        files = filter_files(paths, target_root)
-    except PathEscapeError:
-        raise
+        value = json.loads((target_root / ".ai-review" / "local.json").read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            config = value
+    except (OSError, ValueError):
+        config = {}
+    requested_paths = list(paths)
+    files = _analysis_paths(target_root, requested_paths, config)
+    config_variant = "effect" if detect_effect(target_root) else "generic"
     if not files:
         return _envelope(
             status="skipped",
-            skip_reason="no_js_ts_files",
+            skip_reason="no_js_ts_files" if not requested_paths else "no_supported_files",
             config_variant=config_variant,
-            files_scanned=0,
-            candidates=[],
+            files_scanned=0, candidates=[],
         )
-    reason = preflight(vendor_dir)
+    # Preserve the documented legacy preflight envelope for a JS/TS-only CLI
+    # invocation. Mixed and polyglot scopes go through the common orchestrator
+    # so one unavailable backend cannot hide successful structural backends.
+    only_js_ts = all(
+        (language_for_path(path) is not None)
+        and language_for_path(path).language_id in {"javascript", "typescript"}
+        for path in files
+    )
+    reason = preflight(vendor_dir) if only_js_ts else None
     if reason is not None:
         return _envelope(
-            status="skipped",
-            skip_reason=reason,
-            config_variant=config_variant,
-            files_scanned=0,
-            candidates=[],
+            status="skipped", skip_reason=reason, config_variant=config_variant,
+            files_scanned=0, candidates=[],
         )
-    oxlint_bin = _oxlint_path(vendor_dir)
-    config_path = vendor_dir / ("oxlint-review-effect.json" if config_variant == "effect" else "oxlint-review.json")
-    try:
-        stdout, stderr = run_oxlint(oxlint_bin, config_path, files, timeout)
-        diagnostics = parse_diagnostics(stdout, stderr)
-        candidates = to_candidates(diagnostics, target_root)
-    except AnalysisSkip as skip:
-        return _envelope(
-            status="skipped",
-            skip_reason=skip.reason,
-            config_variant=config_variant,
-            files_scanned=0,
-            candidates=[],
-            detail=skip.detail,
-        )
-    return _envelope(
-        status="ok",
-        skip_reason=None,
-        config_variant=config_variant,
-        files_scanned=len(files),
-        candidates=candidates,
+    options = config.get("review_options") if isinstance(config.get("review_options"), dict) else {}
+    configured_limits = options.get("analysis_limits") if isinstance(options.get("analysis_limits"), dict) else {}
+    config = {
+        **config,
+        "review_options": {
+            **options,
+            "analysis_limits": {
+                **configured_limits,
+                "anti_slop_timeout_seconds": timeout,
+            },
+        },
+    }
+    result = orchestrator.analyse(
+        target_root,
+        [path for path in files],
+        vendor_dir=vendor_dir,
+        config=config,
     )
+    payload = dict(result)
+    payload["legacy_status"] = "ok" if result.get("state") == "Checked" else "skipped"
+    payload["skip_reason"] = None if result.get("state") == "Checked" else result.get("backends", {}).get("oxlint-js-ts", {}).get("reason_code") or "analysis_incomplete"
+    # Keep the old status only at this compatibility boundary. Context uses
+    # ``state`` and backend records from the new envelope.
+    payload["status"] = "ok" if result.get("state") == "Checked" else "skipped"
+    payload["config_variant"] = config_variant
+    return redact_payload(payload)
 
 
 def _entries_paths(entries: Iterable[DiffEntry]) -> list[str]:
-    return sorted({
-        entry.reviewed_path
-        for entry in entries
-        if entry.exists_in_worktree and entry.reviewed_path
-        and Path(entry.reviewed_path).suffix.lower() in JS_TS_SUFFIXES
-    })
+    values = [entry.reviewed_path for entry in entries if entry.exists_in_worktree and entry.reviewed_path]
+    return sorted({path for group in paths_for_anti_slop(values).values() for path in group if path})
+
+
+class RunnerArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise RunnerError(message)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -418,11 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.timeout <= 0:
             raise RunnerError("--timeout must be greater than zero")
         if args.entries_from is not None:
-            entries = (
-                deserialize_entries(sys.stdin.buffer.read())
-                if args.entries_from == "-"
-                else read_diff_entries(Path(args.entries_from))
-            )
+            entries = deserialize_entries(sys.stdin.buffer.read()) if args.entries_from == "-" else read_diff_entries(Path(args.entries_from))
             paths = _entries_paths(entries)
         else:
             paths = args.files

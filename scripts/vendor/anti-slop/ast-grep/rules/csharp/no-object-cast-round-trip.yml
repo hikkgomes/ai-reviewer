@@ -1,0 +1,15 @@
+id: anti-slop-csharp/no-object-cast-round-trip
+language: CSharp
+message: A value is immediately boxed or dynamically widened and narrowed again.
+severity: warning
+metadata:
+  contract: anti-slop-csharp/no-object-cast-round-trip
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: high
+rule:
+  kind: cast_expression
+  has:
+    any:
+      - pattern: (object)$VALUE
+      - pattern: (dynamic)$VALUE

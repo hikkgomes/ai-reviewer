@@ -1,0 +1,35 @@
+id: anti-slop-csharp/no-object-cast-round-trip
+snapshots:
+  ? |
+    class C { void M(Target value) { Other x = (Other)(object)value; } }
+  : labels:
+    - source: (Other)(object)value
+      style: primary
+      start: 43
+      end: 63
+    - source: (object)value
+      style: secondary
+      start: 50
+      end: 63
+  ? |
+    class C { void M(Target value) { Result x = (Result)(dynamic)value; } }
+  : labels:
+    - source: (Result)(dynamic)value
+      style: primary
+      start: 44
+      end: 66
+    - source: (dynamic)value
+      style: secondary
+      start: 52
+      end: 66
+  ? |
+    class C { void M(Target value) { Target x = (Target)(object)value; } }
+  : labels:
+    - source: (Target)(object)value
+      style: primary
+      start: 44
+      end: 65
+    - source: (object)value
+      style: secondary
+      start: 52
+      end: 65

@@ -1,0 +1,35 @@
+id: anti-slop-cpp/no-void-pointer-cast-chain
+snapshots:
+  ? |
+    int f(int *value) { return reinterpret_cast<int *>(static_cast<void *>(value)); }
+  : labels:
+    - source: reinterpret_cast<int *>(static_cast<void *>(value))
+      style: primary
+      start: 27
+      end: 78
+    - source: static_cast<void *>(value)
+      style: secondary
+      start: 51
+      end: 77
+  ? |
+    int f(int *value) { return static_cast<int *>(reinterpret_cast<void *>(value)); }
+  : labels:
+    - source: static_cast<int *>(reinterpret_cast<void *>(value))
+      style: primary
+      start: 27
+      end: 78
+    - source: reinterpret_cast<void *>(value)
+      style: secondary
+      start: 46
+      end: 77
+  ? |
+    int f(int *value) { return static_cast<int *>(static_cast<void *>(value)); }
+  : labels:
+    - source: static_cast<int *>(static_cast<void *>(value))
+      style: primary
+      start: 27
+      end: 73
+    - source: static_cast<void *>(value)
+      style: secondary
+      start: 46
+      end: 72

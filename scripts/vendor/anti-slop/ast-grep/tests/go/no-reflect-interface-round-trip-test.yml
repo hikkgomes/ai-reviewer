@@ -1,0 +1,40 @@
+id: anti-slop-go/no-reflect-interface-round-trip
+valid:
+  - |
+      package p
+      func f(value any) { _ = value }
+  - |
+      package p
+      import "reflect"
+      func f(value any) { _ = reflect.ValueOf(value) }
+  - |
+      package p
+      func f(value any) { _ = value.(Target) }
+  - |
+      package p
+      func f(value any) { _ = reflect.TypeOf(value) }
+  - |
+      package p
+      func f(value any) { var x any = value; _ = x }
+  - |
+      package p
+      func f(value any) { _ = value }
+  - |
+      package p
+      func f(value any) { _ = any(value) }
+  - |
+      package p
+      func f(value any) { _ = interface{}(value) }
+invalid:
+  - |
+      package p
+      import "reflect"
+      func f(value any) { _ = reflect.ValueOf(value).Interface().(Target) }
+  - |
+      package p
+      import "reflect"
+      func f(value any) { _ = reflect.ValueOf(value).Interface().(Other) }
+  - |
+      package p
+      import "reflect"
+      func f(value any) { _ = reflect.ValueOf(value).Interface().(Result) }

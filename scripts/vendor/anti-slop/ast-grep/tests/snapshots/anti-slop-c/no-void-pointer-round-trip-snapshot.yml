@@ -1,0 +1,23 @@
+id: anti-slop-c/no-void-pointer-round-trip
+snapshots:
+  ? |
+    int f(void *value) { return (Target *) (void *) value; }
+  : labels:
+    - source: (Target *) (void *) value
+      style: primary
+      start: 28
+      end: 53
+  ? |
+    int f(void *value) { return (char *) (void *) value; }
+  : labels:
+    - source: (char *) (void *) value
+      style: primary
+      start: 28
+      end: 51
+  ? |
+    int f(void *value) { return (int *) (void *) value; }
+  : labels:
+    - source: (int *) (void *) value
+      style: primary
+      start: 28
+      end: 50

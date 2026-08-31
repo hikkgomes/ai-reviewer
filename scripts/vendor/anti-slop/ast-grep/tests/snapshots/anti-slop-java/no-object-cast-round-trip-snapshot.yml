@@ -1,0 +1,23 @@
+id: anti-slop-java/no-object-cast-round-trip
+snapshots:
+  ? |
+    class C { void f(Target value) { Other x = (Other) (Object) value; } }
+  : labels:
+    - source: (Other) (Object) value
+      style: primary
+      start: 43
+      end: 65
+  ? |
+    class C { void f(Target value) { Result x = (Result) (Object) value; } }
+  : labels:
+    - source: (Result) (Object) value
+      style: primary
+      start: 44
+      end: 67
+  ? |
+    class C { void f(Target value) { Target x = (Target) (Object) value; } }
+  : labels:
+    - source: (Target) (Object) value
+      style: primary
+      start: 44
+      end: 67

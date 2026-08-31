@@ -1,0 +1,27 @@
+id: anti-slop-csharp/no-literal-type-reflection
+valid:
+  - |
+      class C { void M() { GetMethodName(); } }
+  - |
+      class C { void M(Type type) { type.GetMethod(name); } }
+  - |
+      class C { void M() { typeof(KnownType).GetMethod(name); } }
+  - |
+      class C { void M() { typeof(KnownType).GetMethods(); } }
+  - |
+      class C { void M() { typeof(KnownType).GetProperties(); } }
+  - |
+      class C { void M() { GetPropertyName(); } }
+  - |
+      class C { void M() { string name = "literal"; Use(name); } }
+  - |
+      class C { void M() { this.GetMethod("x"); } }
+  - |
+      class C { void M() { typeof(KnownType).GetName(); } }
+invalid:
+  - |
+      class C { void M() { typeof(KnownType).GetMethod("LiteralName"); } }
+  - |
+      class C { void M() { typeof(KnownType).GetProperty("LiteralName"); } }
+  - |
+      class C { void M() { typeof(OtherType).GetMethod("OtherName"); } }

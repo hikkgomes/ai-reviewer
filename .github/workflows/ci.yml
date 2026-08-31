@@ -27,6 +27,8 @@ jobs:
       - name: Install anti-slop runtime
         run: npm ci
         working-directory: scripts/vendor/anti-slop
+      - name: Run native ast-grep rule tests
+        run: scripts/vendor/anti-slop/node_modules/.bin/ast-grep test --config scripts/vendor/anti-slop/ast-grep/sgconfig.yml --color never
       - name: Run offline regression suite
         run: python3 -m unittest discover -s tests -v
       - name: Verify generated adapters
@@ -44,3 +46,61 @@ jobs:
           for result in /tmp/dissect-benchmark-results/agent-*.json; do
             python3 scripts/validate_review_result.py "$result"
           done
+
+  macos-runtime-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: npm
+          cache-dependency-path: scripts/vendor/anti-slop/package-lock.json
+      - name: Install anti-slop runtime
+        run: npm ci
+        working-directory: scripts/vendor/anti-slop
+      - name: Exercise skill-local runtimes and language backends
+        run: |
+          set -euo pipefail
+          OXLINT="scripts/vendor/anti-slop/node_modules/.bin/oxlint"
+          AST_GREP="scripts/vendor/anti-slop/node_modules/.bin/ast-grep"
+          "$OXLINT" --version
+          "$AST_GREP" --version
+          fixture_dir="$(mktemp -d)"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          python3 - "$fixture_dir" <<'PY'
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          (root / "app.ts").write_text("export function load(value: unknown): unknown { return value; }\n")
+          (root / "app.py").write_text("from typing import Any, cast\nvalue = cast(Target, cast(Any, source))\n")
+          (root / "app.go").write_text("package p\nfunc load(value any) { _ = any(value).(Target) }\n")
+          PY
+          if "$OXLINT" --config scripts/vendor/anti-slop/oxlint-review.json --format json \
+            --no-ignore --disable-nested-config "$fixture_dir/app.ts" > "$fixture_dir/oxlint.json"; then
+            :
+          else
+            oxlint_status=$?
+            [ "$oxlint_status" -eq 1 ]
+          fi
+          PYTHONPATH=scripts python3 - "$fixture_dir" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          from dissect_checks.anti_slop.orchestrator import analyse
+
+          root = Path(sys.argv[1])
+          python_result = analyse(root, [root / "app.py"])
+          if python_result["state"] != "Checked" or not python_result["candidates"]:
+              raise SystemExit("Python AST smoke test did not produce a candidate")
+          ast_result = analyse(root, [root / "app.go"])
+          if ast_result["state"] != "Checked" or not ast_result["candidates"]:
+              raise SystemExit("ast-grep smoke test did not produce a candidate")
+          if not isinstance(json.loads((root / "oxlint.json").read_text()), dict):
+              raise SystemExit("Oxlint smoke output was not JSON")
+          PY

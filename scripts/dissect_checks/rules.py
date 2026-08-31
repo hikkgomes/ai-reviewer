@@ -5,10 +5,17 @@ from pathlib import Path
 import re
 from typing import Callable, Iterable
 
+from language_registry import LANGUAGE_SPECS, language_for_path
 from .model import Finding
 
 
 Matcher = Callable[[str, str], Iterable[tuple[int, str]]]
+_JS_TS_SUFFIXES = tuple(sorted(
+    suffix
+    for spec in LANGUAGE_SPECS
+    if spec.language_id in {"javascript", "typescript"}
+    for suffix in spec.suffixes
+))
 
 
 @dataclass(frozen=True)
@@ -125,7 +132,8 @@ def _missing_webhook_verification(path: str, text: str) -> Iterable[tuple[int, s
 
 
 def _ui_only_auth(path: str, text: str) -> Iterable[tuple[int, str]]:
-    if Path(path).suffix.lower() not in {".js", ".jsx", ".ts", ".tsx"}:
+    spec = language_for_path(path)
+    if spec is None or spec.language_id not in {"javascript", "typescript"}:
         return []
     pattern = re.compile(
         r"(?:localStorage|sessionStorage)\.getItem\(['\"](?:token|isAdmin|role)['\"]\)"
@@ -137,7 +145,8 @@ def _ui_only_auth(path: str, text: str) -> Iterable[tuple[int, str]]:
 
 def _browser_privileged_key(path: str, text: str) -> Iterable[tuple[int, str]]:
     suffix = Path(path).suffix.lower()
-    if suffix not in {".js", ".jsx", ".ts", ".tsx", ".map"}:
+    spec = language_for_path(path)
+    if suffix != ".map" and (spec is None or spec.language_id not in {"javascript", "typescript"}):
         return []
     public_name = re.compile(
         r"(?:NEXT_PUBLIC|VITE|PUBLIC|REACT_APP)[A-Z0-9_]*(?:SERVICE_ROLE|SECRET|PRIVATE_KEY)[A-Z0-9_]*",
@@ -309,7 +318,7 @@ RULES = (
         "Resolve price, currency, product, and discounts from trusted server-side data and validate them.",
         regex_matcher(
             r"(?:amount|unit_amount)\s*:\s*(?:req|request)\.(?:body|json\(\))[\w.()\[\]'\"-]*(?:amount|price)",
-            suffixes=(".js", ".jsx", ".ts", ".tsx"),
+            suffixes=_JS_TS_SUFFIXES,
         ),
         ("api/checkout.ts", "stripe.paymentIntents.create({amount: req.body.amount})"),
         ("api/checkout.ts", "stripe.paymentIntents.create({amount: product.priceInCents})"),

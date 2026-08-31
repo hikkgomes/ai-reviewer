@@ -1,0 +1,26 @@
+id: anti-slop-rust/no-immediate-any-round-trip
+valid:
+  - |
+      fn f(value: T) { let _ = value; }
+  - |
+      fn f(value: T) { let _ = Box::new(value); }
+  - |
+      fn f(value: T) { let _ = value.downcast::<T>(); }
+  - |
+      fn f(value: T) { let _ = Vec::<T>::new(); }
+  - |
+      fn f(value: T) { let _ = Box::new(value).downcast::<U>(); }
+  - |
+      fn f(value: T) { let _ = Some(value); }
+  - |
+      fn f(value: T) { let _ = value; }
+  - |
+      fn f(value: T) { let _ = Box::from(value); }
+invalid:
+  - |
+      use std::any::Any;
+      fn f(value: T) { let _ = (Box::new(value) as Box<dyn Any>).downcast::<T>(); }
+  - |
+      fn f(value: U) { let _ = (Box::new(value) as Box<dyn std::any::Any>).downcast::<U>(); }
+  - |
+      fn f(value: T) { let _ = (Box::new(value) as Box<dyn std::any::Any>).downcast::<U>(); }

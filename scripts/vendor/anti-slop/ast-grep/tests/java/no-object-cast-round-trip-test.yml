@@ -1,0 +1,25 @@
+id: anti-slop-java/no-object-cast-round-trip
+valid:
+  - |
+      class C { void f(Target value) { Target x = value; } }
+  - |
+      class C { void f(Target value) { Object x = value; } }
+  - |
+      class C { void f(Object value) { Target x = (Target) value; } }
+  - |
+      class C { void f(Target value) { String x = (String) value; } }
+  - |
+      class C { void f(Target value) { use(value); } }
+  - |
+      class C { void f(Target value) { Object x = (Object) value; } }
+  - |
+      class C { void f(Target value) { if (value != null) use(value); } }
+  - |
+      class C { void f(Target value) { returnValue(value); } }
+invalid:
+  - |
+      class C { void f(Target value) { Target x = (Target) (Object) value; } }
+  - |
+      class C { void f(Target value) { Other x = (Other) (Object) value; } }
+  - |
+      class C { void f(Target value) { Result x = (Result) (Object) value; } }

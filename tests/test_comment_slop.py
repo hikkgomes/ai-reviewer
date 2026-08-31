@@ -144,15 +144,22 @@ class CommentSlopTests(unittest.TestCase):
                 original = Path.read_text
 
                 def read_text(path: Path, *args: object, **kwargs: object) -> str:
-                    if path == bad:
-                        raise OSError("permission denied")
                     return original(path, *args, **kwargs)
+
+                original_bounded = build_review_context._bounded_file_bytes
+
+                def bounded_file_bytes(path: Path, limit: int) -> tuple[bytes | None, str | None]:
+                    if path == bad:
+                        return None, "read_failure: permission denied"
+                    return original_bounded(path, limit)
 
                 entries = [
                     DiffEntry("??", name, name, True, "untracked")
                     for name in ("good.ts", "bad.ts")
                 ]
-                with patch.object(Path, "read_text", autospec=True, side_effect=read_text):
+                with patch.object(Path, "read_text", autospec=True, side_effect=read_text), patch(
+                    "build_review_context._bounded_file_bytes", side_effect=bounded_file_bytes,
+                ):
                     values, limitations, coverage, commands = build_review_context.optional_analyser_evidence(
                         root, mode, ["good.ts", "bad.ts"], entries, "",
                         {"review_options": {"anti_slop": False}},
@@ -171,13 +178,13 @@ class CommentSlopTests(unittest.TestCase):
                     (root / name).write_text("// Update the account owner\nsaveUser(user);\n")
                 entries = [DiffEntry("??", name, name, True, "untracked") for name in ("one.ts", "two.ts")]
                 counts: dict[Path, int] = {}
-                original = Path.read_text
+                original_bounded = build_review_context._bounded_file_bytes
 
-                def read_text(path: Path, *args: object, **kwargs: object) -> str:
+                def bounded_file_bytes(path: Path, limit: int) -> tuple[bytes | None, str | None]:
                     counts[path] = counts.get(path, 0) + 1
-                    return original(path, *args, **kwargs)
+                    return original_bounded(path, limit)
 
-                with patch.object(Path, "read_text", autospec=True, side_effect=read_text):
+                with patch("build_review_context._bounded_file_bytes", side_effect=bounded_file_bytes):
                     build_review_context.optional_analyser_evidence(
                         root, mode, ["one.ts", "two.ts"], entries, "",
                         {"review_options": {"anti_slop": False}},

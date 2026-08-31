@@ -12,6 +12,7 @@ import sys
 
 from .fixtures import is_trusted_self_review, mask_owned_fixture_spans
 from file_paths import iter_files
+from language_registry import LANGUAGE_SPECS, language_for_path
 from .legacy import scan_legacy
 from .model import Finding, HistoricalSource
 from .python_dependencies import (
@@ -29,11 +30,8 @@ DEFAULT_IGNORES = {
     ".git", ".next", ".turbo", ".cache", "node_modules", "vendor", "dist",
     "build", "coverage", "target", "__pycache__",
 }
-TEXT_SUFFIXES = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs",
-    ".rb", ".php", ".java", ".kt", ".kts", ".cs", ".swift", ".sh", ".bash",
-    ".zsh", ".ps1", ".sql", ".tf", ".yml", ".yaml", ".json", ".toml",
-    ".ini", ".cfg", ".md", ".txt", ".map",
+TEXT_SUFFIXES = {suffix for spec in LANGUAGE_SPECS for suffix in spec.suffixes} | {
+    ".json", ".txt", ".map",
 }
 JS_BUILTINS = {
     "assert", "buffer", "child_process", "crypto", "events", "fs", "http",
@@ -702,7 +700,8 @@ def _javascript_dependency_findings(
     )
     findings = []
     for rel in files:
-        if Path(rel).suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        spec = language_for_path(rel)
+        if spec is None or spec.language_id not in {"javascript", "typescript"}:
             continue
         applicable = _nearest_manifest(rel, manifests)
         if applicable is None:
@@ -767,7 +766,8 @@ def _python_dependency_findings(
     )
     findings = []
     for rel in files:
-        if Path(rel).suffix.lower() != ".py":
+        spec = language_for_path(rel)
+        if spec is None or spec.language_id != "python":
             continue
         applicable = nearest_context(rel, manifests)
         manifest_paths = applicable.paths if applicable else ()
@@ -781,7 +781,7 @@ def _python_dependency_findings(
             sibling_modules = {
                 child.stem if child.is_file() else child.name
                 for child in source_dir.iterdir()
-                if child.suffix == ".py" or child.is_dir()
+                if (language_for_path(child) is not None and language_for_path(child).language_id == "python") or child.is_dir()
             }
         except OSError:
             sibling_modules = set()

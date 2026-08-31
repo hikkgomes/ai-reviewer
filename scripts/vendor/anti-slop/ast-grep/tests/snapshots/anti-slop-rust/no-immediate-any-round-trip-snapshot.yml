@@ -1,0 +1,24 @@
+id: anti-slop-rust/no-immediate-any-round-trip
+snapshots:
+  ? |
+    fn f(value: T) { let _ = (Box::new(value) as Box<dyn std::any::Any>).downcast::<U>(); }
+  : labels:
+    - source: (Box::new(value) as Box<dyn std::any::Any>).downcast::<U>()
+      style: primary
+      start: 25
+      end: 84
+  ? |
+    fn f(value: U) { let _ = (Box::new(value) as Box<dyn std::any::Any>).downcast::<U>(); }
+  : labels:
+    - source: (Box::new(value) as Box<dyn std::any::Any>).downcast::<U>()
+      style: primary
+      start: 25
+      end: 84
+  ? |
+    use std::any::Any;
+    fn f(value: T) { let _ = (Box::new(value) as Box<dyn Any>).downcast::<T>(); }
+  : labels:
+    - source: (Box::new(value) as Box<dyn Any>).downcast::<T>()
+      style: primary
+      start: 44
+      end: 93

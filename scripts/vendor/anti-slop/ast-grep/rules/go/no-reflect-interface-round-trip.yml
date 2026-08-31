@@ -1,0 +1,11 @@
+id: anti-slop-go/no-reflect-interface-round-trip
+language: Go
+message: Reflection is immediately converted back to a concrete interface type.
+severity: warning
+metadata:
+  contract: anti-slop-go/no-reflect-interface-round-trip
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: medium
+rule:
+  pattern: reflect.ValueOf($VALUE).Interface().($TARGET)

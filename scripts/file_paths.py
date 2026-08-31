@@ -11,6 +11,7 @@ import json
 import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any, Mapping
 
 
 DEFAULT_IGNORED_DIRS = frozenset({
@@ -66,11 +67,12 @@ def is_ignored_path(
 ) -> bool:
     """Apply built-in and configured path exclusions to one path."""
     root = root.absolute()
+    resolved_root = root.resolve()
     candidate = Path(path)
-    resolved = candidate if candidate.is_absolute() else root / candidate
+    resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
     try:
-        relative = resolved.absolute().relative_to(root).as_posix()
-    except ValueError:
+        relative = resolved.relative_to(resolved_root).as_posix()
+    except (OSError, ValueError):
         return True
     current = root
     for part in Path(relative).parts[:-1]:
@@ -79,6 +81,29 @@ def is_ignored_path(
             return True
     patterns = configured_ignore_patterns(root) if ignored_paths is None else ignored_paths
     return any(matches_ignore_pattern(relative, pattern) for pattern in patterns)
+
+
+def is_generated_path(root: Path, path: Path, config: Mapping[str, Any]) -> bool:
+    """Return whether a path is configured as generated output.
+
+    Generated policy is explicit.  This helper does not guess from filenames
+    or broad directory names, so generated files remain reviewable by the
+    deterministic security scanner when its existing opt-in requires them.
+    """
+    root = root.absolute()
+    resolved_root = root.resolve()
+    try:
+        relative = path.resolve().relative_to(resolved_root).as_posix()
+    except (OSError, ValueError):
+        return False
+    paths = config.get("paths") if isinstance(config, Mapping) else None
+    values = paths.get("generated", []) if isinstance(paths, Mapping) else []
+    if not isinstance(values, list):
+        return False
+    return any(
+        isinstance(pattern, str) and pattern and matches_ignore_pattern(relative, pattern)
+        for pattern in values
+    )
 
 
 def iter_files(
@@ -92,8 +117,14 @@ def iter_files(
     # Preserve the caller's path spelling: on macOS ``/var`` resolves to
     # ``/private/var``, which breaks later ``Path.relative_to(root)`` calls.
     root = root.absolute()
+    resolved_root = root.resolve()
     configured = configured_ignore_patterns(root) if ignored_paths is None else ignored_paths
-    for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for directory, dirnames, filenames in os.walk(
+        root, topdown=True, followlinks=False, onerror=raise_walk_error,
+    ):
         parent = Path(directory)
         dirnames[:] = sorted(
             name for name in dirnames
@@ -107,7 +138,12 @@ def iter_files(
         )
         for name in sorted(filenames):
             path = parent / name
-            if path.is_file() and not any(
+            try:
+                path.resolve().relative_to(resolved_root)
+                inside_root = True
+            except (OSError, ValueError):
+                inside_root = False
+            if inside_root and path.is_file() and not any(
                 matches_ignore_pattern(path.relative_to(root).as_posix(), pattern)
                 for pattern in configured
             ):

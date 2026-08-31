@@ -45,6 +45,9 @@ Weak signals, context only and never findings alone:
 Effect rules apply only when the project depends on `effect`. An anti-slop
 diagnostic proves that a pattern occurred, not that behaviour is wrong. Verify
 the concrete contract violated or the evidence gap before reporting it.
+
+The backend also covers `.mts` and `.cts` files. It uses the skill-local
+Oxlint `1.78.0` runtime and never downloads rules during a review.
 # Operational tracing playbook
 
 Inspect task/PR intent, public types, schemas, generated API clients, route

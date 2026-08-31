@@ -1,0 +1,15 @@
+id: anti-slop-java/no-literal-class-reflection
+language: Java
+message: Literal class reflection may duplicate a direct member contract.
+severity: warning
+metadata:
+  contract: anti-slop-java/no-literal-class-reflection
+  contract_reference: reference/anti-slop-rule-contract.md
+  analysis_level: structural
+  confidence: medium
+rule:
+  kind: method_invocation
+  any:
+    - pattern: $TYPE.class.getDeclaredMethod("$NAME")
+    - pattern: $TYPE.class.getDeclaredMethod("$NAME", $ARG)
+    - pattern: $TYPE.class.getDeclaredField("$NAME")

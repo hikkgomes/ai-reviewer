@@ -1,0 +1,25 @@
+id: anti-slop-cpp/no-void-pointer-cast-chain
+valid:
+  - |
+      int f(int *value) { return value; }
+  - |
+      int f(int *value) { return static_cast<long *>(value); }
+  - |
+      int f(int *value) { return reinterpret_cast<long *>(value); }
+  - |
+      int f(void *value) { return static_cast<int *>(value); }
+  - |
+      int f(int value) { return static_cast<int>(value); }
+  - |
+      int f(int *value) { return *value; }
+  - |
+      int f(int value) { return value + 1; }
+  - |
+      int f(int *value) { return value != nullptr; }
+invalid:
+  - |
+      int f(int *value) { return static_cast<int *>(static_cast<void *>(value)); }
+  - |
+      int f(int *value) { return reinterpret_cast<int *>(static_cast<void *>(value)); }
+  - |
+      int f(int *value) { return static_cast<int *>(reinterpret_cast<void *>(value)); }
