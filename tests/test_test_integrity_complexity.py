@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 import unittest
@@ -23,9 +24,9 @@ from dissect_checks.test_integrity.evidence_matrix import MatrixScenario, _matri
 from dissect_checks.test_integrity.model import TestRunResult, SCENARIO_IDS
 from dissect_checks.test_integrity.mutation import removal_decision
 from dissect_checks.test_integrity.proof_test import ProofCandidate, proof_outcome, validate_test_patch
-from dissect_checks.test_integrity.orchestrator import source_maps
+from dissect_checks.test_integrity.orchestrator import _approval_config, source_maps
 from dissect_checks.test_integrity.inventory import build_inventory
-from dissect_checks.test_integrity.static_analysis import analyse_static
+from dissect_checks.test_integrity.static_analysis import analyse_static, new_test_approval_digest
 
 
 class TestIntegrityComplexityTests(unittest.TestCase):
@@ -189,10 +190,113 @@ class TestIntegrityComplexityTests(unittest.TestCase):
             self.assertFalse(requested.candidates)
             approved = analyse_with(intent_text="Approve adding a new test file for the parser.")
             self.assertFalse(approved.candidates)
+            scope = {
+                "path_patterns": [relative],
+                "roles": ["test"],
+                "max_count": 1,
+                "production_subjects": [],
+                "base_revision": "",
+                "head_revision": "",
+            }
+            scope["digest"] = new_test_approval_digest(scope)
             configured = analyse_with(
-                config={"review_options": {"test_integrity_approved_new_paths": [relative]}}
+                config={"review_options": {"test_integrity_new_test_approval": scope}}
             )
             self.assertFalse(configured.candidates)
+
+    def test_repository_local_text_cannot_authorise_new_test_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relative = "tests/test_new.py"
+            values = {relative: "def test_new():\n    assert True\n"}
+            inventory = build_inventory(root, values, content_by_path=values)
+            result = analyse_static(
+                root,
+                inventory,
+                paths=[relative],
+                base_contents={},
+                head_contents=values,
+                changed_paths=[relative],
+                enabled_rules={"GOV-TESTS-010"},
+                intent_text="Create a new test file for the parser.",
+                trusted_intent_text="",
+            )
+            self.assertEqual([item["source"] for item in result.candidates], ["GOV-TESTS-010"])
+
+    def test_creation_approval_is_bound_to_path_role_and_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = {
+                "tests/test_parser.py": "def test_parser():\n    assert True\n",
+                "tests/fixtures/extra.py": "def test_fixture():\n    assert True\n",
+            }
+            inventory = build_inventory(root, values, content_by_path=values)
+            scope = {
+                "path_patterns": ["tests/test_parser.py"],
+                "roles": ["test"],
+                "max_count": 1,
+                "production_subjects": [],
+                "base_revision": "base",
+                "head_revision": "head",
+            }
+            scope["digest"] = new_test_approval_digest(scope)
+            result = analyse_static(
+                root,
+                inventory,
+                paths=list(values),
+                base_contents={},
+                head_contents=values,
+                changed_paths=list(values),
+                enabled_rules={"GOV-TESTS-010"},
+                new_test_approval=scope,
+                approval_digest=scope["digest"],
+                base_revision="base",
+                head_revision="head",
+            )
+            self.assertEqual(
+                [item["supporting_evidence"][0]["file"] for item in result.candidates],
+                ["tests/fixtures/extra.py"],
+            )
+
+    def test_changed_repository_approval_uses_the_base_revision_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            head_config = {
+                "review_options": {
+                    "test_integrity_new_test_approval": {
+                        "path_patterns": ["tests/test_parser.py"],
+                        "roles": ["test"],
+                        "max_count": 1,
+                        "production_subjects": [],
+                        "base_revision": "base",
+                        "head_revision": "head",
+                        "digest": "f" * 64,
+                    }
+                }
+            }
+            effective = _approval_config(
+                root,
+                head_config,
+                {".ai-review/local.json": json.dumps({"review_options": {}})},
+                [".ai-review/local.json"],
+                mode="diff",
+                base_revision="base",
+            )
+            self.assertNotIn("test_integrity_new_test_approval", effective["review_options"])
+
+    def test_inventory_separates_test_tooling_from_production_test_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = {
+                "src/test_integrity/inventory.py": "import ast\ndef inspect_tests(value):\n    return ast.parse(value)\n",
+                "src/proof_test.py": "def proof_test(value):\n    assert value\n    return value\n",
+                "src/checker.py": "RULE_TEXT = \"def test_case(): pytest.skip('disabled')\"\n",
+            }
+            inventory = build_inventory(root, values, content_by_path=values)
+            roles = {item.logical_path: item.role for item in inventory.artifacts}
+            self.assertEqual(roles["src/test_integrity/inventory.py"], "test tooling")
+            self.assertEqual(roles["src/proof_test.py"], "production source")
+            self.assertEqual(roles["src/checker.py"], "production source")
 
     def test_static_integrity_ignores_todo_comments_and_detects_js_test_seams(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -533,6 +637,40 @@ class TestIntegrityComplexityTests(unittest.TestCase):
             )
             self.assertEqual(malformed.status, "partial")
             self.assertEqual(malformed.reason_code, "parse_error")
+
+    def test_complexity_ranks_before_applying_candidate_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = "\n".join(
+                [
+                    "def modest(value):",
+                    *[
+                        line
+                        for index in range(16)
+                        for line in (f"    if value == {index}:", f"        return {index}")
+                    ],
+                    "    return -1",
+                    "",
+                    "def extreme(value):",
+                    *[
+                        line
+                        for index in range(20)
+                        for line in (f"    if value == {index}:", f"        return {index}")
+                    ],
+                    "    return -1",
+                    "",
+                ]
+            )
+            result = analyse_complexity(
+                root,
+                ["module.py"],
+                config={"review_options": {"analysis_limits": {"complexity_max_candidates": 1}}},
+                head_contents={"module.py": source},
+            )
+            self.assertEqual(result.candidate_summary["emitted_candidates"], 1)
+            self.assertTrue(result.candidate_summary["truncated"])
+            self.assertEqual(result.candidate_summary["reason_code"], "max_candidates")
+            self.assertEqual(result.candidates[0].function.qualified_name.split("(", 1)[0], "extreme")
 
     def test_proof_patch_is_test_only_and_requires_independent_oracle(self) -> None:
         candidate = ProofCandidate("candidate-1", "The service rejects the request.", "public_contract", "ISSUE-1", ("service.load",), "fail", "known_good")

@@ -42,7 +42,7 @@
   "$defs": {
     "intent": {
       "type": "object",
-      "required": ["sources", "summary", "constraints", "negative_requirements", "ambiguities"],
+      "required": ["sources", "summary", "approval_text", "constraints", "negative_requirements", "ambiguities"],
       "properties": {
         "sources": {"type": "array", "items": {"type": "object"}},
         "summary": {"type": "string"},
@@ -94,7 +94,7 @@
     },
     "complexity": {
       "type": "object",
-      "required": ["status", "backend_id", "functions", "candidates", "policy"],
+      "required": ["status", "backend_id", "functions", "candidates", "candidate_summary", "policy"],
       "properties": {
         "status": {"enum": ["complete", "partial", "not_applicable", "unavailable", "failed"]},
         "state": {"enum": ["Finding", "Checked", "Not applicable", "Not verified"]},
@@ -105,9 +105,22 @@
         "reason_code": {"type": ["string", "null"]},
         "functions": {"type": "array", "items": {"$ref": "#/$defs/complexity_function"}},
         "candidates": {"type": "array", "items": {"$ref": "#/$defs/complexity_candidate"}},
+        "candidate_summary": {
+          "type": "object",
+          "required": ["total_candidates", "emitted_candidates", "truncated", "reason_code"],
+          "properties": {
+            "total_candidates": {"type": "integer", "minimum": 0},
+            "emitted_candidates": {"type": "integer", "minimum": 0},
+            "truncated": {"type": "boolean"},
+            "reason_code": {"type": ["string", "null"]}
+          }
+        },
         "policy": {"type": "object"},
         "parse_states": {"type": "object", "additionalProperties": {"enum": ["complete", "failed", "not_verified", "not_run"]}},
-        "parse_errors": {"type": "array", "items": {"type": "object"}}
+        "parse_errors": {"type": "array", "items": {"type": "object"}},
+        "total_candidates": {"type": "integer", "minimum": 0},
+        "emitted_candidates": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "boolean"}
       },
       "additionalProperties": true
     },

@@ -349,7 +349,7 @@ def _build_candidates(
     limits: Mapping[str, int | float],
     budget: AnalysisBudget,
     base_unverified: set[str] | None = None,
-) -> tuple[list[ComplexityCandidate], set[str], str | None]:
+) -> tuple[list[ComplexityCandidate], set[str], str | None, dict[str, Any]]:
     candidates: list[ComplexityCandidate] = []
     unverified_ranges: set[str] = set()
     reason: str | None = None
@@ -394,11 +394,6 @@ def _build_candidates(
         )
         if candidate_reason is None:
             continue
-        try:
-            budget.claim_candidate()
-        except AnalysisBudgetExceeded:
-            reason = reason or "max_candidates"
-            break
         candidates.append(ComplexityCandidate(
             f"candidate-complexity-{hashlib.sha256((function.function_id + candidate_reason).encode()).hexdigest()[:24]}",
             function, candidate_reason, threshold, threshold_source,
@@ -410,7 +405,44 @@ def _build_candidates(
             base_complexity=base_complexity, head_complexity=function.cyclomatic,
             delta=delta, changed_lines=line_set, mapping_status=mapping_status,
         )
-    return candidates, unverified_ranges, reason
+    def priority(item: ComplexityCandidate) -> tuple[Any, ...]:
+        function = item.function
+        changed_production = mode == "diff" and not function.is_test and bool(item.changed_lines)
+        growth = max(item.delta or 0, 0)
+        ratio = function.cyclomatic / max(1, item.threshold)
+        return (
+            -int(changed_production),
+            -growth,
+            -ratio,
+            -function.cyclomatic,
+            -function.nloc,
+            -function.token_count,
+            function.logical_path,
+            function.start_line,
+            function.qualified_name,
+        )
+
+    candidates.sort(key=priority)
+    total_candidates = len(candidates)
+    candidate_limit = budget.max_candidates if budget.max_candidates is not None else total_candidates
+    emitted = candidates[:candidate_limit]
+    for _candidate_record in emitted:
+        try:
+            budget.claim_candidate()
+        except AnalysisBudgetExceeded:
+            reason = reason or "max_candidates"
+            emitted = emitted[:budget.max_candidates or 0]
+            break
+    truncated = len(emitted) < total_candidates
+    summary = {
+        "total_candidates": total_candidates,
+        "emitted_candidates": len(emitted),
+        "truncated": truncated,
+        "reason_code": "max_candidates" if truncated else None,
+    }
+    if truncated:
+        reason = reason or "max_candidates"
+    return emitted, unverified_ranges, reason, summary
 
 
 def analyse(
@@ -539,7 +571,7 @@ def analyse(
     reason = reason or base_reason
     if base_reason:
         parse_errors.append({"scope": "base", "reason_code": base_reason})
-    candidates, unverified_ranges, candidate_reason = _build_candidates(
+    candidates, unverified_ranges, candidate_reason, candidate_summary = _build_candidates(
         functions,
         base_functions,
         mode=mode,
@@ -579,6 +611,7 @@ def analyse(
         applicable, max(0, checked), skipped_files, reason,
         parse_states=parse_states,
         parse_errors=tuple(parse_errors),
+        candidate_summary=candidate_summary,
     )
 
 

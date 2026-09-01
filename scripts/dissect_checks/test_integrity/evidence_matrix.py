@@ -1095,6 +1095,355 @@ def _execute_plan(plan: ExecutionPlan, approval: str) -> tuple[subprocess.Comple
     return execute_approved_plan(plan, approval)
 
 
+@dataclass(frozen=True)
+class _ScenarioContext:
+    root: Path
+    partition: ChangePartition
+    selected: tuple[str, ...]
+    all_paths: tuple[str, ...]
+    production_paths: frozenset[str]
+    test_paths: frozenset[str]
+    base_values: Mapping[str, bytes | str]
+    head_values: Mapping[str, bytes | str]
+    base_command_source: tuple[str, str] | None
+    head_command_source: tuple[str, str] | None
+    config: Mapping[str, Any]
+    create_plans: bool
+    configuration_ambiguous: bool
+    temporary_root: Path | None
+    base_source: Path
+    head_source: Path
+    source_materialisation_error: str | None
+    repository_id: str
+    binding_base_revision: str
+    binding_head_revision: str
+    matrix_deadline: float
+    timeout_seconds: float
+    output_limit: int
+    approved_digests: Mapping[str, str]
+    flaky_repetitions: int
+    reachability: Mapping[str, str]
+    reached_subjects: Mapping[str, tuple[str, ...]]
+    focal_subjects: Mapping[str, tuple[str, ...]]
+
+
+def _scenario_values(context: _ScenarioContext, production_state: str, test_state: str) -> tuple[dict[str, bytes], list[str], dict[str, Any]]:
+    values: dict[str, bytes] = {}
+    removed: list[str] = []
+    for path in context.all_paths:
+        source = (
+            context.base_values if path in context.production_paths and production_state == "base"
+            else context.head_values if path in context.production_paths
+            else context.base_values if path in context.test_paths and test_state == "base"
+            else context.head_values
+        )
+        value = source.get(path)
+        if value is None:
+            removed.append(path)
+        else:
+            values[path] = value if isinstance(value, bytes) else value.encode("utf-8", errors="surrogatepass")
+    source_hashes = _scenario_hashes(
+        {path: values[path] for path in context.partition.production if path in values},
+        {path: values[path] for path in context.partition.tests + context.partition.test_support if path in values},
+        {path: values[path] for path in context.partition.shared_configuration if path in values},
+        all_values=values,
+    )
+    source_hashes.update({
+        "base_source_sha256": _file_digest(context.base_values),
+        "head_source_sha256": _file_digest(context.head_values),
+        "scenario_source_sha256": _file_digest(values),
+        "source_files_present": sorted(values),
+        "source_files_absent": sorted(set(context.all_paths) - set(values)),
+        "production_source_state": production_state,
+        "test_source_state": test_state,
+    })
+    return values, removed, source_hashes
+
+
+def _incomplete_scenario(
+    context: _ScenarioContext,
+    scenario_id: str,
+    production_state: str,
+    test_state: str,
+    source_hashes: Mapping[str, Any],
+    reason: str,
+    plan: ExecutionPlan | None = None,
+) -> MatrixScenario:
+    result = TestRunResult(
+        scenario_id,
+        plan.approval_digest if plan is not None else "",
+        None,
+        False,
+        None,
+        None,
+        context.selected,
+        "",
+        reason,
+        source_hashes["production_patch_sha256"],
+        source_hashes["test_patch_sha256"],
+        source_hashes["shared_config_patch_sha256"],
+        context.reachability.get(scenario_id, "unverified"),
+        context.reached_subjects.get(scenario_id, ()),
+    )
+    return MatrixScenario(
+        scenario_id, production_state, test_state, source_hashes, context.selected,
+        plan, result, (), context.focal_subjects.get(scenario_id, ()),
+    )
+
+
+def _build_scenario(context: _ScenarioContext, scenario_id: str) -> MatrixScenario:
+    production_state, test_state = _scenario_mapping(scenario_id)
+    values, removed, source_hashes = _scenario_values(context, production_state, test_state)
+    command_source = context.base_command_source if test_state == "base" else context.head_command_source
+    if not context.create_plans or context.configuration_ambiguous:
+        reason = (
+            "shared_configuration_ambiguous"
+            if context.configuration_ambiguous
+            else "command_not_configured" if command_source is None else "not_approved"
+        )
+        return _incomplete_scenario(context, scenario_id, production_state, test_state, source_hashes, reason)
+    if context.temporary_root is None:
+        raise RuntimeError("matrix planning requires a private temporary root")
+    tree = context.temporary_root / scenario_id
+    if context.source_materialisation_error is not None:
+        return _incomplete_scenario(
+            context, scenario_id, production_state, test_state, source_hashes,
+            context.source_materialisation_error,
+        )
+    source_root = (
+        context.base_source if production_state == "base" and test_state == "base"
+        else context.head_source if production_state == "head" and test_state == "head"
+        else context.base_source if production_state == "base" else context.head_source
+    )
+    _materialise(source_root, tree, values, removed)
+    if command_source is None:
+        return _incomplete_scenario(context, scenario_id, production_state, test_state, source_hashes, "command_not_configured")
+    command, source = command_source
+    argv = _command_argv(command)
+    if argv is None:
+        return _incomplete_scenario(context, scenario_id, production_state, test_state, source_hashes, "invalid_test_command")
+    bindings = _plan_bindings(
+        scenario_id, source_hashes,
+        base_revision=context.binding_base_revision,
+        head_revision=context.binding_head_revision,
+        selected_tests=context.selected,
+        focal_subjects=context.focal_subjects.get(scenario_id, ()),
+        repository_id=context.repository_id,
+    )
+    plan, error = build_execution_plan(
+        kind="test-evidence",
+        name=f"{source}:{scenario_id}",
+        argv=argv,
+        working_directory=tree,
+        environment=_scenario_environment(context.config, context.temporary_root, scenario_id),
+        timeout_seconds=min(context.timeout_seconds, max(0.001, context.matrix_deadline - time.monotonic())),
+        output_limit=context.output_limit,
+        bindings=bindings,
+    )
+    if plan is None:
+        return _incomplete_scenario(context, scenario_id, production_state, test_state, source_hashes, error or "plan_unavailable")
+    return _execute_scenario(context, scenario_id, production_state, test_state, source_hashes, plan)
+
+
+def _execute_scenario(
+    context: _ScenarioContext,
+    scenario_id: str,
+    production_state: str,
+    test_state: str,
+    source_hashes: Mapping[str, Any],
+    plan: ExecutionPlan,
+) -> MatrixScenario:
+    """Execute one approved scenario and retain only bounded output evidence."""
+    approval = context.approved_digests.get(scenario_id)
+    if approval is None:
+        return _incomplete_scenario(context, scenario_id, production_state, test_state, source_hashes, "not_approved", plan)
+    source_error = (
+        "source_snapshot_invalid"
+        if not _plan_matches_source_hashes(plan, source_hashes)
+        else _verify_materialised_sources(plan, source_hashes)
+    )
+    if source_error is not None:
+        return _incomplete_scenario(context, scenario_id, production_state, test_state, source_hashes, source_error, plan)
+    completed, execution_error = _execute_plan(plan, approval)
+    if completed is None:
+        return _incomplete_scenario(context, scenario_id, production_state, test_state, source_hashes, execution_error or "execution_failed", plan)
+    output = redact_sensitive_text((completed.stdout or "")[:context.output_limit] + (completed.stderr or "")[:context.output_limit])
+    collected_tests = _collect_count(output)
+    completed_flag, passed, reason_code = _test_outcome(
+        completed.returncode,
+        collected_tests,
+        selected_tests_present=set(context.selected) <= set(source_hashes.get("source_files_present", ())),
+    )
+    result = TestRunResult(
+        scenario_id, plan.approval_digest, completed.returncode, completed_flag,
+        passed, collected_tests, context.selected, bounded_fingerprint(output), reason_code,
+        source_hashes["production_patch_sha256"], source_hashes["test_patch_sha256"],
+        source_hashes["shared_config_patch_sha256"], context.reachability.get(scenario_id, "unverified"),
+        context.reached_subjects.get(scenario_id, ()),
+    )
+    repeated = _repeat_matrix_runs(
+        result, plan, approval, source_hashes, context.selected,
+        context.flaky_repetitions, context.output_limit,
+    )
+    return MatrixScenario(
+        scenario_id, production_state, test_state, source_hashes, context.selected,
+        plan, result, repeated, context.focal_subjects.get(scenario_id, ()),
+    )
+
+
+def _normalise_matrix_options(
+    partition: ChangePartition,
+    *,
+    approved_digests: Mapping[str, str] | None,
+    timeout_seconds: float,
+    flaky_repetitions: int,
+    reachability_by_scenario: Mapping[str, str] | None,
+    reached_subjects_by_scenario: Mapping[str, Iterable[str]] | None,
+    focal_subjects_by_scenario: Mapping[str, Iterable[str]] | None,
+) -> tuple[tuple[str, ...], float, int, dict[str, str], dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+        raise ValueError("matrix timeout must be a finite number greater than zero")
+    if approved_digests is not None:
+        unknown_approvals = sorted(set(approved_digests) - set(SCENARIO_IDS))
+        if unknown_approvals:
+            raise ValueError(f"unknown matrix approval scenario(s): {', '.join(unknown_approvals)}")
+    if isinstance(flaky_repetitions, bool) or not isinstance(flaky_repetitions, int) or flaky_repetitions < 1:
+        raise ValueError("flaky_repetitions must be a positive integer")
+    reachability = dict(reachability_by_scenario or {})
+    if any(key not in SCENARIO_IDS or value not in REACHABILITY_STATES for key, value in reachability.items()):
+        raise ValueError("reachability_by_scenario contains an invalid scenario or state")
+    reached_subjects = {
+        key: tuple(sorted(set(values)))
+        for key, values in (reached_subjects_by_scenario or {}).items()
+    }
+    focal_subjects = {
+        key: tuple(sorted(set(values)))
+        for key, values in (focal_subjects_by_scenario or {}).items()
+    }
+    if any(key not in SCENARIO_IDS for key in (*reached_subjects, *focal_subjects)):
+        raise ValueError("reachability subject evidence contains an invalid scenario")
+    if any(any(not isinstance(value, str) or not value for value in values) for values in (*reached_subjects.values(), *focal_subjects.values())):
+        raise ValueError("reachability subject IDs must be non-empty strings")
+    if any(not set(reached_subjects.get(key, ())) <= set(focal_subjects.get(key, ())) for key in reached_subjects if focal_subjects.get(key)):
+        raise ValueError("reached subject IDs must be mapped focal subjects")
+    if any(state == "confirmed" and not reached_subjects.get(key) or state == "not_reached" and reached_subjects.get(key) for key, state in reachability.items()):
+        raise ValueError("reachability state does not match reached subject evidence")
+    if any(values and not focal_subjects.get(key) for key, values in reached_subjects.items()):
+        raise ValueError("reached subject evidence requires mapped focal subjects")
+    return _selected_tests(partition), float(timeout_seconds), flaky_repetitions, reachability, reached_subjects, focal_subjects
+
+
+def _prepare_matrix_context(
+    root: Path,
+    partition: ChangePartition,
+    *,
+    config: Mapping[str, Any],
+    selected: tuple[str, ...],
+    timeout_seconds: float,
+    matrix_deadline: float,
+    create_plans: bool,
+    flaky_repetitions: int,
+    approved_digests: Mapping[str, str] | None,
+    reachability: Mapping[str, str],
+    reached_subjects: Mapping[str, tuple[str, ...]],
+    focal_subjects: Mapping[str, tuple[str, ...]],
+    base_contents: Mapping[str, bytes | str] | None,
+    head_contents: Mapping[str, bytes | str] | None,
+    base_revision: str,
+    head_revision: str,
+    output_limit: int,
+) -> tuple[_ScenarioContext, tempfile.TemporaryDirectory[str] | None]:
+    partition_sets = (
+        set(partition.production), set(partition.tests), set(partition.test_support),
+        set(partition.shared_configuration), set(partition.documentation_or_generated),
+    )
+    overlapping_paths = {
+        path
+        for index, current in enumerate(partition_sets)
+        for other in partition_sets[index + 1:]
+        for path in current & other
+    }
+    configuration_ambiguous = bool(partition.uncertain or overlapping_paths)
+    all_paths = tuple(sorted(set(partition.all_paths)))
+    production_paths = set(partition.production)
+    test_paths = set(partition.tests + partition.test_support + partition.shared_configuration)
+    inferred_base: Mapping[str, bytes] = {}
+    inferred_head: Mapping[str, bytes] = {}
+    if base_contents is None or head_contents is None:
+        if base_revision:
+            inferred_base = {path: value for path in all_paths if (value := _git_file(root, base_revision, path)) is not None}
+            inferred_head = {path: value for path in all_paths if (value := _git_file(root, head_revision or "HEAD", path)) is not None}
+        else:
+            local_values = _local_snapshot_values(root, all_paths)
+            if local_values is not None:
+                inferred_base, inferred_head = local_values
+            else:
+                tree_values = _read_tree(root, all_paths)
+                inferred_base = inferred_head = tree_values
+    base_values = dict(inferred_base if base_contents is None else base_contents)
+    head_values = dict(inferred_head if head_contents is None else head_contents)
+    base_command_source = _command_from_config(root, config, snapshot_texts=base_values)
+    head_command_source = _command_from_config(root, config, snapshot_texts=head_values)
+    temporary = tempfile.TemporaryDirectory(prefix="dissect-test-evidence-") if create_plans else None
+    temporary_root = Path(temporary.name) if temporary is not None else None
+    repository_id = _repository_id(root)
+    binding_base_revision = _resolved_revision(root, base_revision)
+    binding_head_revision = _resolved_revision(root, head_revision)
+    base_source = root
+    head_source = root
+    source_materialisation_error: str | None = None
+    if create_plans and temporary_root is not None and _is_git_repository(root):
+        base_source = temporary_root / ".base-source"
+        head_source = temporary_root / ".head-source"
+        if not _archive_revision(root, base_revision or "HEAD", base_source):
+            source_materialisation_error = "source_snapshot_unavailable"
+        if source_materialisation_error is None and not _archive_revision(root, head_revision or "HEAD", head_source):
+            source_materialisation_error = "source_snapshot_unavailable"
+    context = _ScenarioContext(
+        root=root, partition=partition, selected=selected, all_paths=all_paths,
+        production_paths=frozenset(production_paths), test_paths=frozenset(test_paths),
+        base_values=base_values, head_values=head_values,
+        base_command_source=base_command_source, head_command_source=head_command_source,
+        config=config, create_plans=create_plans,
+        configuration_ambiguous=configuration_ambiguous, temporary_root=temporary_root,
+        base_source=base_source, head_source=head_source,
+        source_materialisation_error=source_materialisation_error,
+        repository_id=repository_id, binding_base_revision=binding_base_revision,
+        binding_head_revision=binding_head_revision, matrix_deadline=matrix_deadline,
+        timeout_seconds=timeout_seconds, output_limit=output_limit,
+        approved_digests=approved_digests or {}, flaky_repetitions=flaky_repetitions,
+        reachability=reachability, reached_subjects=reached_subjects,
+        focal_subjects=focal_subjects,
+    )
+    return context, temporary
+
+
+def _matrix_result_status(scenarios: Sequence[MatrixScenario], configuration_ambiguous: bool, selected: Sequence[str]) -> tuple[str, str | None]:
+    has_scope = bool(selected)
+    applicable = any(item.result.reason_code not in {"command_not_configured", "plan_unavailable"} for item in scenarios)
+    complete = all(item.result.completed for item in scenarios) if applicable else False
+    baseline = next((item.result for item in scenarios if item.scenario_id == "base-code-base-tests"), None)
+    head = next((item.result for item in scenarios if item.scenario_id == "head-code-head-tests"), None)
+    flaky = complete and any(item.repeated_runs and flakiness_evidence(item.repeated_runs)["status"] != "stable" for item in scenarios)
+    if configuration_ambiguous:
+        return "partial", "shared_configuration_ambiguous"
+    if flaky:
+        return "partial", "flaky_test_evidence"
+    if complete and baseline is not None and baseline.passed is False:
+        return "partial", "baseline_failed"
+    if complete and head is not None and head.passed is False:
+        return "partial", "head_failed"
+    if complete:
+        return "complete", None
+    if applicable:
+        source_reasons = {"source_snapshot_changed", "source_snapshot_invalid", "source_snapshot_unavailable"}
+        source_reason = next((item.result.reason_code for item in scenarios if item.result.reason_code in source_reasons), None)
+        if source_reason is not None:
+            return "partial", source_reason
+        return ("planned", "not_approved") if any(item.result.reason_code == "not_approved" for item in scenarios) else ("partial", "scenario_not_verified")
+    return ("unavailable", "command_not_configured") if has_scope else ("not_applicable", "command_not_configured")
+
+
 def build_matrix(
     root: Path,
     partition: ChangePartition,
@@ -1116,356 +1465,45 @@ def build_matrix(
     """Build four exact source scenarios; execute only matching approvals."""
     root = root.resolve()
     config = config or {}
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
-        raise ValueError("matrix timeout must be a finite number greater than zero")
     matrix_deadline = time.monotonic() + float(timeout_seconds)
-    if approved_digests is not None:
-        unknown_approvals = sorted(set(approved_digests) - set(SCENARIO_IDS))
-        if unknown_approvals:
-            raise ValueError(f"unknown matrix approval scenario(s): {', '.join(unknown_approvals)}")
-    if isinstance(flaky_repetitions, bool) or not isinstance(flaky_repetitions, int) or flaky_repetitions < 1:
-        raise ValueError("flaky_repetitions must be a positive integer")
-    reachability = dict(reachability_by_scenario or {})
-    if any(
-        key not in SCENARIO_IDS or value not in REACHABILITY_STATES
-        for key, value in reachability.items()
-    ):
-        raise ValueError("reachability_by_scenario contains an invalid scenario or state")
-    reached_subjects = {
-        key: tuple(sorted(set(values)))
-        for key, values in (reached_subjects_by_scenario or {}).items()
-    }
-    focal_subjects = {
-        key: tuple(sorted(set(values)))
-        for key, values in (focal_subjects_by_scenario or {}).items()
-    }
-    if any(key not in SCENARIO_IDS for key in (*reached_subjects, *focal_subjects)):
-        raise ValueError("reachability subject evidence contains an invalid scenario")
-    if any(
-        any(not isinstance(value, str) or not value for value in values)
-        for values in (*reached_subjects.values(), *focal_subjects.values())
-    ):
-        raise ValueError("reachability subject IDs must be non-empty strings")
-    if any(
-        not set(reached_subjects.get(key, ())) <= set(focal_subjects.get(key, ()))
-        for key in reached_subjects
-        if focal_subjects.get(key)
-    ):
-        raise ValueError("reached subject IDs must be mapped focal subjects")
-    if any(
-        state == "confirmed" and not reached_subjects.get(key)
-        or state == "not_reached" and reached_subjects.get(key)
-        for key, state in reachability.items()
-    ):
-        raise ValueError("reachability state does not match reached subject evidence")
-    if any(values and not focal_subjects.get(key) for key, values in reached_subjects.items()):
-        raise ValueError("reached subject evidence requires mapped focal subjects")
-    selected = _selected_tests(partition)
+    selected, timeout_seconds, flaky_repetitions, reachability, reached_subjects, focal_subjects = _normalise_matrix_options(
+        partition,
+        approved_digests=approved_digests,
+        timeout_seconds=timeout_seconds,
+        flaky_repetitions=flaky_repetitions,
+        reachability_by_scenario=reachability_by_scenario,
+        reached_subjects_by_scenario=reached_subjects_by_scenario,
+        focal_subjects_by_scenario=focal_subjects_by_scenario,
+    )
     if not selected:
         return EvidenceMatrix((), "not_applicable", "no_test_artifacts")
-    partition_sets = (
-        set(partition.production), set(partition.tests), set(partition.test_support),
-        set(partition.shared_configuration), set(partition.documentation_or_generated),
+    context, temporary = _prepare_matrix_context(
+        root,
+        partition,
+        config=config,
+        selected=selected,
+        timeout_seconds=timeout_seconds,
+        matrix_deadline=matrix_deadline,
+        create_plans=create_plans,
+        flaky_repetitions=flaky_repetitions,
+        approved_digests=approved_digests,
+        reachability=reachability,
+        reached_subjects=reached_subjects,
+        focal_subjects=focal_subjects,
+        base_contents=base_contents,
+        head_contents=head_contents,
+        base_revision=base_revision,
+        head_revision=head_revision,
+        output_limit=output_limit,
     )
-    overlapping_paths = {
-        path
-        for index, current in enumerate(partition_sets)
-        for other in partition_sets[index + 1:]
-        for path in current & other
-    }
-    # A shared configuration file is a first-class snapshot input. It is only
-    # ambiguous when partitioning could not decide which semantic side owns a
-    # path, or when one path was assigned to multiple partitions.
-    configuration_ambiguous = bool(partition.uncertain or overlapping_paths)
-    all_paths = tuple(sorted(set(partition.all_paths)))
-    production_paths = set(partition.production)
-    test_paths = set(partition.tests + partition.test_support + partition.shared_configuration)
-    inferred_base: Mapping[str, bytes] = {}
-    inferred_head: Mapping[str, bytes] = {}
-    if base_contents is None or head_contents is None:
-        if base_revision:
-            inferred_base = {
-                path: value
-                for path in all_paths
-                if (value := _git_file(root, base_revision, path)) is not None
-            }
-            inferred_head = {
-                path: value
-                for path in all_paths
-                if (value := _git_file(root, head_revision or "HEAD", path)) is not None
-            }
-        else:
-            local_values = _local_snapshot_values(root, all_paths)
-            if local_values is not None:
-                inferred_base, inferred_head = local_values
-            else:
-                inferred_base = inferred_head = _read_tree(root, all_paths)
-    base_values = dict(inferred_base if base_contents is None else base_contents)
-    head_values = dict(inferred_head if head_contents is None else head_contents)
-    base_command_source = _command_from_config(root, config, snapshot_texts=base_values)
-    head_command_source = _command_from_config(root, config, snapshot_texts=head_values)
-    temporary = tempfile.TemporaryDirectory(prefix="dissect-test-evidence-") if create_plans else None
-    temporary_root = Path(temporary.name) if temporary is not None else None
-    repository_id = _repository_id(root)
-    binding_base_revision = _resolved_revision(root, base_revision)
-    binding_head_revision = _resolved_revision(root, head_revision)
-    base_source = root
-    head_source = root
-    source_materialisation_error: str | None = None
-    if create_plans and temporary_root is not None:
-        if _is_git_repository(root):
-            base_source = temporary_root / ".base-source"
-            head_source = temporary_root / ".head-source"
-            base_is_archived = _archive_revision(root, base_revision or "HEAD", base_source)
-            if not base_is_archived:
-                source_materialisation_error = "source_snapshot_unavailable"
-        # Start every private scenario from an immutable Git tree. Changed
-        # files are overlaid below from the exact base/head maps. Copying the
-        # live checkout here would leak unrelated worktree files into the
-        # matrix and would make an approval depend on mutable state.
-        if source_materialisation_error is None and _is_git_repository(root):
-            head_is_archived = _archive_revision(root, head_revision or "HEAD", head_source)
-            if not head_is_archived:
-                source_materialisation_error = "source_snapshot_unavailable"
-    scenarios: list[MatrixScenario] = []
-    for scenario_id in SCENARIO_IDS:
-        production_state, test_state = _scenario_mapping(scenario_id)
-        values: dict[str, bytes] = {}
-        removed: list[str] = []
-        for path in all_paths:
-            value = (
-                base_values if path in production_paths and production_state == "base"
-                else head_values if path in production_paths
-                else base_values if path in test_paths and test_state == "base"
-                else head_values
-            ).get(path)
-            if value is None:
-                removed.append(path)
-            else:
-                values[path] = value if isinstance(value, bytes) else value.encode("utf-8", errors="surrogatepass")
-        source_hashes = _scenario_hashes(
-            {path: values[path] for path in partition.production if path in values},
-            {path: values[path] for path in partition.tests + partition.test_support if path in values},
-            {path: values[path] for path in partition.shared_configuration if path in values},
-            all_values=values,
-        )
-        source_hashes["base_source_sha256"] = _file_digest(base_values)
-        source_hashes["head_source_sha256"] = _file_digest(head_values)
-        source_hashes["scenario_source_sha256"] = _file_digest(values)
-        source_hashes["source_files_present"] = sorted(values)
-        source_hashes["source_files_absent"] = sorted(set(all_paths) - set(values))
-        source_hashes["production_source_state"] = production_state
-        source_hashes["test_source_state"] = test_state
-        command_source = base_command_source if test_state == "base" else head_command_source
-        repeated_runs: tuple[TestRunResult, ...] = ()
-        if not create_plans or configuration_ambiguous:
-            no_plan_reason = (
-                "shared_configuration_ambiguous"
-                if configuration_ambiguous
-                else "command_not_configured" if command_source is None else "not_approved"
-            )
-            result = TestRunResult(
-                scenario_id,
-                "",
-                None,
-                False,
-                None,
-                None,
-                selected,
-                "",
-                no_plan_reason,
-                source_hashes["production_patch_sha256"],
-                source_hashes["test_patch_sha256"],
-                source_hashes["shared_config_patch_sha256"],
-                reachability.get(scenario_id, "unverified"),
-                reached_subjects.get(scenario_id, ()),
-            )
-            scenarios.append(MatrixScenario(
-                scenario_id, production_state, test_state, source_hashes, selected,
-                None, result, (), focal_subjects.get(scenario_id, ()),
-            ))
-            continue
-        if temporary_root is None:
-            raise RuntimeError("matrix planning requires a private temporary root")
-        tree = temporary_root / scenario_id
-        if source_materialisation_error is not None:
-            plan = None
-            result = TestRunResult(
-                scenario_id, "", None, False, None, None, selected, "",
-                source_materialisation_error,
-                source_hashes["production_patch_sha256"],
-                source_hashes["test_patch_sha256"],
-                source_hashes["shared_config_patch_sha256"],
-                reachability.get(scenario_id, "unverified"),
-                reached_subjects.get(scenario_id, ()),
-            )
-            scenarios.append(MatrixScenario(
-                scenario_id, production_state, test_state, source_hashes, selected,
-                plan, result, (), focal_subjects.get(scenario_id, ()),
-            ))
-            continue
-        source_root = base_source if production_state == "base" and test_state == "base" else head_source if production_state == "head" and test_state == "head" else base_source if production_state == "base" else head_source
-        _materialise(source_root, tree, values, removed)
-        if command_source is None:
-            plan = None
-            result = TestRunResult(
-                scenario_id, "", None, False, None, None, selected, "", "command_not_configured",
-                source_hashes["production_patch_sha256"], source_hashes["test_patch_sha256"], source_hashes["shared_config_patch_sha256"],
-                reachability.get(scenario_id, "unverified"),
-                reached_subjects.get(scenario_id, ()),
-            )
-        else:
-            command, source = command_source
-            argv = _command_argv(command)
-            bindings = _plan_bindings(
-                scenario_id,
-                source_hashes,
-                base_revision=binding_base_revision,
-                head_revision=binding_head_revision,
-                selected_tests=selected,
-                focal_subjects=focal_subjects.get(scenario_id, ()),
-                repository_id=repository_id,
-            )
-            if argv is None:
-                plan = None
-                result = TestRunResult(
-                    scenario_id, "", None, False, None, None, selected, "", "invalid_test_command",
-                    source_hashes["production_patch_sha256"], source_hashes["test_patch_sha256"], source_hashes["shared_config_patch_sha256"],
-                    reachability.get(scenario_id, "unverified"),
-                    reached_subjects.get(scenario_id, ()),
-                )
-            else:
-                plan, error = build_execution_plan(
-                    kind="test-evidence",
-                    name=f"{source}:{scenario_id}",
-                    argv=argv,
-                    working_directory=tree,
-                    environment=_scenario_environment(config, temporary_root, scenario_id),
-                    timeout_seconds=min(
-                        float(timeout_seconds),
-                        max(0.001, matrix_deadline - time.monotonic()),
-                    ),
-                    output_limit=output_limit,
-                    bindings=bindings,
-                )
-                if plan is None:
-                    result = TestRunResult(
-                        scenario_id, "", None, False, None, None, selected, "", "plan_unavailable",
-                        source_hashes["production_patch_sha256"], source_hashes["test_patch_sha256"], source_hashes["shared_config_patch_sha256"],
-                        reachability.get(scenario_id, "unverified"),
-                        reached_subjects.get(scenario_id, ()),
-                    )
-                else:
-                    approval = (approved_digests or {}).get(scenario_id)
-                    if approval is None:
-                        result = TestRunResult(
-                            scenario_id, plan.approval_digest, None, False, None, None, selected,
-                            "", "not_approved",
-                            source_hashes["production_patch_sha256"], source_hashes["test_patch_sha256"], source_hashes["shared_config_patch_sha256"],
-                            reachability.get(scenario_id, "unverified"),
-                            reached_subjects.get(scenario_id, ()),
-                        )
-                    else:
-                        source_error = (
-                            "source_snapshot_invalid"
-                            if not _plan_matches_source_hashes(plan, source_hashes)
-                            else _verify_materialised_sources(plan, source_hashes)
-                        )
-                        if source_error is not None:
-                            result = TestRunResult(
-                                scenario_id, plan.approval_digest, None, False, None, None, selected,
-                                "", source_error,
-                                source_hashes["production_patch_sha256"],
-                                source_hashes["test_patch_sha256"],
-                                source_hashes["shared_config_patch_sha256"],
-                                reachability.get(scenario_id, "unverified"),
-                                reached_subjects.get(scenario_id, ()),
-                            )
-                            scenarios.append(MatrixScenario(
-                                scenario_id, production_state, test_state, source_hashes, selected,
-                                plan, result, (), focal_subjects.get(scenario_id, ()),
-                            ))
-                            continue
-                        completed, execution_error = _execute_plan(plan, approval)
-                        if completed is None:
-                            result = TestRunResult(
-                                scenario_id, plan.approval_digest, None, False, None, None, selected,
-                                "", execution_error or "execution_failed",
-                                source_hashes["production_patch_sha256"], source_hashes["test_patch_sha256"], source_hashes["shared_config_patch_sha256"],
-                                reachability.get(scenario_id, "unverified"),
-                                reached_subjects.get(scenario_id, ()),
-                            )
-                        else:
-                            output = redact_sensitive_text((completed.stdout or "")[:output_limit] + (completed.stderr or "")[:output_limit])
-                            collected_tests = _collect_count(output)
-                            completed_flag, passed, reason_code = _test_outcome(
-                                completed.returncode,
-                                collected_tests,
-                                selected_tests_present=set(selected) <= set(values),
-                            )
-                            result = TestRunResult(
-                                scenario_id, plan.approval_digest, completed.returncode,
-                                completed_flag,
-                                passed,
-                                collected_tests, selected,
-                                bounded_fingerprint(output),
-                                reason_code,
-                                source_hashes["production_patch_sha256"], source_hashes["test_patch_sha256"], source_hashes["shared_config_patch_sha256"],
-                                reachability.get(scenario_id, "unverified"),
-                                reached_subjects.get(scenario_id, ()),
-                            )
-                            repeated_runs = _repeat_matrix_runs(
-                                result, plan, approval, source_hashes, selected,
-                                flaky_repetitions, output_limit,
-                            )
-        scenarios.append(MatrixScenario(
-            scenario_id, production_state, test_state, source_hashes, selected,
-            plan, result, repeated_runs, focal_subjects.get(scenario_id, ()),
-        ))
-    has_test_evidence_scope = bool(selected)
-    applicable = any(item.result.reason_code not in {"command_not_configured", "plan_unavailable"} for item in scenarios)
-    complete = all(item.result.completed for item in scenarios) if applicable else False
-    baseline = next((item.result for item in scenarios if item.scenario_id == "base-code-base-tests"), None)
-    head = next((item.result for item in scenarios if item.scenario_id == "head-code-head-tests"), None)
-    flaky = complete and any(
-        scenario.repeated_runs
-        and flakiness_evidence(scenario.repeated_runs)["status"] != "stable"
-        for scenario in scenarios
-    )
+    scenarios = [_build_scenario(context, scenario_id) for scenario_id in SCENARIO_IDS]
+    configuration_ambiguous = context.configuration_ambiguous
     dynamic_candidates = (
         *_matrix_candidates(scenarios),
         *_flakiness_candidates(scenarios),
         *_reachability_candidates(scenarios),
     )
-    if configuration_ambiguous:
-        status, reason = "partial", "shared_configuration_ambiguous"
-    elif flaky:
-        status, reason = "partial", "flaky_test_evidence"
-    elif complete and baseline is not None and baseline.passed is False:
-        status, reason = "partial", "baseline_failed"
-    elif complete and head is not None and head.passed is False:
-        status, reason = "partial", "head_failed"
-    elif complete:
-        status, reason = "complete", None
-    elif applicable:
-        source_reasons = {
-            "source_snapshot_changed", "source_snapshot_invalid", "source_snapshot_unavailable"
-        }
-        source_reason = next(
-            (item.result.reason_code for item in scenarios if item.result.reason_code in source_reasons),
-            None,
-        )
-        unapproved = any(item.result.reason_code == "not_approved" for item in scenarios)
-        status, reason = (
-            ("partial", source_reason)
-            if source_reason is not None else
-            ("planned", "not_approved") if unapproved else
-            ("partial", "scenario_not_verified")
-        )
-    elif has_test_evidence_scope:
-        status, reason = "unavailable", "command_not_configured"
-    else:
-        status, reason = "not_applicable", "command_not_configured"
+    status, reason = _matrix_result_status(scenarios, configuration_ambiguous, selected)
     return EvidenceMatrix(tuple(scenarios), status, reason, temporary, configuration_ambiguous, dynamic_candidates)
 
 

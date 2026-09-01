@@ -82,13 +82,41 @@ def _is_test_path(path: str) -> bool:
     name = Path(lower).name
     return bool(
         re.search(r"(?:^|/)(?:test|tests|spec|specs|__tests__|testdata|fixtures?)(?:/|$)", lower)
-        or re.search(r"(?:^|[._-])(?:test|spec)(?:[._-]|$)", name)
+        or re.search(r"^(?:test|spec)[._-]", name)
+        or re.search(r"[._-](?:test|spec)[._-]", name)
         or name.endswith("_test.go")
     )
 
 
-def _is_test_function(path: str, name: str) -> bool:
-    return _is_test_path(path) or bool(re.search(r"(?:^|[.:$])(?:test|spec)[_$-]", name, re.I))
+def _python_has_test_declaration(text: str) -> bool:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            bases = {
+                base.id if isinstance(base, ast.Name)
+                else base.attr if isinstance(base, ast.Attribute)
+                else ""
+                for base in node.bases
+            }
+            if "TestCase" in bases:
+                return True
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if re.match(r"^test(?:_|$)", node.name, re.I):
+            return True
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if isinstance(target, ast.Attribute) and target.attr in {"fixture", "parametrize"}:
+                return True
+    return False
+
+
+def _is_test_function(path: str, name: str, text: str) -> bool:
+    suffix = Path(path).suffix.lower()
+    return _is_test_path(path) if suffix not in {".py", ".pyi"} else _python_has_test_declaration(text)
 
 
 def _decode_source(path: str, data: bytes) -> str:
@@ -146,7 +174,7 @@ def extract_functions(path: str, source: bytes | str, *, source_kind: str = "wor
                 max(0, int(getattr(info, "nloc", 0) or 0)),
                 max(0, int(getattr(info, "token_count", 0) or 0)),
                 max(0, int(getattr(info, "parameter_count", 0) or 0)),
-                _is_test_function(path, name), str(getattr(info, "long_name", "")), "complete",
+                _is_test_function(path, name, text), str(getattr(info, "long_name", "")), "complete",
             ))
         return tuple(sorted(functions, key=lambda item: (item.logical_path, item.start_line, item.qualified_name)))
     except (AttributeError, SyntaxError, TypeError, ValueError) as error:

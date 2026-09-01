@@ -84,17 +84,30 @@ def analysis_limits(config: Mapping[str, Any] | None) -> dict[str, int | float]:
         for item in candidates:
             if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
                 raise ValueError("review option complexity_threshold values must be positive integers")
-    if isinstance(options, Mapping) and "test_integrity_approved_new_paths" in options:
-        approved_paths = options["test_integrity_approved_new_paths"]
-        if not isinstance(approved_paths, list) or not all(
-            isinstance(item, str) and item.strip() for item in approved_paths
-        ):
-            raise ValueError("review option test_integrity_approved_new_paths must be a non-empty-string array")
-        for item in approved_paths:
+    if isinstance(options, Mapping) and options.get("test_integrity_new_test_approval") is not None:
+        approval = options["test_integrity_new_test_approval"]
+        if not isinstance(approval, Mapping):
+            raise ValueError("review option test_integrity_new_test_approval must be an object or null")
+        paths = approval.get("path_patterns", approval.get("paths"))
+        if not isinstance(paths, list) or not paths or not all(isinstance(item, str) and item.strip() for item in paths):
+            raise ValueError("review option test_integrity_new_test_approval paths must be a non-empty-string array")
+        for item in paths:
             normalised = item.replace("\\", "/").strip()
             path = Path(normalised)
             if path.is_absolute() or ".." in path.parts:
-                raise ValueError("review option test_integrity_approved_new_paths must contain repository-relative patterns")
+                raise ValueError("review option test_integrity_new_test_approval paths must be repository-relative patterns")
+        roles = approval.get("roles", approval.get("artifact_roles"))
+        if not isinstance(roles, list) or not roles or not all(isinstance(item, str) and item for item in roles):
+            raise ValueError("review option test_integrity_new_test_approval roles must be a non-empty string array")
+        max_count = approval.get("max_count")
+        if isinstance(max_count, bool) or not isinstance(max_count, int) or max_count < 1:
+            raise ValueError("review option test_integrity_new_test_approval max_count must be positive")
+        subjects = approval.get("production_subjects", approval.get("subjects", []))
+        if not isinstance(subjects, list) or not all(isinstance(item, str) and item for item in subjects):
+            raise ValueError("review option test_integrity_new_test_approval production_subjects must be a string array")
+        for key in ("base_revision", "head_revision", "digest", "approval_digest"):
+            if key in approval and not isinstance(approval[key], str):
+                raise ValueError(f"review option test_integrity_new_test_approval {key} must be a string")
     if not isinstance(options, Mapping) or "analysis_limits" not in options:
         if isinstance(options, Mapping):
             for key in _FEATURE_TOGGLES & set(options):

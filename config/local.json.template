@@ -12,7 +12,7 @@
     "anti_slop_python_getattr": false,
     "comment_slop": true,
     "test_integrity": true,
-    "test_integrity_approved_new_paths": [],
+    "test_integrity_new_test_approval": null,
     "complexity": true,
     "dynamic_test_evidence": true,
     "targeted_mutation": true,

@@ -20,7 +20,7 @@ REACHABILITY_STATES = frozenset({"confirmed", "not_reached", "unverified"})
 ARTIFACT_ROLES = frozenset({
     "test", "test helper", "fixture", "snapshot or golden file",
     "test configuration", "CI test command", "production source",
-    "shared build or manifest file", "documentation",
+    "test tooling", "shared build or manifest file", "documentation",
 })
 USEFULNESS_DIMENSIONS = (
     "collects_or_compiles",

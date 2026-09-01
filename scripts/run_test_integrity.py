@@ -40,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", default="", help="Base revision for diff evidence")
     parser.add_argument("--head", default="", help="Head revision for commit-range evidence")
     parser.add_argument("--intent", default="", help="Explicit task intent used for new-test-file approval")
+    parser.add_argument("--new-test-approval", type=Path, help="JSON file containing a path- and revision-bound test-creation approval")
+    parser.add_argument("--approve-new-tests", default="", help="Approval digest for --new-test-approval")
     parser.add_argument("--format", choices=("json",), default="json")
     parser.add_argument("--approve-matrix", action="append", default=[], metavar="SCENARIO=DIGEST")
     parser.add_argument("--approve-mutation", action="append", default=[], metavar="MUTATION=DIGEST")
@@ -83,10 +85,18 @@ def main(argv: list[str] | None = None) -> int:
                     if isinstance(item, dict):
                         entries.append(DiffEntry(**item))
         intent_text = args.intent
+        trusted_intent_text = args.intent
         if not intent_text and isinstance(context_payload, dict):
             intent_value = context_payload.get("intent")
             if isinstance(intent_value, dict) and isinstance(intent_value.get("summary"), str):
                 intent_text = intent_value["summary"]
+            if isinstance(intent_value, dict) and isinstance(intent_value.get("approval_text"), str):
+                trusted_intent_text = intent_value["approval_text"]
+        approval_scope = None
+        if args.new_test_approval is not None:
+            approval_scope = json.loads(args.new_test_approval.read_text(encoding="utf-8"))
+            if not isinstance(approval_scope, dict):
+                raise ValueError("new-test approval must be a JSON object")
         if mode == "diff" and not entries:
             try:
                 committed_range = (
@@ -113,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
             approved_matrix_digests=_approval_map(args.approve_matrix) if args.approve_matrix else None,
             approved_mutation_digests=_approval_map(args.approve_mutation) if args.approve_mutation else None,
             intent_text=intent_text,
+            trusted_intent_text=trusted_intent_text,
+            new_test_approval=approval_scope,
+            approval_digest=args.approve_new_tests or None,
         )
         try:
             payload = redact_payload(result.as_dict())

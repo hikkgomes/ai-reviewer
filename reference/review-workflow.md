@@ -100,9 +100,9 @@ redacted output. Targeted hunk reversion and proof tests are optional
 verification evidence and never modify the real checkout.
 
 New unit, integration, end-to-end, and spec files, including test-only helpers
-and fixtures, are opt-in. Require an explicit creation request or approval, or
-an exact approved path pattern in
-`review_options.test_integrity_approved_new_paths`. A generic request to
+and fixtures, are opt-in. Require caller-provided or external trusted intent,
+or an exact digest-bound approval in
+`review_options.test_integrity_new_test_approval`. A generic request to
 implement, fix, test, or verify does not authorise a new test file. Prefer
 existing tests and direct browser/runtime checks, and make test changes exercise
 observable behaviour rather than source strings, implementation shapes, or the

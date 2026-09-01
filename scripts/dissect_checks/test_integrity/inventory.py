@@ -20,6 +20,15 @@ from .model import TestArtifact, TestSubject, sha256_bytes
 MAX_INVENTORY_FILE_BYTES = 5 * 1024 * 1024
 _TEST_PATH_RE = re.compile(r"(?:^|/)(?:test|tests|spec|specs|__tests__|testdata|fixtures?|unit|integration|e2e|end[-_]to[-_]end)(?:/|$)", re.I)
 _TEST_NAME_RE = re.compile(r"(?:^|[._-])(test|spec|unit|integration|e2e|end[-_]to[-_]end)(?:[._-]|$)", re.I)
+_TEST_TOOLING_PATH_RE = re.compile(
+    r"(?:^|/)(?:test[-_](?:integrity|evidence|tooling|runner|analysis|analyser|analyzer)|testing[-_](?:tooling|analysis|runner))(?:/|$)",
+    re.I,
+)
+_TEST_TOOLING_NAME_RE = re.compile(
+    r"^(?:run|build|collect|validate|check)[._-].*(?:test|testing|acceptance|evidence|complexity|effectiveness)|"
+    r"^(?:test|testing)[._-].*(?:runner|tooling|analysis|evidence|integrity)$",
+    re.I,
+)
 _FRAMEWORK_DEPENDENCIES = {
     "pytest": "pytest", "unittest": "python-unittest", "jest": "jest", "vitest": "vitest",
     "mocha": "mocha", "@jest/globals": "jest", "go": "go-testing", "tokio": "rust-tokio",
@@ -87,6 +96,217 @@ def _decode_source(path: str, data: bytes) -> str:
         except (SyntaxError, UnicodeDecodeError, LookupError):
             return data.decode("utf-8", errors="replace")
     return data.decode("utf-8", errors="replace")
+
+
+def _mask_non_code(text: str, *, python: bool = False) -> str:
+    """Mask comments and literals before applying syntax heuristics."""
+    if python:
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+            lines = text.splitlines(keepends=True)
+            offsets: list[int] = []
+            total = 0
+            for line in lines:
+                offsets.append(total)
+                total += len(line)
+            chars = list(text)
+            for token in tokens:
+                if token.type not in {tokenize.STRING, tokenize.COMMENT}:
+                    continue
+                start_line, start_col = token.start
+                end_line, end_col = token.end
+                if 1 <= start_line <= len(offsets) and 1 <= end_line <= len(offsets):
+                    first = offsets[start_line - 1] + start_col
+                    last = offsets[end_line - 1] + end_col
+                    for index in range(max(0, first), min(len(chars), last)):
+                        if chars[index] not in "\r\n":
+                            chars[index] = " "
+            return "".join(chars)
+        except (tokenize.TokenError, IndentationError, SyntaxError, UnicodeError):
+            pass
+
+    chars = list(text)
+    index = 0
+    quote = ""
+    line_comment = False
+    block_comment = False
+    escaped = False
+    while index < len(chars):
+        current = chars[index]
+        following = chars[index + 1] if index + 1 < len(chars) else ""
+        if line_comment:
+            if current in "\r\n":
+                line_comment = False
+            elif current != "\n":
+                chars[index] = " "
+            index += 1
+            continue
+        if block_comment:
+            if current == "*" and following == "/":
+                chars[index] = chars[index + 1] = " "
+                block_comment = False
+                index += 2
+            else:
+                if current not in "\r\n":
+                    chars[index] = " "
+                index += 1
+            continue
+        if quote:
+            if current in "\r\n" and quote != "`":
+                quote = ""
+                index += 1
+                continue
+            chars[index] = " "
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == quote:
+                quote = ""
+            index += 1
+            continue
+        if python and current == "#":
+            chars[index] = " "
+            line_comment = True
+            index += 1
+            continue
+        if current == "/" and following == "/":
+            chars[index] = chars[index + 1] = " "
+            line_comment = True
+            index += 2
+            continue
+        if current == "/" and following == "*":
+            chars[index] = chars[index + 1] = " "
+            block_comment = True
+            index += 2
+            continue
+        if current in {'"', "'", "`"}:
+            quote = current
+            chars[index] = " "
+        index += 1
+    return "".join(chars)
+
+
+def _python_declarations(text: str) -> dict[str, bool]:
+    """Return real Python test declarations, never raw text matches."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return {}
+    result = {
+        "test_function": False,
+        "test_case_class": False,
+        "pytest_decorator": False,
+        "fixture": False,
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            bases = {
+                base.id if isinstance(base, ast.Name)
+                else base.attr if isinstance(base, ast.Attribute)
+                else ""
+                for base in node.bases
+            }
+            if "TestCase" in bases:
+                result["test_case_class"] = True
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if re.match(r"^test(?:_|$)", node.name, re.I):
+            result["test_function"] = True
+        for decorator in node.decorator_list:
+            name = ""
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if isinstance(target, ast.Name):
+                name = target.id
+            elif isinstance(target, ast.Attribute):
+                name = target.attr
+                if isinstance(target.value, ast.Attribute):
+                    name = f"{target.value.attr}.{name}"
+                elif isinstance(target.value, ast.Name):
+                    name = f"{target.value.id}.{name}"
+            lowered = name.lower()
+            if lowered in {"pytest.fixture", "fixture", "pytest.fixture", "pytest_fixture"}:
+                result["fixture"] = True
+            if lowered.startswith("pytest.") or lowered.startswith("pytest.mark.") or lowered in {"fixture", "parametrize", "mark"}:
+                result["pytest_decorator"] = True
+    return result
+
+
+def _python_has_test_declaration(evidence: Mapping[str, bool]) -> bool:
+    return any(evidence.get(key) for key in ("test_function", "test_case_class", "pytest_decorator", "fixture"))
+
+
+def _python_has_test_syntax(text: str, evidence: Mapping[str, bool]) -> bool:
+    """Accept compact test snippets while keeping declaration evidence AST-based."""
+    if _python_has_test_declaration(evidence):
+        return True
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert):
+            return True
+        if isinstance(node, ast.Call):
+            target = node.func
+            name = target.attr if isinstance(target, ast.Attribute) else target.id if isinstance(target, ast.Name) else ""
+            if name in {"raises", "expect", "assert_that", "assertThat"}:
+                return True
+    return False
+
+
+def _has_non_python_test_declaration(path: str, code: str) -> bool:
+    suffix = Path(path).suffix.lower()
+    patterns = {
+        ".js": r"\b(?:test|it|specify|describe|expect|assert)\s*\(",
+        ".ts": r"\b(?:test|it|specify|describe|expect|assert)\s*\(",
+        ".go": r"\bfunc\s+Test[A-Za-z0-9_]*\s*\(",
+        ".rs": r"#\s*\[(?:tokio::)?test(?:\([^\]]*\))?\]|\bmod\s+tests\b",
+        ".java": r"@(?:Test|ParameterizedTest|TestFactory)\b|\borg\.junit\b",
+        ".cs": r"\[(?:Fact|Theory|Test|TestCase|TestMethod)\]",
+        ".c": r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(|\b(?:EXPECT|ASSERT|REQUIRE|CHECK)_",
+        ".cc": r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(|\b(?:EXPECT|ASSERT|REQUIRE|CHECK)_",
+        ".cpp": r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\(|\b(?:EXPECT|ASSERT|REQUIRE|CHECK)_",
+    }
+    pattern = patterns.get(suffix)
+    return bool(pattern and re.search(pattern, code, re.I))
+
+
+def _test_layout_or_filename(path: str) -> bool:
+    name = Path(path).name
+    return bool(_TEST_PATH_RE.search(path) or _TEST_NAME_RE.search(name) or name.endswith("_test.go"))
+
+
+def _test_tooling_source(path: str, text: str, code: str) -> bool:
+    """Recognise source which analyses or runs tests as production tooling."""
+    lower_path = path.lower()
+    name = Path(path).stem.lower()
+    tooling_path = bool(_TEST_TOOLING_PATH_RE.search(path) or _TEST_TOOLING_NAME_RE.search(Path(path).name))
+    if not tooling_path:
+        return False
+    if Path(path).suffix.lower() in {".py", ".pyi"}:
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, TypeError):
+            return False
+        imports = {
+            alias.name.split(".", 1)[0]
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in (node.names if isinstance(node, ast.Import) else (ast.alias(node.module or ""),))
+            if alias.name
+        }
+        names = {
+            node.name.lower()
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        return bool(
+            imports & {"ast", "tokenize", "subprocess", "coverage", "pytest", "unittest"}
+            or any(any(token in value for token in ("analyse", "analyze", "inventory", "evidence", "mutation", "validate", "runner")) for value in names)
+            or name.startswith(("run_test", "validate_test", "collect_test"))
+        )
+    return bool(re.search(r"\b(?:pytest|unittest|test\s+runner|test\s+evidence|coverage)\b", code, re.I))
 
 
 def _declared_frameworks(
@@ -187,14 +407,17 @@ def _declared_frameworks(
 
 
 def _syntax_framework(path: str, text: str, declared: set[str]) -> str:
-    lower = text.lower()
+    lower = _mask_non_code(text, python=Path(path).suffix.lower() in {".py", ".pyi"}).lower()
     suffix = Path(path).suffix.lower()
     if suffix in {".py", ".pyi"}:
-        if re.search(r"\b(?:unittest|pytest)\b|\bTestCase\b|\bpytest\.", text):
-            return "pytest" if "pytest" in lower or "pytest" in declared else "python-unittest"
-        if "pytest" in declared and (_TEST_PATH_RE.search(path) or _TEST_NAME_RE.search(Path(path).name)):
+        declarations = _python_declarations(text)
+        if declarations.get("pytest_decorator") or declarations.get("fixture"):
             return "pytest"
-        return "python-unittest" if "test" in path.lower() else "unknown-python"
+        if declarations.get("test_function") or declarations.get("test_case_class"):
+            return "pytest" if "pytest" in declared else "python-unittest"
+        if "pytest" in declared and _test_layout_or_filename(path) and _python_has_test_declaration(declarations):
+            return "pytest"
+        return "unknown-python"
     if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
         for framework, marker in (("vitest", "vitest"), ("jest", "jest"), ("mocha", "mocha"), ("node-test", "node:test")):
             if marker in lower:
@@ -202,18 +425,18 @@ def _syntax_framework(path: str, text: str, declared: set[str]) -> str:
         for framework in ("vitest", "jest", "mocha", "node-test"):
             if framework in declared and (_TEST_PATH_RE.search(path) or _TEST_NAME_RE.search(Path(path).name)):
                 return framework
-    if suffix == ".go" and (path.endswith("_test.go") or '"testing"' in text):
+    if suffix == ".go" and (path.endswith("_test.go") or '"testing"' in lower):
         return "go-testing"
-    if suffix == ".rs" and re.search(r"#\s*\[(?:tokio::)?test(?:\([^\]]*\))?\]|\bmod\s+tests\b", text):
+    if suffix == ".rs" and re.search(r"#\s*\[(?:tokio::)?test(?:\([^\]]*\))?\]|\bmod\s+tests\b", lower):
         return "rust"
-    if suffix == ".java" and re.search(r"@(?:Test|ParameterizedTest|TestFactory)\b|org\.junit", text):
+    if suffix == ".java" and re.search(r"@(?:Test|ParameterizedTest|TestFactory)\b|org\.junit", lower):
         return "junit5" if "jupiter" in lower else "junit"
-    if suffix == ".cs" and re.search(r"\[(?:Fact|Theory|Test|TestCase|TestMethod)\]", text):
-        return "xunit" if re.search(r"\[(?:fact|theory)\]", text, re.I) else "mstest" if "[testmethod]" in lower else "nunit"
+    if suffix == ".cs" and re.search(r"\[(?:Fact|Theory|Test|TestCase|TestMethod)\]", lower):
+        return "xunit" if re.search(r"\[(?:fact|theory)\]", lower, re.I) else "mstest" if "[testmethod]" in lower else "nunit"
     if suffix in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"}:
-        if re.search(r"\b(?:TEST|TEST_F|TEST_P)\s*\(|\bEXPECT_|\bASSERT_", text):
+        if re.search(r"\b(?:TEST|TEST_F|TEST_P)\s*\(|\bEXPECT_|\bASSERT_", lower):
             return "googletest"
-        if "catch2" in lower or re.search(r"\bTEST_CASE\s*\(", text):
+        if "catch2" in lower or re.search(r"\bTEST_CASE\s*\(", lower):
             return "catch2"
         if "doctest" in lower:
             return "doctest"
@@ -227,6 +450,8 @@ def _role(path: str, text: str, framework: str) -> str:
     lower_path = path.lower()
     suffix = Path(path).suffix.lower()
     name = Path(path).name.lower()
+    code = _mask_non_code(text, python=suffix in {".py", ".pyi"})
+    python_declarations = _python_declarations(text) if suffix in {".py", ".pyi"} else {}
     if lower_path.startswith("reference/") and suffix in {".json", ".md", ".rst", ".txt", ".yaml", ".yml"}:
         return "shared build or manifest file"
     if ".snap" in name or name.endswith((".golden", ".gold", ".approved")) or "/snapshots/" in f"/{lower_path}/":
@@ -238,28 +463,36 @@ def _role(path: str, text: str, framework: str) -> str:
     if suffix in {".md", ".rst", ".txt"}:
         return "documentation"
     helper = any(token in lower_path for token in ("/helpers/", "/support/", "/utils/", "test_helper", "test-support"))
-    test_syntax = bool(re.search(
-        r"(?:\b(?:test|spec)[A-Za-z0-9_$-]*\s*\(|\b(?:it|describe|TEST|TEST_CASE|Fact|Theory|TestMethod)\s*\(|#\s*\[(?:tokio::)?test(?:\([^\]]*\))?|\bdef\s+test_[A-Za-z0-9_]*\s*\()",
-        text,
-        re.I,
-    ))
+    test_syntax = (
+        _python_has_test_syntax(text, python_declarations)
+        if suffix in {".py", ".pyi"}
+        else _has_non_python_test_declaration(path, code)
+    )
+    if suffix in {".py", ".pyi"} and not _python_has_test_declaration(python_declarations) and not _TEST_PATH_RE.search(path):
+        test_syntax = False
     if suffix in {".yml", ".yaml"} and (
         "test" in lower_path
         or "ci" in lower_path
-        or re.search(r"\b(?:pytest|unittest|jest|vitest|mocha|go\s+test|cargo\s+test|dotnet\s+test|npm\s+(?:run\s+)?test)\b", text, re.I)
+        or re.search(r"\b(?:pytest|unittest|jest|vitest|mocha|go\s+test|cargo\s+test|dotnet\s+test|npm\s+(?:run\s+)?test)\b", code, re.I)
     ):
         return "CI test command"
     if lower_path.startswith(".github/workflows/") or lower_path == ".gitlab-ci.yml":
         return "shared build or manifest file"
-    test_path = bool(_TEST_PATH_RE.search(path) or _TEST_NAME_RE.search(name) or name.endswith("_test.go"))
+    test_path = _test_layout_or_filename(path)
     if not test_path and (Path(path).stem.lower().startswith(("config", "settings")) or any(token in lower_path.split("/") for token in ("config", "configs", "configuration"))):
         return "shared build or manifest file"
-    if helper and (test_path or test_syntax):
+    if test_path and suffix in {".py", ".pyi"} and python_declarations.get("fixture") and not (
+        python_declarations.get("test_function") or python_declarations.get("test_case_class")
+    ):
+        return "fixture"
+    if helper and test_path and test_syntax:
         return "test helper"
-    if test_path or test_syntax:
+    if test_path and test_syntax:
         return "test"
     if name in {"package.json", "pyproject.toml", "go.mod", "cargo.toml", "pom.xml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}:
         return "shared build or manifest file"
+    if _test_tooling_source(path, text, code):
+        return "test tooling"
     return "production source"
 
 
@@ -269,12 +502,14 @@ def _classification_evidence(path: str, text: str, framework: str, role: str) ->
     values: list[str] = []
     if _TEST_PATH_RE.search(path) or _TEST_NAME_RE.search(name) or name.endswith("_test.go"):
         values.append("test_layout_or_filename")
-    if re.search(
-        r"(?:\b(?:test|it|specify|describe|TEST|TEST_CASE)\s*\(|#\s*\[(?:tokio::)?test(?:\([^\]]*\))?\]|"
-        r"\b(?:Fact|Theory|TestMethod|ParameterizedTest)\b|\bdef\s+test_)",
-        text,
-        re.I,
-    ):
+    suffix = Path(path).suffix.lower()
+    code = _mask_non_code(text, python=suffix in {".py", ".pyi"})
+    declaration = (
+        _python_has_test_declaration(_python_declarations(text))
+        if suffix in {".py", ".pyi"}
+        else _has_non_python_test_declaration(path, code)
+    )
+    if declaration:
         values.append("framework_declaration")
     if framework not in {"unknown", "unknown-python", "repository-test"}:
         values.append("framework_or_language_evidence")
@@ -292,6 +527,8 @@ def _classification_evidence(path: str, text: str, framework: str, role: str) ->
         values.append("documentation_extension_or_path")
     if role == "production source":
         values.append("non_test_source_evidence")
+    if role == "test tooling":
+        values.append("test_tooling_source_evidence")
     return tuple(dict.fromkeys(values or ["role_not_identified_by_high_confidence_evidence"]))
 
 

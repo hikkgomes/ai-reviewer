@@ -128,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", default="", help="Base revision for diff mode")
     parser.add_argument("--file-list", type=Path, help="Canonical diff-entry file for diff mode")
     parser.add_argument("--file", action="append", default=[])
+    parser.add_argument("--max-candidates", type=int, help="Override the complexity candidate budget for this evidence run")
     parser.add_argument("--format", choices=("json",), default="json")
     args = parser.parse_args(argv)
     try:
@@ -138,6 +139,14 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(loaded, dict):
                 raise ValueError("review configuration must be a JSON object")
             config = loaded
+        if args.max_candidates is not None:
+            if args.max_candidates < 1:
+                raise ValueError("--max-candidates must be positive")
+            options = dict(config.get("review_options", {})) if isinstance(config.get("review_options"), dict) else {}
+            limits = dict(options.get("analysis_limits", {})) if isinstance(options.get("analysis_limits"), dict) else {}
+            limits["complexity_max_candidates"] = args.max_candidates
+            options["analysis_limits"] = limits
+            config = {**config, "review_options": options}
         if args.mode == "diff":
             paths, base_contents, head_contents, changed_ranges, source_kind, source_kind_by_path = _diff_inputs(
                 args.root.resolve(), args.file, args.base, args.file_list,

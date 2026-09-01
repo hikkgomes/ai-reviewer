@@ -192,9 +192,9 @@ mutation evidence. Dynamic tests, mutations, and proof tests run only from an
 exact approved plan in a private tree. Generate a focused proof-test plan with:
 
 New test files and test-only helpers or fixtures are opt-in. `GOV-TESTS-010`
-reports an unapproved addition unless the review intent explicitly requests or
-approves creation, or the path matches
-`review_options.test_integrity_approved_new_paths`. Generic implementation,
+reports an unapproved addition unless caller-provided or external trusted intent
+explicitly requests or approves creation, or an exact digest-bound
+`review_options.test_integrity_new_test_approval` matches it. Generic implementation,
 fix, test, or verification requests do not authorise a new test file. Existing
 tests and direct browser/runtime checks are preferred. Test changes must check
 observable behaviour rather than source strings, implementation shapes, or the

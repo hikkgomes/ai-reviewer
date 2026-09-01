@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Validate machine-readable rule evidence and its meta-mutation gate."""
+"""Validate machine-readable rule acceptance evidence and its meta-mutation gate."""
 from __future__ import annotations
 
 import argparse
 import ast
 import json
-import math
 from pathlib import Path
 import sys
 from contextlib import ExitStack
@@ -32,12 +31,12 @@ from run_rule_acceptance import CASES, run as run_acceptance  # noqa: E402
 
 REQUIRED_EVIDENCE = (
     "failure_model", "positive_cases", "negative_cases", "valid_fixture",
-    "exact_locations", "negative_control", "reviewed_sample", "precision", "evidence",
+    "exact_locations", "negative_control", "acceptance_sample", "evidence",
 )
-REQUIRED_EVIDENCE_ITEMS = ("malformed", "generated", "framework", "suppression", "locations", "manual_precision")
+REQUIRED_EVIDENCE_ITEMS = ("malformed", "generated", "framework", "suppression", "locations", "acceptance_review")
 
 
-def validate(manifest: Any, calibration: Any | None = None) -> list[str]:
+def validate(manifest: Any, acceptance_evidence: Any | None = None) -> list[str]:
     errors: list[str] = []
     if not isinstance(manifest, dict):
         return ["rule manifest must be an object"]
@@ -53,17 +52,19 @@ def validate(manifest: Any, calibration: Any | None = None) -> list[str]:
         errors.append("default_enabled rule IDs must be unique")
     elif set(enabled) != set(DEFAULT_ENABLED_RULES):
         errors.append("default_enabled must exactly match the registered static defaults")
-    if not isinstance(calibration, dict):
-        errors.append("calibration evidence must be an object")
+    if not isinstance(acceptance_evidence, dict):
+        errors.append("rule acceptance evidence must be an object")
     else:
-        if calibration.get("schema_version") != "1.0":
-            errors.append("calibration evidence schema_version must be 1.0")
-        if not isinstance(calibration.get("sample_id"), str) or not calibration.get("sample_id"):
-            errors.append("calibration evidence requires a sample_id")
-        if not isinstance(calibration.get("sample_source"), str) or not calibration.get("sample_source"):
-            errors.append("calibration evidence requires a sample_source")
-    calibration_rules = calibration.get("rules", {}) if isinstance(calibration, dict) else {}
-    calibration_sample_id = calibration.get("sample_id") if isinstance(calibration, dict) else None
+        if acceptance_evidence.get("schema_version") != "1.0":
+            errors.append("rule acceptance evidence schema_version must be 1.0")
+        if not isinstance(acceptance_evidence.get("sample_id"), str) or not acceptance_evidence.get("sample_id"):
+            errors.append("rule acceptance evidence requires a sample_id")
+        if not isinstance(acceptance_evidence.get("sample_source"), str) or not acceptance_evidence.get("sample_source"):
+            errors.append("rule acceptance evidence requires a sample_source")
+        if "precision" in acceptance_evidence:
+            errors.append("rule acceptance evidence must not publish precision")
+    acceptance_rules = acceptance_evidence.get("rules", {}) if isinstance(acceptance_evidence, dict) else {}
+    acceptance_sample_id = acceptance_evidence.get("sample_id") if isinstance(acceptance_evidence, dict) else None
     for rule_id in enabled:
         if not isinstance(rule_id, str) or rule_id not in rules:
             errors.append(f"default-enabled rule is missing: {rule_id}")
@@ -98,11 +99,10 @@ def validate(manifest: Any, calibration: Any | None = None) -> list[str]:
         for key in ("valid_fixture", "exact_locations", "negative_control"):
             if record.get(key) is not True:
                 errors.append(f"rule {rule_id} is missing required {key} evidence")
-        if record.get("reviewed_sample") is not True:
-            errors.append(f"rule {rule_id} has no reviewed sample")
-        precision = record.get("precision")
-        if isinstance(precision, bool) or not isinstance(precision, (int, float)) or not math.isfinite(float(precision)) or not 0 <= precision <= 1 or precision < 0.9:
-            errors.append(f"rule {rule_id} precision is below the 90% gate")
+        if record.get("acceptance_sample") is not True:
+            errors.append(f"rule {rule_id} has no reviewed acceptance sample")
+        if "precision" in record:
+            errors.append(f"rule {rule_id} acceptance evidence must not publish precision")
         evidence = record.get("evidence")
         if not isinstance(evidence, dict):
             errors.append(f"rule {rule_id} evidence must be an object")
@@ -110,32 +110,31 @@ def validate(manifest: Any, calibration: Any | None = None) -> list[str]:
             for key in REQUIRED_EVIDENCE_ITEMS:
                 if key not in evidence:
                     errors.append(f"rule {rule_id} evidence is missing {key}")
-            for key in ("malformed", "generated", "framework", "suppression", "locations", "manual_precision"):
+            for key in ("malformed", "generated", "framework", "suppression", "locations", "acceptance_review"):
                 value = evidence.get(key)
                 if isinstance(value, dict):
-                    if value.get("present") is not True and key != "manual_precision":
+                    if value.get("present") is not True and key != "acceptance_review":
                         errors.append(f"rule {rule_id} evidence {key} is not present")
                 elif value is not True:
                     errors.append(f"rule {rule_id} evidence {key} is not present")
-            if isinstance(evidence.get("manual_precision"), dict) and evidence["manual_precision"].get("reviewed") is not True:
-                errors.append(f"rule {rule_id} manual precision evidence is not reviewed")
-            if isinstance(evidence.get("manual_precision"), dict):
-                sample_id = evidence["manual_precision"].get("sample_id")
-                if not isinstance(sample_id, str) or not sample_id or sample_id != calibration_sample_id:
-                    errors.append(f"rule {rule_id} manual precision sample is not bound to the calibration record")
-        calibration_record = calibration_rules.get(rule_id) if isinstance(calibration_rules, dict) else None
-        if not isinstance(calibration_record, dict):
-            errors.append(f"rule {rule_id} has no calibration record")
-        elif not _valid_calibration(calibration_record):
-            errors.append(f"rule {rule_id} calibration precision is below the 90% gate")
-        elif isinstance(record.get("precision"), (int, float)) and abs(
-            float(record["precision"]) - float(calibration_record["precision"])
-        ) > 1e-9:
-            errors.append(f"rule {rule_id} manifest precision does not match calibration")
+            if isinstance(evidence.get("acceptance_review"), dict):
+                if evidence["acceptance_review"].get("reviewed") is not True:
+                    errors.append(f"rule {rule_id} acceptance sample is not reviewed")
+                sample_id = evidence["acceptance_review"].get("sample_id")
+                if not isinstance(sample_id, str) or not sample_id or sample_id != acceptance_sample_id:
+                    errors.append(f"rule {rule_id} acceptance sample is not bound to the evidence record")
+        acceptance_record = acceptance_rules.get(rule_id) if isinstance(acceptance_rules, dict) else None
+        if not isinstance(acceptance_record, dict):
+            errors.append(f"rule {rule_id} has no acceptance record")
+        else:
+            if "precision" in acceptance_record:
+                errors.append(f"rule {rule_id} acceptance evidence must not publish precision")
+            if not _valid_acceptance_record(acceptance_record):
+                errors.append(f"rule {rule_id} acceptance record is inconsistent")
     return errors
 
 
-def _valid_calibration(record: Mapping[str, Any]) -> bool:
+def _valid_acceptance_record(record: Mapping[str, Any]) -> bool:
     values = {
         key: record.get(key)
         for key in ("reviewed_cases", "true_positive", "false_positive", "true_negative", "false_negative")
@@ -145,13 +144,6 @@ def _valid_calibration(record: Mapping[str, Any]) -> bool:
     if values["true_positive"] < 3 or values["true_negative"] < 8:
         return False
     if values["reviewed_cases"] != sum(values[key] for key in values if key != "reviewed_cases"):
-        return False
-    precision = record.get("precision")
-    if isinstance(precision, bool) or not isinstance(precision, (int, float)) or not math.isfinite(float(precision)) or not 0 <= precision <= 1:
-        return False
-    denominator = values["true_positive"] + values["false_positive"]
-    measured = values["true_positive"] / denominator if denominator else 1.0
-    if abs(float(precision) - measured) > 1e-9 or measured < 0.9:
         return False
     decisions = record.get("decisions")
     if not isinstance(decisions, list) or len(decisions) != values["reviewed_cases"]:
@@ -447,8 +439,8 @@ def meta_mutation_errors(root: Path, *, require_toolchains: bool = False) -> lis
 
 def load(root: Path) -> tuple[Any, Any]:
     manifest = json.loads((root / "reference" / "test-integrity-rule-manifest.json").read_text(encoding="utf-8"))
-    calibration = json.loads((root / "reference" / "test-integrity-calibration.json").read_text(encoding="utf-8"))
-    return manifest, calibration
+    acceptance_evidence = json.loads((root / "reference" / "test-integrity-rule-acceptance-evidence.json").read_text(encoding="utf-8"))
+    return manifest, acceptance_evidence
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -459,8 +451,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-meta-mutation", action="store_true")
     args = parser.parse_args(argv)
     try:
-        manifest, calibration = load(args.root.resolve())
-        errors = validate(manifest, calibration)
+        manifest, acceptance_evidence = load(args.root.resolve())
+        errors = validate(manifest, acceptance_evidence)
         errors.extend(validate_rule_ownership(args.root.resolve()))
         errors.extend(_validate_static_acceptance_fixtures(args.root.resolve()))
         if not args.skip_meta_mutation:

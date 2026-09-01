@@ -28,6 +28,27 @@ def _sha256(value: Any, *, allow_empty: bool = False) -> bool:
     return allow_empty and value == "" or isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
+def _validate_complexity_summary(complexity: dict[str, Any], errors: list[str]) -> None:
+    summary = complexity.get("candidate_summary")
+    if summary is None:
+        errors.append("complexity candidate_summary is required")
+        return
+    if not isinstance(summary, dict):
+        errors.append("complexity candidate_summary must be an object")
+        return
+    total = summary.get("total_candidates")
+    emitted = summary.get("emitted_candidates")
+    if not _non_negative_integer(total) or not _non_negative_integer(emitted):
+        errors.append("complexity candidate_summary counts must be non-negative integers")
+        return
+    if emitted > total or emitted != len(complexity.get("candidates", [])):
+        errors.append("complexity candidate_summary counts do not match candidates")
+    if summary.get("truncated") is not (total > emitted):
+        errors.append("complexity candidate_summary truncated flag does not match counts")
+    if summary.get("truncated") and summary.get("reason_code") != "max_candidates":
+        errors.append("truncated complexity candidate_summary requires max_candidates reason")
+
+
 def _safe_relative_path(value: Any) -> bool:
     if not isinstance(value, str) or not value:
         return False
@@ -198,6 +219,7 @@ def validate(data: Any) -> list[str]:
                 errors.append("complexity not_applicable status has applicable files")
         functions = complexity.get("functions", [])
         candidates = complexity.get("candidates", [])
+        _validate_complexity_summary(complexity, errors)
         parse_states = complexity.get("parse_states", {})
         if not isinstance(parse_states, dict) or any(
             not _safe_relative_path(path)

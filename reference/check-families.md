@@ -172,9 +172,9 @@ reported as semantic findings.
   production markers, unapproved new test files or test-only helpers/fixtures,
   and missing test oracles. Structural matches are candidates until the
   affected contract is verified.
-- Treat new unit, integration, end-to-end, and spec files as opt-in. Require an
-  explicit creation request or approval, or a matching
-  `review_options.test_integrity_approved_new_paths` entry. Prefer existing
+- Treat new unit, integration, end-to-end, and spec files as opt-in. Require
+  caller-provided or external trusted intent, or a matching digest-bound
+  `review_options.test_integrity_new_test_approval` entry. Prefer existing
   tests and direct browser/runtime checks. Test changes should exercise
   observable behaviour, not source strings, implementation shapes, or the
   existence of tests.

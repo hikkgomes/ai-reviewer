@@ -77,6 +77,39 @@ def _build_command(config: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _approval_config(
+    root: Path,
+    config: Mapping[str, Any],
+    base_contents: Mapping[str, str] | None,
+    changed_paths: Sequence[str],
+    *,
+    mode: str,
+    base_revision: str,
+) -> Mapping[str, Any]:
+    """Use the base policy when the repository approval file is reviewed."""
+    if mode != "diff" or ".ai-review/local.json" not in set(changed_paths):
+        return config
+    value: Any = None
+    if base_contents is not None:
+        value = base_contents.get(".ai-review/local.json")
+    if value is None and base_revision:
+        value = _git_text(root, base_revision, ".ai-review/local.json")
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else {}
+    except ValueError:
+        parsed = {}
+    base_options = parsed.get("review_options", {}) if isinstance(parsed, Mapping) else {}
+    current_options = config.get("review_options", {}) if isinstance(config.get("review_options"), Mapping) else {}
+    merged_options = dict(current_options)
+    for key in ("test_integrity_new_test_approval",):
+        merged_options.pop(key, None)
+        if isinstance(base_options, Mapping) and key in base_options:
+            merged_options[key] = base_options[key]
+    merged = dict(config)
+    merged["review_options"] = merged_options
+    return merged
+
+
 def _content_map_digest(values: Mapping[str, str | bytes] | None, paths: Iterable[str]) -> str:
     """Digest the exact selected source values for execution-plan binding."""
     payload = "\n".join(
@@ -462,6 +495,11 @@ def _prepare_inventory(
     limits: Mapping[str, int | float],
     source_kind_by_path: Mapping[str, str] | None = None,
     intent_text: str | None = None,
+    trusted_intent_text: str | None = None,
+    base_revision: str = "",
+    head_revision: str = "",
+    new_test_approval: Mapping[str, Any] | None = None,
+    approval_digest: str | None = None,
 ) -> tuple[InventoryResult, ChangePartition, StaticAnalysisResult, tuple[TestChange, ...]]:
     budget = AnalysisBudget(
         float(limits["test_integrity_timeout_seconds"]),
@@ -546,7 +584,12 @@ def _prepare_inventory(
         changed_paths=changed_paths if mode == "diff" else None,
         budget=budget,
         intent_text=intent_text,
+        trusted_intent_text=trusted_intent_text,
         config=config,
+        new_test_approval=new_test_approval,
+        approval_digest=approval_digest,
+        base_revision=base_revision,
+        head_revision=head_revision,
         new_paths=tuple(
             entry.new_path
             for entry in entries
@@ -604,32 +647,30 @@ def _head_layer_for_path(
     return "commit" if live("commit") else "working-tree"
 
 
-def analyse(
+@dataclass(frozen=True)
+class _AnalysisInputs:
+    selected: tuple[str, ...] | None
+    inventory_paths: tuple[str, ...]
+    changed_paths: tuple[str, ...]
+    base_contents: Mapping[str, str]
+    head_contents: Mapping[str, str]
+    changed_ranges: Mapping[str, Iterable[tuple[int, int]]] | None
+    source_kind_by_path: Mapping[str, str]
+
+
+def _analysis_inputs(
     root: Path,
-    paths: Iterable[str | Path] | None = None,
+    paths: Iterable[str | Path] | None,
+    entries: Sequence[DiffEntry],
     *,
-    entries: Sequence[DiffEntry] = (),
-    config: Mapping[str, Any] | None = None,
-    mode: str = "full",
-    base_contents: Mapping[str, str] | None = None,
-    head_contents: Mapping[str, str] | None = None,
-    approved_matrix_digests: Mapping[str, str] | None = None,
-    approved_mutation_digests: Mapping[str, str] | None = None,
-    prepare_dynamic_plans: bool = False,
-    base_revision: str = "",
-    head_revision: str = "HEAD",
-    changed_ranges: Mapping[str, Iterable[tuple[int, int]]] | None = None,
-    reachability_by_scenario: Mapping[str, str] | None = None,
-    reached_subjects_by_scenario: Mapping[str, Iterable[str]] | None = None,
-    focal_subjects_by_scenario: Mapping[str, Iterable[str]] | None = None,
-    intent_text: str | None = None,
-) -> TestIntegrityResult:
-    root = root.resolve()
-    config = config or {}
+    mode: str,
+    base_revision: str,
+    head_revision: str,
+    base_contents: Mapping[str, str] | None,
+    head_contents: Mapping[str, str] | None,
+    changed_ranges: Mapping[str, Iterable[tuple[int, int]]] | None,
+) -> _AnalysisInputs:
     selected = tuple(sorted({Path(path).as_posix() for path in (paths or ())})) if paths is not None else None
-    # Full mode inventories and challenges the selected repository, but does
-    # not pretend that every existing test was changed.  This keeps the
-    # changed-test oracle and mutation claims scoped to diff evidence.
     changed_paths = (
         tuple(sorted({entry.reviewed_path for entry in entries if entry.reviewed_path}))
         if mode == "diff" and entries else
@@ -649,6 +690,8 @@ def analyse(
         }))
     else:
         inventory_paths = tuple(path.relative_to(root).as_posix() for path in iter_files(root))
+    detected_base: dict[str, str] = {}
+    detected_head: dict[str, str] = {}
     if base_contents is None or head_contents is None:
         detected_base, detected_head = _source_maps(
             root,
@@ -658,91 +701,122 @@ def analyse(
             head_revision=head_revision,
             assume_base_equals_head=mode == "full",
         )
-        if base_contents is None:
-            base_contents = detected_base
-        if head_contents is None:
-            head_contents = detected_head
-
-    effective_changed_ranges = changed_ranges
-    if mode == "diff" and effective_changed_ranges is None:
-        effective_changed_ranges = _changed_ranges_from_contents(
-            base_contents or {}, head_contents or {},
-        )
-
-    source_kind_by_path = _head_source_kinds(
-        entries, inventory_paths, base_revision, root=root,
+    effective_base = detected_base if base_contents is None else dict(base_contents)
+    effective_head = detected_head if head_contents is None else dict(head_contents)
+    effective_ranges = changed_ranges
+    if mode == "diff" and effective_ranges is None:
+        effective_ranges = _changed_ranges_from_contents(effective_base, effective_head)
+    return _AnalysisInputs(
+        selected,
+        inventory_paths,
+        changed_paths,
+        effective_base,
+        effective_head,
+        effective_ranges,
+        _head_source_kinds(entries, inventory_paths, base_revision, root=root),
     )
 
-    limits = analysis_limits(config)
-    inventory, partition, static, changes = _prepare_inventory(
-        root, config, inventory_paths, selected, entries, changed_paths, mode,
-        base_contents, head_contents, limits,
-        source_kind_by_path,
-        intent_text,
+
+def _dynamic_matrix(
+    root: Path,
+    partition: ChangePartition,
+    limits: Mapping[str, int | float],
+    config: Mapping[str, Any],
+    *,
+    base_contents: Mapping[str, str],
+    head_contents: Mapping[str, str],
+    base_revision: str,
+    head_revision: str,
+    prepare_dynamic_plans: bool,
+    approved_matrix_digests: Mapping[str, str] | None,
+    changes: Sequence[TestChange],
+    reachability_by_scenario: Mapping[str, str] | None,
+    reached_subjects_by_scenario: Mapping[str, Iterable[str]] | None,
+    focal_subjects_by_scenario: Mapping[str, Iterable[str]] | None,
+) -> EvidenceMatrix | None:
+    if not _enabled(config, "dynamic_test_evidence"):
+        return None
+    mapped_subjects = tuple(sorted({
+        subject.subject_id
+        for change in changes
+        for subject in change.affected_subjects
+    }))
+    focal_subjects = {
+        scenario_id: mapped_subjects
+        for scenario_id in (
+            "base-code-base-tests", "base-code-head-tests",
+            "head-code-base-tests", "head-code-head-tests",
+        )
+    }
+    return build_matrix(
+        root,
+        partition,
+        config=config,
+        base_contents=dict(base_contents),
+        head_contents=dict(head_contents),
+        approved_digests=approved_matrix_digests,
+        base_revision=base_revision,
+        head_revision=head_revision,
+        timeout_seconds=float(limits["test_matrix_timeout_seconds"]),
+        create_plans=prepare_dynamic_plans or approved_matrix_digests is not None,
+        flaky_repetitions=int(limits["flaky_test_repetitions"]),
+        reachability_by_scenario=reachability_by_scenario,
+        reached_subjects_by_scenario=reached_subjects_by_scenario,
+        focal_subjects_by_scenario=focal_subjects_by_scenario or focal_subjects,
     )
-    matrix: EvidenceMatrix | None = None
-    if _enabled(config, "dynamic_test_evidence"):
-        mapped_subjects = tuple(sorted({
-            subject.subject_id
-            for change in changes
-            for subject in change.affected_subjects
-        }))
-        focal_subjects = {
-            scenario_id: mapped_subjects
-            for scenario_id in (
-                "base-code-base-tests", "base-code-head-tests",
-                "head-code-base-tests", "head-code-head-tests",
-            )
-        }
-        matrix = build_matrix(
-            root,
-            partition,
-            config=config,
-            base_contents={key: value for key, value in (base_contents or {}).items()},
-            head_contents={key: value for key, value in (head_contents or {}).items()},
-            approved_digests=approved_matrix_digests,
-            base_revision=base_revision,
-            head_revision=head_revision,
-            timeout_seconds=float(limits["test_matrix_timeout_seconds"]),
-            create_plans=prepare_dynamic_plans or approved_matrix_digests is not None,
-            flaky_repetitions=int(limits["flaky_test_repetitions"]),
-            reachability_by_scenario=reachability_by_scenario,
-            reached_subjects_by_scenario=reached_subjects_by_scenario,
-            focal_subjects_by_scenario=focal_subjects_by_scenario or focal_subjects,
-        )
-    mutations: MutationRun | None = None
-    if _enabled(config, "targeted_mutation"):
-        specs = generate_mutations(
-            partition,
-            inventory.subjects,
-            base_contents=base_contents or {},
-            head_contents=head_contents or {},
-            max_mutants=int(limits["mutation_max_mutants"]),
-            max_per_function=int(limits["mutation_max_per_function"]),
-            excluded_paths=partition.documentation_or_generated,
-            changed_ranges=effective_changed_ranges,
-        )
-        mutations = run_mutations(
-            root,
-            specs,
-            command=_command(root, config),
-            build_command=_build_command(config),
-            test_selection=partition.tests + partition.test_support,
-            approved_digests=approved_mutation_digests,
-            timeout_seconds=float(limits["mutation_timeout_seconds"]),
-            source_overrides={
-                path: value
-                for path, value in (head_contents or {}).items()
-            },
-            source_revision=head_revision if mode == "diff" else "",
-            production_patch_sha256=_content_map_digest(head_contents, partition.production),
-            test_patch_sha256=_content_map_digest(head_contents, partition.tests + partition.test_support),
-            shared_config_patch_sha256=_content_map_digest(head_contents, partition.shared_configuration),
-        )
-    changes = tuple(
-        replace(item, usefulness=_usefulness_evidence(item, matrix, mutations))
-        for item in changes
+
+
+def _targeted_mutations(
+    root: Path,
+    partition: ChangePartition,
+    inventory: InventoryResult,
+    limits: Mapping[str, int | float],
+    config: Mapping[str, Any],
+    *,
+    base_contents: Mapping[str, str],
+    head_contents: Mapping[str, str],
+    changed_ranges: Mapping[str, Iterable[tuple[int, int]]] | None,
+    mode: str,
+    head_revision: str,
+    approved_mutation_digests: Mapping[str, str] | None,
+) -> MutationRun | None:
+    if not _enabled(config, "targeted_mutation"):
+        return None
+    specs = generate_mutations(
+        partition,
+        inventory.subjects,
+        base_contents=base_contents,
+        head_contents=head_contents,
+        max_mutants=int(limits["mutation_max_mutants"]),
+        max_per_function=int(limits["mutation_max_per_function"]),
+        excluded_paths=partition.documentation_or_generated,
+        changed_ranges=changed_ranges,
     )
+    return run_mutations(
+        root,
+        specs,
+        command=_command(root, config),
+        build_command=_build_command(config),
+        test_selection=partition.tests + partition.test_support,
+        approved_digests=approved_mutation_digests,
+        timeout_seconds=float(limits["mutation_timeout_seconds"]),
+        source_overrides=dict(head_contents),
+        source_revision=head_revision if mode == "diff" else "",
+        production_patch_sha256=_content_map_digest(head_contents, partition.production),
+        test_patch_sha256=_content_map_digest(head_contents, partition.tests + partition.test_support),
+        shared_config_patch_sha256=_content_map_digest(head_contents, partition.shared_configuration),
+    )
+
+
+def _final_status(
+    inventory: InventoryResult,
+    static: StaticAnalysisResult,
+    partition: ChangePartition,
+    changes: Sequence[TestChange],
+    matrix: EvidenceMatrix | None,
+    mutations: MutationRun | None,
+    config: Mapping[str, Any],
+) -> tuple[str, str | None]:
     applicable = bool(
         static.candidates
         or any(item.role in TEST_ROLES for item in inventory.artifacts)
@@ -762,11 +836,106 @@ def analyse(
     )
     if missing_oracle:
         incomplete = True
-    status = "not_applicable" if not applicable else "partial" if incomplete else "complete"
-    reason = (
-        "no_test_or_subject_artifacts" if not applicable else
-        "oracle_not_recorded" if missing_oracle else
-        "dynamic_evidence_not_verified" if incomplete else None
+    if not applicable:
+        return "not_applicable", "no_test_or_subject_artifacts"
+    if missing_oracle:
+        return "partial", "oracle_not_recorded"
+    return ("partial", "dynamic_evidence_not_verified") if incomplete else ("complete", None)
+
+
+def analyse(
+    root: Path,
+    paths: Iterable[str | Path] | None = None,
+    *,
+    entries: Sequence[DiffEntry] = (),
+    config: Mapping[str, Any] | None = None,
+    mode: str = "full",
+    base_contents: Mapping[str, str] | None = None,
+    head_contents: Mapping[str, str] | None = None,
+    approved_matrix_digests: Mapping[str, str] | None = None,
+    approved_mutation_digests: Mapping[str, str] | None = None,
+    prepare_dynamic_plans: bool = False,
+    base_revision: str = "",
+    head_revision: str = "HEAD",
+    changed_ranges: Mapping[str, Iterable[tuple[int, int]]] | None = None,
+    reachability_by_scenario: Mapping[str, str] | None = None,
+    reached_subjects_by_scenario: Mapping[str, Iterable[str]] | None = None,
+    focal_subjects_by_scenario: Mapping[str, Iterable[str]] | None = None,
+    intent_text: str | None = None,
+    trusted_intent_text: str | None = None,
+    new_test_approval: Mapping[str, Any] | None = None,
+    approval_digest: str | None = None,
+) -> TestIntegrityResult:
+    root = root.resolve()
+    config = config or {}
+    inputs = _analysis_inputs(
+        root, paths, entries,
+        mode=mode,
+        base_revision=base_revision,
+        head_revision=head_revision,
+        base_contents=base_contents,
+        head_contents=head_contents,
+        changed_ranges=changed_ranges,
+    )
+    if mode == "diff" and any(
+        path == ".ai-review/local.json"
+        for entry in entries
+        for path in (entry.old_path, entry.new_path)
+    ) and ".ai-review/local.json" not in inputs.changed_paths:
+        inputs = _AnalysisInputs(
+            inputs.selected,
+            inputs.inventory_paths,
+            (*inputs.changed_paths, ".ai-review/local.json"),
+            inputs.base_contents,
+            inputs.head_contents,
+            inputs.changed_ranges,
+            inputs.source_kind_by_path,
+        )
+    limits = analysis_limits(config)
+    approval_config = _approval_config(
+        root, config, inputs.base_contents, inputs.changed_paths,
+        mode=mode, base_revision=base_revision,
+    )
+    inventory, partition, static, changes = _prepare_inventory(
+        root, approval_config, inputs.inventory_paths, inputs.selected,
+        entries, inputs.changed_paths, mode,
+        inputs.base_contents, inputs.head_contents, limits,
+        inputs.source_kind_by_path,
+        intent_text,
+        trusted_intent_text,
+        base_revision,
+        head_revision,
+        new_test_approval,
+        approval_digest,
+    )
+    matrix = _dynamic_matrix(
+        root, partition, limits, config,
+        base_contents=inputs.base_contents,
+        head_contents=inputs.head_contents,
+        base_revision=base_revision,
+        head_revision=head_revision,
+        prepare_dynamic_plans=prepare_dynamic_plans,
+        approved_matrix_digests=approved_matrix_digests,
+        changes=changes,
+        reachability_by_scenario=reachability_by_scenario,
+        reached_subjects_by_scenario=reached_subjects_by_scenario,
+        focal_subjects_by_scenario=focal_subjects_by_scenario,
+    )
+    mutations = _targeted_mutations(
+        root, partition, inventory, limits, config,
+        base_contents=inputs.base_contents,
+        head_contents=inputs.head_contents,
+        changed_ranges=inputs.changed_ranges,
+        mode=mode,
+        head_revision=head_revision,
+        approved_mutation_digests=approved_mutation_digests,
+    )
+    changes = tuple(
+        replace(item, usefulness=_usefulness_evidence(item, matrix, mutations))
+        for item in changes
+    )
+    status, reason = _final_status(
+        inventory, static, partition, changes, matrix, mutations, config,
     )
     return TestIntegrityResult(status, inventory, partition, static, changes, matrix, mutations, (), reason)
 

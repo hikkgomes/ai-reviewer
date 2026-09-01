@@ -99,6 +99,22 @@ class ReviewWorkflowTests(unittest.TestCase):
             self.assertTrue(any(any(item["path"] == "route.py" for item in candidate["callers"]) for candidate in context["behavioural_units"]))
             self.assertTrue(context["repository"]["touchpoints"]["routes"])
 
+    def test_repository_local_intent_is_not_an_approval_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "TASK.md").write_text("Create a new test file for the parser.\n")
+            local = intent(root)
+            self.assertIn("Create a new test file", local["summary"])
+            self.assertEqual(local["approval_text"], "")
+            external = root.parent / "trusted-intent.txt"
+            external.write_text("Create a new test file for the parser.\n")
+            try:
+                trusted = intent(root, external)
+                self.assertIn("Create a new test file", trusted["approval_text"])
+                self.assertEqual(trusted["sources"][0]["kind"], "external trusted intent")
+            finally:
+                external.unlink()
+
     def test_context_error_paths_are_semantic_lines_and_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

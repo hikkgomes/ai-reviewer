@@ -119,6 +119,7 @@ class ComplexityResult:
     backend_id: str = "lizard-fallback"
     parse_states: Mapping[str, str] = field(default_factory=dict)
     parse_errors: tuple[Mapping[str, Any], ...] = ()
+    candidate_summary: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"complete", "partial", "not_applicable", "unavailable", "failed"}:
@@ -143,6 +144,26 @@ class ComplexityResult:
             for path, state in self.parse_states.items()
         ):
             raise ValueError("complexity parse states are invalid")
+        if self.candidate_summary is None:
+            object.__setattr__(self, "candidate_summary", {
+                "total_candidates": len(self.candidates),
+                "emitted_candidates": len(self.candidates),
+                "truncated": False,
+                "reason_code": None,
+            })
+        summary = self.candidate_summary
+        if not isinstance(summary, Mapping):
+            raise ValueError("complexity candidate summary must be an object")
+        total = summary.get("total_candidates")
+        emitted = summary.get("emitted_candidates")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (total, emitted)):
+            raise ValueError("complexity candidate summary counts are invalid")
+        if not isinstance(total, int) or not isinstance(emitted, int) or emitted > total or emitted != len(self.candidates):
+            raise ValueError("complexity candidate summary does not match candidates")
+        if summary.get("truncated") is not (total > emitted):
+            raise ValueError("complexity candidate summary truncation flag is invalid")
+        if summary.get("truncated") and summary.get("reason_code") != "max_candidates":
+            raise ValueError("truncated complexity candidates require max_candidates reason")
 
     def as_dict(self) -> dict[str, Any]:
         state = (
@@ -163,4 +184,8 @@ class ComplexityResult:
             "policy": dict(self.policy),
             "parse_states": dict(sorted(self.parse_states.items())),
             "parse_errors": [dict(item) for item in self.parse_errors],
+            "candidate_summary": dict(self.candidate_summary or {}),
+            "total_candidates": (self.candidate_summary or {}).get("total_candidates", 0),
+            "emitted_candidates": (self.candidate_summary or {}).get("emitted_candidates", 0),
+            "truncated": (self.candidate_summary or {}).get("truncated", False),
         }

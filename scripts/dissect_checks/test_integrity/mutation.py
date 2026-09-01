@@ -403,6 +403,274 @@ def _verify_source_overrides(tree: Path, expected: Mapping[str, str]) -> bool:
     return True
 
 
+def _mutation_result(
+    spec: MutationSpec,
+    *,
+    build_valid: bool | None,
+    killed: bool | None,
+    reason_code: str | None,
+    command_plan_digest: str = "",
+    build_command_plan_digest: str = "",
+    killing_tests: Sequence[str] = (),
+) -> MutationResult:
+    return MutationResult(
+        spec.mutation_id,
+        spec.subject,
+        spec.mutation_kind,
+        spec.patch_sha256,
+        build_valid,
+        killed,
+        tuple(killing_tests),
+        reason_code,
+        command_plan_digest,
+        build_command_plan_digest,
+    )
+
+
+def _run_mutation_spec(
+    root: Path,
+    directory: Path,
+    source_root: Path,
+    spec: MutationSpec,
+    *,
+    argv: Sequence[str] | None,
+    build_argv: Sequence[str] | None,
+    build_command_configured: bool,
+    test_selection: Sequence[str],
+    approved_digests: Mapping[str, str],
+    review_budget: AnalysisBudget,
+    output_limit: int,
+    source_overrides: Mapping[str, str | bytes],
+    production_patch_sha256: str,
+    test_patch_sha256: str,
+    shared_config_patch_sha256: str,
+    repository_id: str,
+) -> tuple[MutationResult, str | None]:
+    """Plan and, when approved, run one mutant in its private source tree."""
+    if argv is None:
+        return _mutation_result(spec, build_valid=None, killed=None, reason_code="command_not_configured"), "command_not_configured"
+    if not _valid_source(spec.logical_path, spec.mutated_source):
+        return _mutation_result(spec, build_valid=False, killed=None, reason_code="invalid_mutant"), "invalid_mutant"
+    supplied_original = source_overrides.get(spec.logical_path)
+    observed_original = (
+        sha256_bytes(supplied_original if isinstance(supplied_original, bytes) else supplied_original.encode("utf-8", errors="surrogatepass"))
+        if supplied_original is not None
+        else _source_hash(source_root, spec.logical_path)
+    )
+    if observed_original != spec.original_sha256:
+        return _mutation_result(spec, build_valid=None, killed=None, reason_code="source_snapshot_changed"), "source_snapshot_changed"
+    tree = directory / spec.mutation_id
+    overrides = dict(source_overrides)
+    overrides[spec.logical_path] = spec.mutated_source
+    override_hashes = _source_override_hashes(overrides)
+    try:
+        _copy_private_tree(source_root, tree, overrides)
+    except (OSError, ValueError):
+        return _mutation_result(spec, build_valid=None, killed=None, reason_code="private_tree_failure"), "private_tree_failure"
+    if not source_overrides and _source_hash(source_root, spec.logical_path) != spec.original_sha256:
+        return _mutation_result(spec, build_valid=None, killed=None, reason_code="source_snapshot_changed"), "source_snapshot_changed"
+    if build_command_configured and build_argv is None:
+        return _mutation_result(spec, build_valid=None, killed=None, reason_code="invalid_build_command"), "invalid_build_command"
+    build_plan = None
+    build_error: str | None = None
+    if build_argv is not None:
+        build_plan, build_error = build_execution_plan(
+            kind="test-evidence",
+            name=f"mutation-build:{spec.mutation_id}",
+            argv=list(build_argv),
+            working_directory=tree,
+            environment=_isolated_environment(tree),
+            timeout_seconds=max(0.001, review_budget.remaining_seconds()),
+            output_limit=output_limit,
+            bindings={
+                "mutation_id": spec.mutation_id,
+                "patch_sha256": spec.patch_sha256,
+                "repository_id": repository_id,
+                "source_path": spec.logical_path,
+                "source_layer": spec.subject.source_kind,
+                "original_sha256": spec.original_sha256,
+                "mutated_sha256": spec.mutated_sha256,
+                "phase": "build",
+                "source_snapshot_sha256": digest_payload(override_hashes),
+                "production_patch_sha256": production_patch_sha256,
+                "test_patch_sha256": test_patch_sha256,
+                "shared_config_patch_sha256": shared_config_patch_sha256,
+            },
+        )
+        if build_plan is None:
+            return _mutation_result(spec, build_valid=None, killed=None, reason_code=build_error or "plan_unavailable"), build_error or "plan_unavailable"
+    plan, error = build_execution_plan(
+        kind="test-evidence",
+        name=f"mutation:{spec.mutation_id}",
+        argv=list(argv),
+        working_directory=tree,
+        timeout_seconds=max(0.001, review_budget.remaining_seconds()),
+        output_limit=output_limit,
+        environment=_isolated_environment(tree),
+        bindings={
+            "mutation_id": spec.mutation_id,
+            "patch_sha256": spec.patch_sha256,
+            "subject_id": spec.subject.subject_id,
+            "repository_id": repository_id,
+            "source_path": spec.logical_path,
+            "source_layer": spec.subject.source_kind,
+            "original_sha256": spec.original_sha256,
+            "mutated_sha256": spec.mutated_sha256,
+            "test_selection": "\0".join(test_selection),
+            "source_snapshot_sha256": digest_payload(override_hashes),
+            "production_patch_sha256": production_patch_sha256,
+            "test_patch_sha256": test_patch_sha256,
+            "shared_config_patch_sha256": shared_config_patch_sha256,
+        },
+    )
+    build_digest = build_plan.approval_digest if build_plan is not None else ""
+    if plan is None:
+        return _mutation_result(spec, build_valid=None, killed=None, reason_code=error or "plan_unavailable", build_command_plan_digest=build_digest), error or "plan_unavailable"
+    approval = approved_digests.get(spec.mutation_id)
+    build_approval = approved_digests.get(f"{spec.mutation_id}:build")
+    if approval is None or (build_plan is not None and build_approval is None):
+        return _mutation_result(
+            spec, build_valid=None, killed=None, reason_code="not_approved",
+            command_plan_digest=plan.approval_digest, build_command_plan_digest=build_digest,
+        ), "not_approved"
+    if not _verify_source_overrides(tree, override_hashes):
+        return _mutation_result(
+            spec, build_valid=None, killed=None, reason_code="source_snapshot_changed",
+            command_plan_digest=plan.approval_digest, build_command_plan_digest=build_digest,
+        ), "source_snapshot_changed"
+    if build_plan is not None:
+        build_completed, build_execution_error = execute_approved_plan(build_plan, build_approval)
+        if build_completed is None or build_completed.returncode != 0:
+            build_reason = (
+                "build_timeout" if build_completed is not None and build_completed.returncode == 124
+                else "invalid_mutant" if build_completed is not None
+                else build_execution_error or "build_failed"
+            )
+            return _mutation_result(
+                spec,
+                build_valid=None if build_reason == "build_timeout" else False,
+                killed=None,
+                reason_code=build_reason,
+                command_plan_digest=plan.approval_digest,
+                build_command_plan_digest=build_digest,
+            ), build_reason
+    if not _verify_source_overrides(tree, override_hashes):
+        return _mutation_result(
+            spec, build_valid=None, killed=None, reason_code="source_snapshot_changed",
+            command_plan_digest=plan.approval_digest, build_command_plan_digest=build_digest,
+        ), "source_snapshot_changed"
+    completed, execution_error = execute_approved_plan(plan, approval)
+    if completed is None:
+        reason = execution_error or "execution_failed"
+        return _mutation_result(
+            spec, build_valid=None, killed=None, reason_code=reason,
+            command_plan_digest=plan.approval_digest, build_command_plan_digest=build_digest,
+        ), reason
+    output = redact_sensitive_text(((completed.stdout or "") + (completed.stderr or ""))[:output_limit])
+    timed_out = completed.returncode == 124
+    killed = None if timed_out else completed.returncode != 0
+    reason = "test_timeout" if timed_out else None if completed.returncode == 0 else "mutant_killed"
+    return _mutation_result(
+        spec,
+        build_valid=True,
+        killed=killed,
+        killing_tests=_killing_tests(output, test_selection) if killed else (),
+        reason_code=reason,
+        command_plan_digest=plan.approval_digest,
+        build_command_plan_digest=build_digest,
+    ), None
+
+
+def _prepare_mutation_source(root: Path, directory: Path, source_revision: str) -> tuple[Path, str | None]:
+    source_root = root
+    if source_revision and _is_git_repository(root):
+        archived = directory / "head-source"
+        if not _archive_revision(root, source_revision, archived):
+            return root, "source_snapshot_unavailable"
+        source_root = archived
+    return source_root, None
+
+
+def _run_mutation_specs(
+    root: Path,
+    directory: Path,
+    source_root: Path,
+    specs: Sequence[MutationSpec],
+    *,
+    argv: Sequence[str] | None,
+    build_argv: Sequence[str] | None,
+    build_command_configured: bool,
+    test_selection: Sequence[str],
+    approved_digests: Mapping[str, str],
+    review_budget: AnalysisBudget,
+    output_limit: int,
+    source_overrides: Mapping[str, str | bytes],
+    production_patch_sha256: str,
+    test_patch_sha256: str,
+    shared_config_patch_sha256: str,
+    repository_id: str,
+) -> tuple[list[MutationResult], str | None]:
+    results: list[MutationResult] = []
+    reason: str | None = None
+    for index, spec in enumerate(specs):
+        try:
+            review_budget.claim_file()
+        except AnalysisBudgetExceeded as error:
+            reason = reason or error.reason_code
+            results.extend(
+                _mutation_result(remaining, build_valid=None, killed=None, reason_code=error.reason_code)
+                for remaining in specs[index:]
+            )
+            break
+        result, result_reason = _run_mutation_spec(
+            root, directory, source_root, spec,
+            argv=argv,
+            build_argv=build_argv,
+            build_command_configured=build_command_configured,
+            test_selection=test_selection,
+            approved_digests=approved_digests,
+            review_budget=review_budget,
+            output_limit=output_limit,
+            source_overrides=source_overrides,
+            production_patch_sha256=production_patch_sha256,
+            test_patch_sha256=test_patch_sha256,
+            shared_config_patch_sha256=shared_config_patch_sha256,
+            repository_id=repository_id,
+        )
+        results.append(result)
+        reason = reason or result_reason
+    return results, reason
+
+
+def _mutation_status(results: Sequence[MutationResult], reason: str | None) -> str:
+    if reason == "not_approved":
+        return "planned"
+    if reason == "command_not_configured":
+        return "unavailable"
+    if reason:
+        return "partial"
+    return "complete" if all(item.reason_code != "not_approved" for item in results) else "planned"
+
+
+def _validate_mutation_request(
+    specs: Sequence[MutationSpec],
+    build_command: str | None,
+    approved_digests: Mapping[str, str] | None,
+    patch_hashes: Mapping[str, str],
+) -> None:
+    for name, value in patch_hashes.items():
+        if value and (len(value) != 64 or any(character not in "0123456789abcdef" for character in value)):
+            raise ValueError(f"{name} must be a lowercase SHA-256 or empty")
+    if approved_digests is None:
+        return
+    expected_approvals = {spec.mutation_id for spec in specs}
+    if build_command:
+        expected_approvals.update(f"{spec.mutation_id}:build" for spec in specs)
+    unknown_approvals = sorted(set(approved_digests) - expected_approvals)
+    if unknown_approvals:
+        raise ValueError(f"unknown mutation approval(s): {', '.join(unknown_approvals)}")
+
+
 def run_mutations(
     root: Path,
     specs: Sequence[MutationSpec],
@@ -420,272 +688,47 @@ def run_mutations(
     shared_config_patch_sha256: str = "",
 ) -> MutationRun:
     """Plan every mutant and execute only an exact approved plan."""
-    for name, value in (
-        ("production_patch_sha256", production_patch_sha256),
-        ("test_patch_sha256", test_patch_sha256),
-        ("shared_config_patch_sha256", shared_config_patch_sha256),
-    ):
-        if value and (len(value) != 64 or any(character not in "0123456789abcdef" for character in value)):
-            raise ValueError(f"{name} must be a lowercase SHA-256 or empty")
-    if approved_digests is not None:
-        expected_approvals = {spec.mutation_id for spec in specs}
-        if build_command:
-            expected_approvals.update(f"{spec.mutation_id}:build" for spec in specs)
-        unknown_approvals = sorted(set(approved_digests) - expected_approvals)
-        if unknown_approvals:
-            raise ValueError(f"unknown mutation approval(s): {', '.join(unknown_approvals)}")
+    _validate_mutation_request(
+        specs,
+        build_command,
+        approved_digests,
+        {
+            "production_patch_sha256": production_patch_sha256,
+            "test_patch_sha256": test_patch_sha256,
+            "shared_config_patch_sha256": shared_config_patch_sha256,
+        },
+    )
     if not specs:
         return MutationRun("not_applicable", ())
     argv = _command_argv(command) if command else None
-    results: list[MutationResult] = []
-    reason: str | None = None
     review_budget = AnalysisBudget(timeout_seconds, max_files=len(specs))
     with tempfile.TemporaryDirectory(prefix="dissect-mutations-") as directory:
-        source_root = root
-        archived_source = Path(directory) / "head-source"
-        if source_revision and _is_git_repository(root):
-            if not _archive_revision(root, source_revision, archived_source):
-                reason = "source_snapshot_unavailable"
-                return MutationRun(
-                    "partial",
-                    tuple(
-                        MutationResult(
-                            spec.mutation_id,
-                            spec.subject,
-                            spec.mutation_kind,
-                            spec.patch_sha256,
-                            None,
-                            None,
-                            (),
-                            reason,
-                        )
-                        for spec in specs
-                    ),
-                    reason,
-                    {},
-                    {},
-                )
-            source_root = archived_source
-        for index, spec in enumerate(specs):
-            try:
-                review_budget.claim_file()
-            except AnalysisBudgetExceeded as error:
-                reason = reason or error.reason_code
-                for remaining in specs[index:]:
-                    results.append(MutationResult(
-                        remaining.mutation_id, remaining.subject, remaining.mutation_kind,
-                        remaining.patch_sha256, None, None, (), error.reason_code,
-                    ))
-                break
-            if argv is None:
-                results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, None, None, (), "command_not_configured"))
-                reason = reason or "command_not_configured"
-                continue
-            if not _valid_source(spec.logical_path, spec.mutated_source):
-                results.append(MutationResult(
-                    spec.mutation_id,
-                    spec.subject,
-                    spec.mutation_kind,
-                    spec.patch_sha256,
-                    False,
-                    None,
-                    (),
-                    "invalid_mutant",
-                ))
-                reason = reason or "invalid_mutant"
-                continue
-            expected_original = spec.original_sha256
-            supplied_original = (source_overrides or {}).get(spec.logical_path)
-            observed_original = (
-                sha256_bytes(supplied_original if isinstance(supplied_original, bytes) else supplied_original.encode("utf-8", errors="surrogatepass"))
-                if supplied_original is not None
-                else _source_hash(source_root, spec.logical_path)
-            )
-            if observed_original != expected_original:
-                results.append(MutationResult(
-                    spec.mutation_id,
-                    spec.subject,
-                    spec.mutation_kind,
-                    spec.patch_sha256,
-                    None,
-                    None,
-                    (),
-                    "source_snapshot_changed",
-                ))
-                reason = reason or "source_snapshot_changed"
-                continue
-            tree = Path(directory) / spec.mutation_id
-            overrides = dict(source_overrides or {})
-            overrides[spec.logical_path] = spec.mutated_source
-            override_hashes = _source_override_hashes(overrides)
-            try:
-                _copy_private_tree(source_root, tree, overrides)
-            except (OSError, ValueError) as error:
-                results.append(MutationResult(
-                    spec.mutation_id,
-                    spec.subject,
-                    spec.mutation_kind,
-                    spec.patch_sha256,
-                    None,
-                    None,
-                    (),
-                    "private_tree_failure",
-                ))
-                reason = reason or "private_tree_failure"
-                continue
-            if not source_overrides and _source_hash(source_root, spec.logical_path) != expected_original:
-                results.append(MutationResult(
-                    spec.mutation_id,
-                    spec.subject,
-                    spec.mutation_kind,
-                    spec.patch_sha256,
-                    None,
-                    None,
-                    (),
-                    "source_snapshot_changed",
-                ))
-                reason = reason or "source_snapshot_changed"
-                continue
-            build_argv = _command_argv(build_command) if build_command else None
-            if build_command and build_argv is None:
-                results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, None, None, (), "invalid_build_command"))
-                reason = reason or "invalid_build_command"
-                continue
-            plan_timeout = max(0.001, review_budget.remaining_seconds())
-            build_plan = None
-            build_error: str | None = None
-            if build_argv is not None:
-                build_plan, build_error = build_execution_plan(
-                    kind="test-evidence",
-                    name=f"mutation-build:{spec.mutation_id}",
-                    argv=build_argv,
-                    working_directory=tree,
-                    environment=_isolated_environment(tree),
-                    timeout_seconds=plan_timeout,
-                    output_limit=output_limit,
-                    bindings={
-                        "mutation_id": spec.mutation_id,
-                        "patch_sha256": spec.patch_sha256,
-                        "repository_id": _repository_identity(root),
-                        "source_path": spec.logical_path,
-                        "source_layer": spec.subject.source_kind,
-                        "original_sha256": spec.original_sha256,
-                        "mutated_sha256": spec.mutated_sha256,
-                        "phase": "build",
-                        "source_snapshot_sha256": digest_payload(override_hashes),
-                        "production_patch_sha256": production_patch_sha256,
-                        "test_patch_sha256": test_patch_sha256,
-                        "shared_config_patch_sha256": shared_config_patch_sha256,
-                    },
-                )
-                if build_plan is None:
-                    results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, None, None, (), build_error or "plan_unavailable"))
-                    reason = reason or build_error or "plan_unavailable"
-                    continue
-            plan, error = build_execution_plan(
-                kind="test-evidence",
-                name=f"mutation:{spec.mutation_id}",
-                argv=argv,
-                working_directory=tree,
-                timeout_seconds=max(0.001, review_budget.remaining_seconds()),
-                output_limit=output_limit,
-                environment=_isolated_environment(tree),
-                bindings={
-                    "mutation_id": spec.mutation_id,
-                    "patch_sha256": spec.patch_sha256,
-                    "subject_id": spec.subject.subject_id,
-                    "repository_id": _repository_identity(root),
-                    "source_path": spec.logical_path,
-                    "source_layer": spec.subject.source_kind,
-                    "original_sha256": spec.original_sha256,
-                    "mutated_sha256": spec.mutated_sha256,
-                    "test_selection": "\0".join(test_selection),
-                    "source_snapshot_sha256": digest_payload(override_hashes),
-                    "production_patch_sha256": production_patch_sha256,
-                    "test_patch_sha256": test_patch_sha256,
-                    "shared_config_patch_sha256": shared_config_patch_sha256,
-                },
-            )
-            if plan is None:
-                results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, None, None, (), error or "plan_unavailable"))
-                reason = reason or error or "plan_unavailable"
-                continue
-            approval = (approved_digests or {}).get(spec.mutation_id)
-            build_approval = (approved_digests or {}).get(f"{spec.mutation_id}:build")
-            if approval is None or (build_plan is not None and build_approval is None):
-                results.append(MutationResult(
-                    spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
-                    None, None, (), "not_approved", plan.approval_digest,
-                    build_plan.approval_digest if build_plan is not None else "",
-                ))
-                reason = reason or "not_approved"
-                continue
-            if not _verify_source_overrides(tree, override_hashes):
-                results.append(MutationResult(
-                    spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
-                    None, None, (), "source_snapshot_changed", plan.approval_digest,
-                    build_plan.approval_digest if build_plan is not None else "",
-                ))
-                reason = reason or "source_snapshot_changed"
-                continue
-            if build_plan is not None:
-                build_completed, build_execution_error = execute_approved_plan(build_plan, build_approval)
-                if build_completed is None or build_completed.returncode != 0:
-                    build_reason = (
-                        "build_timeout" if build_completed is not None and build_completed.returncode == 124
-                        else "invalid_mutant" if build_completed is not None
-                        else build_execution_error or "build_failed"
-                    )
-                    results.append(MutationResult(
-                        spec.mutation_id, spec.subject, spec.mutation_kind,
-                        spec.patch_sha256,
-                        None if build_reason == "build_timeout" else False,
-                        None,
-                        (),
-                        build_reason,
-                        plan.approval_digest,
-                        build_plan.approval_digest if build_plan is not None else "",
-                    ))
-                    reason = reason or build_reason
-                    continue
-            if not _verify_source_overrides(tree, override_hashes):
-                results.append(MutationResult(
-                    spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
-                    None, None, (), "source_snapshot_changed", plan.approval_digest,
-                    build_plan.approval_digest if build_plan is not None else "",
-                ))
-                reason = reason or "source_snapshot_changed"
-                continue
-            completed, execution_error = execute_approved_plan(plan, approval)
-            if completed is None:
-                results.append(MutationResult(
-                    spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
-                    None, None, (), execution_error or "execution_failed", plan.approval_digest,
-                    build_plan.approval_digest if build_plan is not None else "",
-                ))
-                reason = reason or execution_error or "execution_failed"
-                continue
-            output = redact_sensitive_text(((completed.stdout or "") + (completed.stderr or ""))[:output_limit])
-            # Source validity is established before planning. A non-zero
-            # test command means that the valid mutant was killed, not that
-            # the mutant failed to build. Build failures are excluded during
-            # generation rather than being counted as killed mutants.
-            build_valid = True
-            timed_out = completed.returncode == 124
-            killed = None if timed_out else completed.returncode != 0
-            results.append(MutationResult(
-                spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
-                build_valid, killed, _killing_tests(output, test_selection) if killed else (),
-                "test_timeout" if timed_out else None if completed.returncode == 0 else "mutant_killed", plan.approval_digest,
-                build_plan.approval_digest if build_plan is not None else "",
-            ))
-            _ = bounded_fingerprint(output)
-    status = (
-        "complete" if all(item.reason_code != "not_approved" for item in results) and not reason
-        else "planned" if reason == "not_approved"
-        else "unavailable" if reason == "command_not_configured"
-        else "partial"
-    )
+        source_root, source_reason = _prepare_mutation_source(root, Path(directory), source_revision)
+        if source_reason is not None:
+            results = [
+                _mutation_result(spec, build_valid=None, killed=None, reason_code=source_reason)
+                for spec in specs
+            ]
+            return MutationRun("partial", tuple(results), source_reason, {}, {})
+        source_values = source_overrides or {}
+        build_argv = _command_argv(build_command) if build_command else None
+        repository_id = _repository_identity(root)
+        results, reason = _run_mutation_specs(
+            root, Path(directory), source_root, specs,
+            argv=argv,
+            build_argv=build_argv,
+            build_command_configured=bool(build_command),
+            test_selection=test_selection,
+            approved_digests=approved_digests or {},
+            review_budget=review_budget,
+            output_limit=output_limit,
+            source_overrides=source_values,
+            production_patch_sha256=production_patch_sha256,
+            test_patch_sha256=test_patch_sha256,
+            shared_config_patch_sha256=shared_config_patch_sha256,
+            repository_id=repository_id,
+        )
+    status = _mutation_status(results, reason)
     mutation_results = tuple(results)
     return MutationRun(
         status,

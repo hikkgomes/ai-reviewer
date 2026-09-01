@@ -4,7 +4,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
     <Compile Remove="Malformed.cs" />
     <Compile Remove="generated/**/*.cs" />
-  </PropertyGroup>
+  </ItemGroup>
 </Project>

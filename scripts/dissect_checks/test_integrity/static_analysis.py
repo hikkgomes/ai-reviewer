@@ -7,6 +7,7 @@ import ast
 import difflib
 import fnmatch
 import io
+import json
 import re
 from pathlib import Path
 import tokenize
@@ -26,6 +27,7 @@ NEW_TEST_ARTIFACT_ROLES = frozenset({"test", "test helper", "fixture", "snapshot
 MAX_CANDIDATES = 500
 MAX_DIFF_LINES = 5_000
 MAX_DIFF_COMPARISONS = 1_000_000
+NEW_TEST_APPROVAL_DOMAIN = b"dissect-test-creation-approval-v1\0"
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,36 @@ class StaticAnalysisResult:
             "evidence": [dict(item) for item in self.evidence],
             "reason_code": self.reason_code,
         }
+
+
+@dataclass(frozen=True)
+class NewTestApproval:
+    """A path- and revision-bound approval for newly added test artefacts."""
+
+    path_patterns: tuple[str, ...]
+    roles: tuple[str, ...]
+    max_count: int
+    production_subjects: tuple[str, ...]
+    base_revision: str
+    head_revision: str
+    digest: str
+    source: str
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0",
+            "path_patterns": list(self.path_patterns),
+            "roles": list(self.roles),
+            "max_count": self.max_count,
+            "production_subjects": list(self.production_subjects),
+            "base_revision": self.base_revision,
+            "head_revision": self.head_revision,
+        }
+
+    @property
+    def expected_digest(self) -> str:
+        encoded = json.dumps(self.payload(), ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return hashlib.sha256(NEW_TEST_APPROVAL_DOMAIN + encoded).hexdigest()
 
 
 def _line(text: str, offset: int) -> int:
@@ -697,34 +729,202 @@ def _has_explicit_new_test_approval(intent_text: str | None) -> bool:
     return False
 
 
-def _approved_new_test_patterns(config: Mapping[str, Any] | None) -> tuple[str, ...]:
-    options = config.get("review_options") if isinstance(config, Mapping) else None
-    if not isinstance(options, Mapping):
-        return ()
-    values = options.get("test_integrity_approved_new_paths", [])
-    if not isinstance(values, list) or not all(isinstance(value, str) and value.strip() for value in values):
-        raise ValueError("review option test_integrity_approved_new_paths must be a non-empty-string array")
+def _normalise_approval_paths(values: Any) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple)) or not values or not all(isinstance(value, str) and value.strip() for value in values):
+        raise ValueError("new-test approval paths must be a non-empty-string array")
     patterns: list[str] = []
     for value in values:
         pattern = value.replace("\\", "/").strip()
         path = Path(pattern)
         if path.is_absolute() or ".." in path.parts:
-            raise ValueError("review option test_integrity_approved_new_paths must contain repository-relative patterns")
+            raise ValueError("new-test approval paths must contain repository-relative patterns")
         patterns.append(pattern)
-    return tuple(patterns)
+    return tuple(dict.fromkeys(patterns))
+
+
+def _approval_payload(
+    path_patterns: Iterable[str],
+    roles: Iterable[str],
+    max_count: int,
+    production_subjects: Iterable[str],
+    base_revision: str,
+    head_revision: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "path_patterns": sorted(set(path_patterns)),
+        "roles": sorted(set(roles)),
+        "max_count": max_count,
+        "production_subjects": sorted(set(production_subjects)),
+        "base_revision": base_revision,
+        "head_revision": head_revision,
+    }
+
+
+def new_test_approval_digest(scope: Mapping[str, Any]) -> str:
+    """Create the full digest used by external test-creation approvals."""
+    payload = _approval_payload(
+        scope.get("path_patterns", scope.get("paths", ())),
+        scope.get("roles", ()),
+        scope.get("max_count", 0),
+        scope.get("production_subjects", ()),
+        str(scope.get("base_revision", "")),
+        str(scope.get("head_revision", "")),
+    )
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(NEW_TEST_APPROVAL_DOMAIN + encoded).hexdigest()
+
+
+def _approval_from_mapping(
+    value: Mapping[str, Any],
+    *,
+    source: str,
+    base_revision: str,
+    head_revision: str,
+) -> NewTestApproval | None:
+    try:
+        paths = _normalise_approval_paths(value.get("path_patterns", value.get("paths", value.get("allowed_paths"))))
+        roles_value = value.get("roles", value.get("artifact_roles"))
+        if not isinstance(roles_value, (list, tuple)) or not roles_value or not all(isinstance(item, str) and item in NEW_TEST_ARTIFACT_ROLES for item in roles_value):
+            return None
+        roles = tuple(dict.fromkeys(roles_value))
+        max_count = value.get("max_count")
+        if isinstance(max_count, bool) or not isinstance(max_count, int) or max_count < 1:
+            return None
+        subjects_value = value.get("production_subjects", value.get("subjects", ()))
+        if not isinstance(subjects_value, (list, tuple)) or not all(isinstance(item, str) and item for item in subjects_value):
+            return None
+        expected_base = value.get("base_revision", "")
+        expected_head = value.get("head_revision", "")
+        if not isinstance(expected_base, str) or not isinstance(expected_head, str):
+            return None
+        if expected_base != base_revision or expected_head != head_revision:
+            return None
+        payload = _approval_payload(paths, roles, max_count, subjects_value, expected_base, expected_head)
+        digest = value.get("digest", value.get("approval_digest"))
+        if not isinstance(digest, str) or digest != new_test_approval_digest(payload):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return NewTestApproval(
+        tuple(payload["path_patterns"]), tuple(payload["roles"]), max_count,
+        tuple(payload["production_subjects"]), expected_base, expected_head,
+        digest, source,
+    )
+
+
+def _configured_new_test_approval(
+    config: Mapping[str, Any] | None,
+    *,
+    base_revision: str,
+    head_revision: str,
+) -> NewTestApproval | None:
+    options = config.get("review_options") if isinstance(config, Mapping) else None
+    if not isinstance(options, Mapping):
+        return None
+    structured = options.get("test_integrity_new_test_approval")
+    if isinstance(structured, Mapping):
+        return _approval_from_mapping(
+            structured,
+            source="review_options.test_integrity_new_test_approval",
+            base_revision=base_revision,
+            head_revision=head_revision,
+        )
+    # The former path-list option is intentionally not an approval source. It
+    # has no artifact-role, count, subject, or revision binding.
+    return None
+
+
+def _intent_paths(intent_text: str) -> tuple[str, ...]:
+    values = re.findall(r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9_-]+)?", intent_text)
+    paths = []
+    for value in values:
+        normalised = value.replace("\\", "/")
+        if Path(normalised).is_absolute() or ".." in Path(normalised).parts:
+            continue
+        if "/" in normalised and (Path(normalised).suffix or "*" in normalised):
+            paths.append(normalised)
+    return tuple(dict.fromkeys(paths))
+
+
+def _intent_role(intent_text: str) -> str:
+    lower = intent_text.lower()
+    if "fixture" in lower:
+        return "fixture"
+    if "helper" in lower:
+        return "test helper"
+    if any(token in lower for token in ("snapshot", "golden")):
+        return "snapshot or golden file"
+    return "test"
+
+
+def _intent_new_test_approval(
+    intent_text: str | None,
+    new_artifacts: Sequence[TestArtifact],
+    related_subjects: Mapping[str, Sequence[TestSubject]],
+    *,
+    base_revision: str,
+    head_revision: str,
+) -> NewTestApproval | None:
+    if not _has_explicit_new_test_approval(intent_text):
+        return None
+    text = intent_text or ""
+    paths = _intent_paths(text)
+    role = _intent_role(text)
+    singular = bool(re.search(r"\b(?:a|an|one|single)\b", text, re.I))
+    if not paths:
+        if len(new_artifacts) != 1:
+            return None
+        paths = (new_artifacts[0].logical_path,)
+    max_count = 1 if singular or len(paths) == 1 else len(paths)
+    matched = [item for item in new_artifacts if any(fnmatch.fnmatchcase(item.logical_path, pattern) for pattern in paths)]
+    subjects = tuple(sorted({
+        subject.subject_id
+        for artifact in matched
+        for subject in related_subjects.get(artifact.artifact_id, ())
+    }))
+    payload = _approval_payload(paths, (role,), max_count, subjects, base_revision, head_revision)
+    return NewTestApproval(
+        tuple(payload["path_patterns"]), tuple(payload["roles"]), max_count,
+        tuple(payload["production_subjects"]), base_revision, head_revision,
+        new_test_approval_digest(payload), "trusted_intent",
+    )
 
 
 def _new_test_approval(
     path: str,
-    config: Mapping[str, Any] | None,
-    intent_text: str | None,
+    artifact: TestArtifact,
+    approval: NewTestApproval | None,
+    new_artifacts: Sequence[TestArtifact],
+    related_subjects: Mapping[str, Sequence[TestSubject]],
 ) -> tuple[bool, str]:
-    patterns = _approved_new_test_patterns(config)
-    if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns):
-        return True, "review_options.test_integrity_approved_new_paths"
-    if _has_explicit_new_test_approval(intent_text):
-        return True, "explicit_creation_request"
-    return False, "none"
+    if approval is None:
+        return False, "none"
+    matched_artifacts = [
+        item for item in new_artifacts
+        if item.role in approval.roles
+        and any(fnmatch.fnmatchcase(item.logical_path, pattern) for pattern in approval.path_patterns)
+    ]
+    if len(matched_artifacts) > approval.max_count:
+        return False, approval.source
+    if artifact not in matched_artifacts:
+        return False, approval.source
+    actual_subjects = {subject.subject_id for subject in related_subjects.get(artifact.artifact_id, ())}
+    if approval.production_subjects != ("*",):
+        approved_subjects = set(approval.production_subjects)
+        linked = related_subjects.get(artifact.artifact_id, ())
+        if linked and any(
+            not any(
+                fnmatch.fnmatchcase(value, pattern)
+                for pattern in approved_subjects
+                for value in (subject.subject_id, subject.logical_path, subject.qualified_name)
+            )
+            for subject in linked
+        ):
+            return False, approval.source
+        if not actual_subjects and approved_subjects:
+            return False, approval.source
+    return True, approval.source
 
 
 def _new_test_file_matches(
@@ -988,82 +1188,290 @@ def _mask_non_code(text: str, *, python: bool = False) -> str:
     return "".join(chars)
 
 
-def analyse_static(
-    root: Path,
-    inventory: InventoryResult,
+def _test_matches(
+    path: str,
+    artifact: TestArtifact,
+    text: str,
+    base: str,
+    code_text: str,
+    base_code: str,
     *,
-    paths: Iterable[str] | None = None,
-    base_contents: Mapping[str, str] | None = None,
-    head_contents: Mapping[str, str] | None = None,
-    changed_paths: Iterable[str] | None = None,
-    source_kind: str = "working-tree",
-    budget: AnalysisBudget | None = None,
-    enabled_rules: Iterable[str] | None = None,
-    intent_text: str | None = None,
-    config: Mapping[str, Any] | None = None,
-    new_paths: Iterable[str] | None = None,
-) -> StaticAnalysisResult:
-    """Analyse only evidence-bearing test files and selected production seams."""
-    if base_contents is not None:
-        base_contents = {path: _source_text(value) for path, value in base_contents.items()}
-    if head_contents is not None:
-        head_contents = {path: _source_text(value) for path, value in head_contents.items()}
-    requested_values = paths or [item.logical_path for item in inventory.artifacts]
-    requested_set: set[str] = set()
-    for value in requested_values:
+    changed: set[str] | None,
+    deleted_source: bool,
+    is_new: bool,
+    documented_contract_change: bool,
+    linked_subjects: Sequence[TestSubject],
+    creation_approval: NewTestApproval | None,
+    new_artifacts: Sequence[TestArtifact],
+    related_subjects: Mapping[str, Sequence[TestSubject]],
+) -> list[tuple[str, int, int, str, TestSubject | None, dict[str, Any]]]:
+    matches: list[tuple[str, int, int, str, TestSubject | None, dict[str, Any]]] = []
+    approved, approval_source = _new_test_approval(
+        path, artifact, creation_approval, new_artifacts, related_subjects,
+    )
+    for line, offset, message in _new_test_file_matches(
+        path, artifact, is_new=is_new, approved=approved,
+    ):
+        matches.append((
+            "GOV-TESTS-010", line, offset, message, None,
+            {
+                "change_kind": "new_test_file_without_approval",
+                "approval_required": True,
+                "approval_source": approval_source,
+                "approval_digest": creation_approval.digest if creation_approval else "",
+                "approval_scope": creation_approval.payload() if creation_approval else {},
+            },
+        ))
+    if base and _changed(path, changed) and not documented_contract_change:
+        compare_head = "" if deleted_source else text
+        matches.extend(
+            ("GOV-TESTS-001", line, 0, message, None, {"change_kind": "test_removed"})
+            for line, message in _deleted_test_matches(path, base, compare_head)
+        )
+    if not deleted_source:
+        matches.extend(
+            ("GOV-TESTS-001", line, offset, message, None, {"change_kind": "disabled_or_bypassed"})
+            for line, offset, message in _disabled_matches(code_text, base_code)
+            if not _has_quarantine_evidence(text, line)
+        )
+    if base and _changed(path, changed) and not documented_contract_change:
+        matches.extend(
+            ("GOV-TESTS-002", line, 0, message, None, {"change_kind": "assertion_weakened"})
+            for line, message in _assertion_weakening(base_code, code_text)
+        )
+        matches.extend(
+            ("GOV-TESTS-002", line, 0, message, None, {"change_kind": "assertion_moved_behind_branch"})
+            for line, message in _assertion_moved_behind_branch(base_code, code_text)
+        )
+        matches.extend(
+            ("GOV-TESTS-001", line, 0, message, None, {"change_kind": "parameter_cases_reduced"})
+            for line, message in _reduced_parameter_cases(path, base, text)
+        )
+        matches.extend(
+            ("GOV-TESTS-001", line, 0, message, None, {"change_kind": "test_path_excluded"})
+            for line, message in _excluded_test_paths(base, text)
+        )
+    for line, message, subject_name in _circular_oracles(code_text):
+        subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
+        matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "circular_oracle", "called_symbol": subject_name}))
+    for line, message, subject_name in _derived_oracles(code_text):
+        subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
+        matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "implementation_derived_oracle", "called_symbol": subject_name}))
+    python_source = Path(path).suffix.lower() in {".py", ".pyi"}
+    if python_source:
+        for line, message, subject_name in _python_circular_oracles(text):
+            subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
+            matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "circular_oracle", "called_symbol": subject_name}))
+        for line, message, subject_name in _python_derived_oracles(text):
+            subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
+            matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "implementation_derived_oracle", "called_symbol": subject_name}))
+    for line, message, subject_name in _implementation_oracle_matches(text):
+        matches.append(("GOV-TESTS-003", line, 0, message, None, {"change_kind": subject_name}))
+    if artifact.role == "snapshot or golden file":
+        matches.extend(
+            ("GOV-TESTS-003", line, 0, message, None, {"change_kind": "generated_snapshot", "called_symbol": subject_name})
+            for line, message, subject_name in _snapshot_derived_oracle(text)
+        )
+    matches.extend(
+        ("GOV-TESTS-004", line, 0, message, subject, {"change_kind": "focal_subject_mocked"})
+        for line, subject, message in _mock_matches(text, linked_subjects)
+    )
+    matches.extend(
+        ("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"})
+        for line, message in _tautologies(code_text)
+    )
+    if python_source:
+        matches.extend(
+            ("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"})
+            for line, message in _python_tautologies(text)
+        )
+        matches.extend(
+            ("GOV-TESTS-005", line, 0, message, None, {"change_kind": "early_return"})
+            for line, message in _python_early_return_matches(text)
+        )
+        matches.extend(
+            ("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"})
+            for line, message in _python_catch_all_matches(text)
+        )
+    else:
+        matches.extend(
+            ("GOV-TESTS-005", line, 0, message, None, {"change_kind": "no_observable_verification"})
+            for line, message in _non_python_no_observable_test_bodies(path, text)
+        )
+    matches.extend(
+        ("GOV-TESTS-005", line, 0, message, None, {"change_kind": "no_observable_verification"})
+        for line, message in _no_observable_test_bodies(text)
+    )
+    if artifact.role in {"fixture", "test"}:
+        matches.extend(
+            ("GOV-TESTS-007", line, 0, message, None, {"change_kind": "invalid_fixture"})
+            for line, message in _invalid_fixture_matches(path, text)
+        )
+    return matches
+
+
+def _production_matches(
+    text: str,
+    path: str,
+) -> list[tuple[str, int, int, str, TestSubject | None, dict[str, Any]]]:
+    return [
+        ("GOV-TESTS-006", line, 0, message, None, {"change_kind": "test_only_production_path"})
+        for line, message in _test_only_production(
+            text,
+            python=Path(path).suffix.lower() in {".py", ".pyi"},
+        )
+    ]
+
+
+def _normalise_static_paths(root: Path, values: Iterable[str | Path]) -> set[str]:
+    result: set[str] = set()
+    for value in values:
         candidate = Path(value)
         if candidate.is_absolute():
             try:
-                requested_set.add(candidate.resolve().relative_to(root.resolve()).as_posix())
+                result.add(candidate.resolve().relative_to(root.resolve()).as_posix())
             except (OSError, ValueError):
                 continue
         else:
-            requested_set.add(candidate.as_posix())
-    requested = sorted(requested_set)
-    changed: set[str] | None = None
-    if changed_paths is not None:
-        changed = set()
-        for value in changed_paths:
-            candidate = Path(value)
-            if candidate.is_absolute():
-                try:
-                    changed.add(candidate.resolve().relative_to(root.resolve()).as_posix())
-                except (OSError, ValueError):
-                    continue
-            else:
-                changed.add(candidate.as_posix())
-    added: set[str] = set()
-    if new_paths is not None:
-        for value in new_paths:
-            candidate = Path(value)
-            if candidate.is_absolute():
-                try:
-                    added.add(candidate.resolve().relative_to(root.resolve()).as_posix())
-                except (OSError, ValueError):
-                    continue
-            else:
-                added.add(candidate.as_posix())
-    enabled = set(enabled_rules) if enabled_rules is not None else set(DEFAULT_ENABLED_RULES)
-    artifacts = inventory.artifacts
-    artifact_by_path = {item.logical_path: item for item in artifacts}
-    selected = [
-        path for path in requested
-        if artifact_by_path.get(path) is not None
-        and artifact_by_path[path].role in {
-            "test", "test helper", "fixture", "snapshot or golden file",
-            "test configuration", "CI test command", "production source",
-        }
-    ]
-    subjects = inventory.subjects
-    subjects_by_id = {item.subject_id: item for item in subjects}
-    related_subjects: dict[str, tuple[TestSubject, ...]] = {}
+            result.add(candidate.as_posix())
+    return result
+
+
+def _related_static_subjects(
+    inventory: InventoryResult,
+) -> dict[str, tuple[TestSubject, ...]]:
+    subjects_by_id = {item.subject_id: item for item in inventory.subjects}
+    result: dict[str, tuple[TestSubject, ...]] = {}
     for relation in inventory.relations:
         artifact_id = relation.get("test_artifact_id") if isinstance(relation, Mapping) else None
         subject_id = relation.get("subject_id") if isinstance(relation, Mapping) else None
         subject = subjects_by_id.get(subject_id) if isinstance(subject_id, str) else None
         if isinstance(artifact_id, str) and subject is not None:
-            related_subjects.setdefault(artifact_id, tuple())
-            related_subjects[artifact_id] = tuple(dict.fromkeys((*related_subjects[artifact_id], subject)))
+            result.setdefault(artifact_id, tuple())
+            result[artifact_id] = tuple(dict.fromkeys((*result[artifact_id], subject)))
+    return result
+
+
+def _creation_approval(
+    config: Mapping[str, Any] | None,
+    explicit_scope: Mapping[str, Any] | None,
+    approval_digest: str | None,
+    trusted_intent_text: str | None,
+    new_artifacts: Sequence[TestArtifact],
+    related_subjects: Mapping[str, Sequence[TestSubject]],
+    *,
+    base_revision: str,
+    head_revision: str,
+) -> NewTestApproval | None:
+    configured = _configured_new_test_approval(
+        config,
+        base_revision=base_revision,
+        head_revision=head_revision,
+    )
+    scope = explicit_scope
+    if scope is None and approval_digest is not None:
+        options = config.get("review_options") if isinstance(config, Mapping) else None
+        value = options.get("test_integrity_new_test_approval") if isinstance(options, Mapping) else None
+        scope = value if isinstance(value, Mapping) else None
+    if scope is not None:
+        value = dict(scope)
+        if approval_digest is not None:
+            value["digest"] = approval_digest
+        configured = _approval_from_mapping(
+            value,
+            source="explicit_approval_digest",
+            base_revision=base_revision,
+            head_revision=head_revision,
+        )
+    elif approval_digest is not None:
+        configured = None
+    intent = _intent_new_test_approval(
+        trusted_intent_text,
+        new_artifacts,
+        related_subjects,
+        base_revision=base_revision,
+        head_revision=head_revision,
+    ) if trusted_intent_text else None
+    return configured or intent
+
+
+def _append_static_candidate(
+    candidates: list[dict[str, Any]],
+    evidence: list[Mapping[str, Any]],
+    seen: set[str],
+    *,
+    rule_id: str,
+    path: str,
+    line: int,
+    column: int,
+    message: str,
+    artifact: TestArtifact | None,
+    subject: TestSubject | None,
+    digest: str,
+    source_kind: str,
+    details: Mapping[str, Any],
+    candidate_limit: int,
+    budget: AnalysisBudget | None,
+) -> tuple[bool, str | None]:
+    if candidate_limit <= len(candidates):
+        return False, "max_candidates"
+    evidence_source_kind = artifact.source_kind if artifact is not None else subject.source_kind if subject is not None else source_kind
+    candidate = _candidate(
+        rule_id, path, line, column, message,
+        artifact=artifact, subject=subject, source_kind=evidence_source_kind,
+        content_sha256=digest, details=details,
+    )
+    if candidate["id"] in seen:
+        return True, None
+    if budget is not None:
+        try:
+            budget.claim_candidate()
+        except AnalysisBudgetExceeded as error:
+            return False, error.reason_code
+    seen.add(candidate["id"])
+    candidates.append(candidate)
+    evidence.extend(candidate["supporting_evidence"])
+    return len(candidates) < candidate_limit, None
+
+
+def _read_static_source(
+    root: Path,
+    path: str,
+    base_contents: Mapping[str, str] | None,
+    head_contents: Mapping[str, str] | None,
+) -> tuple[str | None, bool, str | None]:
+    if head_contents is not None:
+        text = head_contents.get(path)
+        if text is not None:
+            return text, False, None
+        if path in (base_contents or {}):
+            return (base_contents or {}).get(path), True, None
+        return None, False, "source_unavailable"
+    try:
+        return (root / path).read_text(encoding="utf-8", errors="replace"), False, None
+    except OSError:
+        return None, False, "read_failure"
+
+
+def _scan_static_files(
+    root: Path,
+    selected: Sequence[str],
+    artifact_by_path: Mapping[str, TestArtifact],
+    subjects: Sequence[TestSubject],
+    related_subjects: Mapping[str, Sequence[TestSubject]],
+    *,
+    new_artifacts: Sequence[TestArtifact],
+    base_contents: Mapping[str, str] | None,
+    head_contents: Mapping[str, str] | None,
+    added: set[str],
+    changed: set[str] | None,
+    source_kind: str,
+    budget: AnalysisBudget | None,
+    enabled: set[str],
+    creation_approval: NewTestApproval | None,
+    documented_contract_change: bool,
+    candidate_limit: int,
+) -> StaticAnalysisResult:
     candidates: list[dict[str, Any]] = []
     evidence: list[Mapping[str, Any]] = []
     seen: set[str] = set()
@@ -1071,57 +1479,6 @@ def analyse_static(
     checked = 0
     skipped = 0
     skip_reason: str | None = None
-    candidate_limit = min(
-        MAX_CANDIDATES,
-        budget.max_candidates if budget is not None and budget.max_candidates is not None else MAX_CANDIDATES,
-    )
-    documented_contract_change = _has_explicit_contract_change(intent_text)
-
-    def add_candidate(
-        rule_id: str,
-        path: str,
-        line: int,
-        column: int,
-        message: str,
-        artifact: TestArtifact | None,
-        subject: TestSubject | None,
-        digest: str,
-        details: Mapping[str, Any],
-    ) -> bool:
-        nonlocal skip_reason
-        if candidate_limit <= len(candidates):
-            skip_reason = skip_reason or "max_candidates"
-            return False
-        evidence_source_kind = (
-            artifact.source_kind if artifact is not None
-            else subject.source_kind if subject is not None
-            else source_kind
-        )
-        candidate = _candidate(
-            rule_id,
-            path,
-            line,
-            column,
-            message,
-            artifact=artifact,
-            subject=subject,
-            source_kind=evidence_source_kind,
-            content_sha256=digest,
-            details=details,
-        )
-        if candidate["id"] in seen:
-            return True
-        if budget is not None:
-            try:
-                budget.claim_candidate()
-            except AnalysisBudgetExceeded as error:
-                skip_reason = skip_reason or error.reason_code
-                return False
-        seen.add(candidate["id"])
-        candidates.append(candidate)
-        evidence.extend(candidate["supporting_evidence"])
-        return len(candidates) < candidate_limit
-
     for index, path in enumerate(selected):
         if budget is not None:
             try:
@@ -1135,31 +1492,14 @@ def analyse_static(
         production = artifact is not None and artifact.role == "production source"
         if production and changed is not None and path not in changed:
             continue
-        if production and path.startswith("scripts/dissect_checks/test_integrity/"):
-            # Rule implementation strings are not evidence about repository
-            # runtime seams. Self-review covers this module separately.
-            continue
         if not is_test and not production:
             continue
         if not _changed(path, changed) and not production:
             continue
-        head_text = head_contents.get(path) if head_contents is not None else None
-        deleted_source = False
-        if head_contents is not None:
-            text = head_text
-            if text is None and path in (base_contents or {}):
-                text = (base_contents or {}).get(path)
-                deleted_source = True
-        else:
-            try:
-                text = (root / path).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                skipped += 1
-                skip_reason = skip_reason or "read_failure"
-                continue
+        text, deleted_source, read_reason = _read_static_source(root, path, base_contents, head_contents)
         if text is None:
             skipped += 1
-            skip_reason = skip_reason or "source_unavailable"
+            skip_reason = skip_reason or read_reason or "source_unavailable"
             continue
         applicable += 1
         checked += 1
@@ -1173,120 +1513,181 @@ def analyse_static(
         linked_subjects = related_subjects.get(artifact.artifact_id, ()) if artifact is not None else ()
         if not linked_subjects:
             linked_subjects = _subjects_for(path, subjects)
-        matches: list[tuple[str, int, int, str, TestSubject | None, dict[str, Any]]] = []
-        if is_test:
-            is_new = (
-                path in added
-                or (
-                    base_contents is not None
-                    and head_contents is not None
-                    and path in head_contents
-                    and path not in base_contents
-                )
-            )
-            approved, approval_source = _new_test_approval(path, config, intent_text)
-            for line, offset, message in _new_test_file_matches(
-                path,
-                artifact,
+        is_new = path in added or (
+            base_contents is not None
+            and head_contents is not None
+            and path in head_contents
+            and path not in base_contents
+        )
+        matches = (
+            _test_matches(
+                path, artifact, text, base, code_text, base_code,
+                changed=changed,
+                deleted_source=deleted_source,
                 is_new=is_new,
-                approved=approved,
-            ):
-                matches.append((
-                    "GOV-TESTS-010",
-                    line,
-                    offset,
-                    message,
-                    None,
-                    {
-                        "change_kind": "new_test_file_without_approval",
-                        "approval_required": True,
-                        "approval_source": approval_source,
-                    },
-                ))
-            if base and _changed(path, changed) and not documented_contract_change:
-                compare_head = "" if deleted_source else text
-                for line, message in _deleted_test_matches(path, base, compare_head):
-                    matches.append(("GOV-TESTS-001", line, 0, message, None, {"change_kind": "test_removed"}))
-            if not deleted_source:
-                for line, offset, message in _disabled_matches(code_text, base_code):
-                    if _has_quarantine_evidence(text, line):
-                        continue
-                    matches.append(("GOV-TESTS-001", line, offset, message, None, {"change_kind": "disabled_or_bypassed"}))
-            if base and _changed(path, changed) and not documented_contract_change:
-                for line, message in _assertion_weakening(base_code, code_text):
-                    matches.append(("GOV-TESTS-002", line, 0, message, None, {"change_kind": "assertion_weakened"}))
-                for line, message in _assertion_moved_behind_branch(base_code, code_text):
-                    matches.append(("GOV-TESTS-002", line, 0, message, None, {"change_kind": "assertion_moved_behind_branch"}))
-                for line, message in _reduced_parameter_cases(path, base, text):
-                    matches.append(("GOV-TESTS-001", line, 0, message, None, {"change_kind": "parameter_cases_reduced"}))
-                for line, message in _excluded_test_paths(base, text):
-                    matches.append(("GOV-TESTS-001", line, 0, message, None, {"change_kind": "test_path_excluded"}))
-            for line, message, subject_name in _circular_oracles(code_text):
-                subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
-                matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "circular_oracle", "called_symbol": subject_name}))
-            for line, message, subject_name in _derived_oracles(code_text):
-                subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
-                matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "implementation_derived_oracle", "called_symbol": subject_name}))
-            if python_source:
-                for line, message, subject_name in _python_circular_oracles(text):
-                    subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
-                    matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "circular_oracle", "called_symbol": subject_name}))
-                for line, message, subject_name in _python_derived_oracles(text):
-                    subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
-                    matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "implementation_derived_oracle", "called_symbol": subject_name}))
-            for line, message, subject_name in _implementation_oracle_matches(text):
-                matches.append(("GOV-TESTS-003", line, 0, message, None, {"change_kind": subject_name}))
-            if artifact is not None and artifact.role == "snapshot or golden file":
-                for line, message, subject_name in _snapshot_derived_oracle(text):
-                    matches.append(("GOV-TESTS-003", line, 0, message, None, {"change_kind": "generated_snapshot", "called_symbol": subject_name}))
-            for line, subject, message in _mock_matches(text, linked_subjects):
-                matches.append(("GOV-TESTS-004", line, 0, message, subject, {"change_kind": "focal_subject_mocked"}))
-            for line, message in _tautologies(code_text):
-                matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"}))
-            if python_source:
-                for line, message in _python_tautologies(text):
-                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"}))
-                for line, message in _python_early_return_matches(text):
-                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "early_return"}))
-                for line, message in _python_catch_all_matches(text):
-                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"}))
-            else:
-                for line, message in _non_python_no_observable_test_bodies(path, text):
-                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "no_observable_verification"}))
-            for line, message in _no_observable_test_bodies(text):
-                matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "no_observable_verification"}))
-            if artifact is not None and artifact.role in {"fixture", "test"}:
-                for line, message in _invalid_fixture_matches(path, text):
-                    matches.append(("GOV-TESTS-007", line, 0, message, None, {"change_kind": "invalid_fixture"}))
-        if production:
-            for line, message in _test_only_production(
-                text,
-                python=Path(path).suffix.lower() in {".py", ".pyi"},
-            ):
-                matches.append(("GOV-TESTS-006", line, 0, message, None, {"change_kind": "test_only_production_path"}))
+                documented_contract_change=documented_contract_change,
+                linked_subjects=linked_subjects,
+                creation_approval=creation_approval,
+                new_artifacts=new_artifacts,
+                related_subjects=related_subjects,
+            )
+            if is_test
+            else _production_matches(text, path)
+            if production
+            else []
+        )
         for rule_id, line, column, message, subject, details in matches:
             if rule_id not in enabled:
                 continue
-            if not add_candidate(rule_id, path, line, column, message, artifact, subject, digest, details):
-                return StaticAnalysisResult(
-                    "partial",
-                    applicable,
-                    checked,
-                    skipped,
-                    tuple(candidates),
-                    tuple(evidence),
-                    skip_reason or "max_candidates",
-                )
+            keep_going, candidate_reason = _append_static_candidate(
+                candidates, evidence, seen,
+                rule_id=rule_id, path=path, line=line, column=column,
+                message=message, artifact=artifact, subject=subject,
+                digest=digest, source_kind=source_kind, details=details,
+                candidate_limit=candidate_limit, budget=budget,
+            )
+            if candidate_reason is not None:
+                skip_reason = skip_reason or candidate_reason
+            if not keep_going:
+                return StaticAnalysisResult("partial", applicable, checked, skipped, tuple(candidates), tuple(evidence), skip_reason or "max_candidates")
     if not applicable:
-        status = "not_applicable"
-        reason = "no_test_or_production_artifacts"
-    elif skipped:
-        status = "partial"
-        reason = skip_reason or "read_failure"
-    else:
-        status = "complete"
-        reason = None
-    return StaticAnalysisResult(status, applicable, checked, skipped, tuple(candidates), tuple(evidence), reason)
+        return StaticAnalysisResult("not_applicable", 0, 0, 0, tuple(candidates), tuple(evidence), "no_test_or_production_artifacts")
+    if skipped:
+        return StaticAnalysisResult("partial", applicable, checked, skipped, tuple(candidates), tuple(evidence), skip_reason or "read_failure")
+    return StaticAnalysisResult("complete", applicable, checked, skipped, tuple(candidates), tuple(evidence), None)
+
+
+def _analyse_static(
+    root: Path,
+    inventory: InventoryResult,
+    *,
+    paths: Iterable[str] | None = None,
+    base_contents: Mapping[str, str] | None = None,
+    head_contents: Mapping[str, str] | None = None,
+    changed_paths: Iterable[str] | None = None,
+    source_kind: str = "working-tree",
+    budget: AnalysisBudget | None = None,
+    enabled_rules: Iterable[str] | None = None,
+    intent_text: str | None = None,
+    trusted_intent_text: str | None = None,
+    config: Mapping[str, Any] | None = None,
+    new_paths: Iterable[str] | None = None,
+    new_test_approval: Mapping[str, Any] | None = None,
+    approval_digest: str | None = None,
+    base_revision: str = "",
+    head_revision: str = "",
+) -> StaticAnalysisResult:
+    """Analyse only evidence-bearing test files and selected production seams."""
+    if base_contents is not None:
+        base_contents = {path: _source_text(value) for path, value in base_contents.items()}
+    if head_contents is not None:
+        head_contents = {path: _source_text(value) for path, value in head_contents.items()}
+    requested_values = paths or [item.logical_path for item in inventory.artifacts]
+    requested_set = _normalise_static_paths(root, requested_values)
+    requested = sorted(requested_set)
+    changed = _normalise_static_paths(root, changed_paths) if changed_paths is not None else None
+    added = _normalise_static_paths(root, new_paths or ())
+    enabled = set(enabled_rules) if enabled_rules is not None else set(DEFAULT_ENABLED_RULES)
+    artifacts = inventory.artifacts
+    artifact_by_path = {item.logical_path: item for item in artifacts}
+    selected = [
+        path for path in requested
+        if artifact_by_path.get(path) is not None
+        and artifact_by_path[path].role in {
+            "test", "test helper", "fixture", "snapshot or golden file",
+            "test configuration", "CI test command", "production source",
+        }
+    ]
+    subjects = inventory.subjects
+    related_subjects = _related_static_subjects(inventory)
+    new_artifacts = [
+        item for item in artifacts
+        if item.role in NEW_TEST_ARTIFACT_ROLES
+        and (
+            item.logical_path in added
+            or (
+                base_contents is not None
+                and head_contents is not None
+                and item.logical_path in head_contents
+                and item.logical_path not in base_contents
+            )
+        )
+    ]
+    trusted_approval_text = intent_text if trusted_intent_text is None else trusted_intent_text
+    creation_approval = _creation_approval(
+        config,
+        new_test_approval,
+        approval_digest,
+        trusted_approval_text,
+        new_artifacts,
+        related_subjects,
+        base_revision=base_revision,
+        head_revision=head_revision,
+    )
+    candidate_limit = min(
+        MAX_CANDIDATES,
+        budget.max_candidates if budget is not None and budget.max_candidates is not None else MAX_CANDIDATES,
+    )
+    return _scan_static_files(
+        root,
+        selected,
+        artifact_by_path,
+        subjects,
+        related_subjects,
+        new_artifacts=new_artifacts,
+        base_contents=base_contents,
+        head_contents=head_contents,
+        added=added,
+        changed=changed,
+        source_kind=source_kind,
+        budget=budget,
+        enabled=enabled,
+        creation_approval=creation_approval,
+        documented_contract_change=_has_explicit_contract_change(trusted_approval_text),
+        candidate_limit=candidate_limit,
+    )
+
+
+def analyse_static(
+    root: Path,
+    inventory: InventoryResult,
+    *,
+    paths: Iterable[str] | None = None,
+    base_contents: Mapping[str, str] | None = None,
+    head_contents: Mapping[str, str] | None = None,
+    changed_paths: Iterable[str] | None = None,
+    source_kind: str = "working-tree",
+    budget: AnalysisBudget | None = None,
+    enabled_rules: Iterable[str] | None = None,
+    intent_text: str | None = None,
+    trusted_intent_text: str | None = None,
+    config: Mapping[str, Any] | None = None,
+    new_paths: Iterable[str] | None = None,
+    new_test_approval: Mapping[str, Any] | None = None,
+    approval_digest: str | None = None,
+    base_revision: str = "",
+    head_revision: str = "",
+) -> StaticAnalysisResult:
+    """Prepare the inventory and delegate file scanning to its own pass."""
+    return _analyse_static(
+        root,
+        inventory,
+        paths=paths,
+        base_contents=base_contents,
+        head_contents=head_contents,
+        changed_paths=changed_paths,
+        source_kind=source_kind,
+        budget=budget,
+        enabled_rules=enabled_rules,
+        intent_text=intent_text,
+        trusted_intent_text=trusted_intent_text,
+        config=config,
+        new_paths=new_paths,
+        new_test_approval=new_test_approval,
+        approval_digest=approval_digest,
+        base_revision=base_revision,
+        head_revision=head_revision,
+    )
 
 
 static_analysis = analyse_static

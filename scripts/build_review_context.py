@@ -151,15 +151,30 @@ def source_paths(root: Path, entries: list[DiffEntry], mode: str) -> list[str]:
         and entry.reviewed_path
         and (normalised := _safe_relative_path(entry.reviewed_path)) is not None
         and not is_ignored_path(root, normalised)
+        and not _is_malformed_fixture_path(normalised)
     })
+
+
+def _is_malformed_fixture_path(path: str) -> bool:
+    """Keep intentionally malformed acceptance inputs in their acceptance job."""
+    name = Path(path).stem.lower()
+    return "fixture" in path.lower() and "malformed" in name
 
 
 def intent(root: Path, intent_file: Path | None = None) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
+    trusted: list[str] = []
     if intent_file and intent_file.exists():
         value = read(intent_file)
         if value:
-            sources.append({"path": str(intent_file), "kind": "benchmark/task intent", "content": value})
+            try:
+                intent_file.resolve().relative_to(root.resolve())
+            except (OSError, ValueError):
+                kind = "external trusted intent"
+                trusted.append(value)
+            else:
+                kind = "repository-local intent"
+            sources.append({"path": str(intent_file), "kind": kind, "content": value})
     for path in iter_files(root):
         if path.name not in INTENT_NAMES:
             continue
@@ -169,10 +184,13 @@ def intent(root: Path, intent_file: Path | None = None) -> dict[str, Any]:
     environment = os.environ.get("AI_REVIEW_INTENT", "").strip()
     if environment:
         sources.insert(0, {"kind": "caller-provided intent", "content": environment})
+        trusted.insert(0, environment)
     summary = redact_sensitive_text("\n\n".join(item["content"] for item in sources))
     return {
         "sources": [{key: value for key, value in item.items() if key != "content"} for item in sources],
-        "summary": summary[:24000], "constraints": [], "negative_requirements": [],
+        "summary": summary[:24000],
+        "approval_text": redact_sensitive_text("\n\n".join(trusted))[:24000],
+        "constraints": [], "negative_requirements": [],
         "ambiguities": [] if sources else ["Authoritative user/PR/task intent was not available in the review context."],
     }
 
@@ -1549,10 +1567,26 @@ def optional_analyser_evidence(
         return _optional_analyser_evidence_impl(root, mode, source_scope, entries, base, config, snapshot)
 
 
-def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file: Path | None = None, requested_frameworks: tuple[str, ...] = ()) -> dict[str, Any]:
+def build(
+    root: Path,
+    mode: str,
+    base: str,
+    file_list: Path | None,
+    intent_file: Path | None = None,
+    requested_frameworks: tuple[str, ...] = (),
+    complexity_max_candidates: int | None = None,
+) -> dict[str, Any]:
     root = root.resolve()
     config = local_config(root)
     analysis_limits(config)
+    if complexity_max_candidates is not None:
+        if complexity_max_candidates < 1:
+            raise ValueError("complexity_max_candidates must be positive")
+        options = dict(config.get("review_options", {})) if isinstance(config.get("review_options"), dict) else {}
+        limits = dict(options.get("analysis_limits", {})) if isinstance(options.get("analysis_limits"), dict) else {}
+        limits["complexity_max_candidates"] = complexity_max_candidates
+        options["analysis_limits"] = limits
+        config = {**config, "review_options": options}
     review_intent = intent(root, intent_file)
     entries = changed_entries(root, mode, file_list, base)
     primary_paths = source_paths(root, entries, mode)
@@ -1569,14 +1603,16 @@ def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file:
         head_revision = git(root, "rev-parse", "HEAD") or "HEAD"
         source_base_revision = base if mode == "diff" else ""
     test_integrity_paths = sorted({
-        *semantic_context_paths,
+        *(path for path in semantic_context_paths if not _is_malformed_fixture_path(path)),
         *(
             entry.reviewed_path
             for entry in entries
             if _safe_relative_path(entry.reviewed_path) is not None
+            and not _is_malformed_fixture_path(entry.reviewed_path)
         ),
         *(
             path for path in all_text_paths(root)
+            if not _is_malformed_fixture_path(path)
             if Path(path).name in {
                 "package.json", "pyproject.toml", "go.mod", "Cargo.toml",
                 "pom.xml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
@@ -1611,6 +1647,7 @@ def build(root: Path, mode: str, base: str, file_list: Path | None, intent_file:
         head_revision=head_revision,
         changed_ranges=changed_ranges,
         intent_text=review_intent.get("summary", ""),
+        trusted_intent_text=review_intent.get("approval_text", ""),
     )
     complexity = complexity_orchestrator.analyse(
         root,
@@ -1745,6 +1782,8 @@ def _worker_arguments(args: argparse.Namespace, output: Path) -> list[str]:
         values.extend(["--worker-delay", str(worker_delay)])
     for framework in args.framework:
         values.extend(["--framework", framework])
+    if args.complexity_max_candidates is not None:
+        values.extend(["--complexity-max-candidates", str(args.complexity_max_candidates)])
     return values
 
 
@@ -1846,6 +1885,7 @@ def main() -> int:
     parser.add_argument("--file-list", type=Path)
     parser.add_argument("--intent-file", type=Path)
     parser.add_argument("--framework", action="append", default=[])
+    parser.add_argument("--complexity-max-candidates", type=int)
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
@@ -1865,7 +1905,10 @@ def main() -> int:
         try:
             if args.worker_delay:
                 time.sleep(args.worker_delay)
-            payload = build(args.root.resolve(), args.mode, args.base, args.file_list, args.intent_file, tuple(args.framework))
+            payload = build(
+                args.root.resolve(), args.mode, args.base, args.file_list,
+                args.intent_file, tuple(args.framework), args.complexity_max_candidates,
+            )
             validation_errors = validate_context(payload)
             if validation_errors:
                 raise ValueError(f"invalid review context: {validation_errors[0]}")
