@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded, analysis_limits  # noqa: E402
 from build_review_context import _diff_optional_targets, _terminate_process_group, main  # noqa: E402
 from dissect_checks import comment_slop  # noqa: E402
-from dissect_checks.anti_slop import orchestrator  # noqa: E402
+from dissect_checks.anti_slop import orchestrator, oxlint_backend  # noqa: E402
 from dissect_checks.anti_slop.chunking import CommandChunkError, iter_command_chunks  # noqa: E402
 from dissect_checks.anti_slop.ast_grep_backend import _matches_to_diagnostics  # noqa: E402
 from dissect_checks.anti_slop.model import AnalysisTarget, BackendDiagnostic, BackendResult, canonical_diagnostic_identity  # noqa: E402
@@ -156,6 +156,93 @@ class AnalysisContractTests(unittest.TestCase):
             self.assertEqual(result.reason_code, "parse_error")
             self.assertEqual(result.checked_files, 2)
             self.assertEqual(result.skipped_files, 1)
+
+    def test_oxlint_parser_errors_survive_rule_filtering(self) -> None:
+        stdout = '{"diagnostics":[{"message":"Unexpected token","severity":"error","filename":"broken.ts","labels":[{"span":{"line":1,"column":7}}]}]}'
+        diagnostics, parser_errors = oxlint_backend.parse_diagnostics_with_errors(stdout)
+        self.assertEqual(diagnostics, [])
+        self.assertEqual(parser_errors[0]["filename"], "broken.ts")
+
+    def test_python_binding_scope_does_not_reuse_class_or_nested_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "bindings.py"
+            source.write_text(
+                "from typing import Any, cast\n"
+                "\n"
+                "def valid(value):\n"
+                "    return cast(str, cast(Any, value))\n"
+                "\n"
+                "def rebound(value):\n"
+                "    cast = other\n"
+                "    return cast(str, cast(Any, value))\n"
+                "\n"
+                "class Proxy:\n"
+                "    def __getattr__(self, name):\n"
+                "        return name\n"
+                "    def read(self, other):\n"
+                "        def inner(self):\n"
+                "            return getattr(self, 'nested')\n"
+                "        return getattr(other, 'owner'), getattr(self, 'name'), inner(other)\n"
+            )
+            result = analyse_python(
+                root,
+                [AnalysisTarget("bindings.py", source, "python")],
+                AnalysisBudget(5),
+                enable_getattr=True,
+            )
+            self.assertEqual(
+                [(item.rule_id, item.line) for item in result.diagnostics],
+                [
+                    ("anti-slop-python/no-widen-then-cast", 4),
+                    ("anti-slop-python/no-literal-getattr-without-default", 15),
+                    ("anti-slop-python/no-literal-getattr-without-default", 16),
+                ],
+            )
+
+    def test_python_late_local_rebinding_blocks_earlier_module_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "late_bindings.py"
+            source.write_text(
+                "from typing import Any, cast\n"
+                "\n"
+                "def late_cast(value):\n"
+                "    result = cast(str, cast(Any, value))\n"
+                "    cast = replacement\n"
+                "    return result\n"
+                "\n"
+                "def late_getattr(value):\n"
+                "    result = getattr(value, 'name')\n"
+                "    getattr = replacement\n"
+                "    return result\n"
+            )
+            result = analyse_python(
+                root,
+                [AnalysisTarget("late_bindings.py", source, "python")],
+                AnalysisBudget(5),
+                enable_getattr=True,
+            )
+            self.assertEqual(result.diagnostics, [])
+
+    def test_python_module_rebinding_below_function_blocks_global_rule_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "module_rebinding.py"
+            source.write_text(
+                "from typing import Any, cast\n"
+                "\n"
+                "def load(value):\n"
+                "    return cast(str, cast(Any, value))\n"
+                "\n"
+                "cast = replacement\n"
+            )
+            result = analyse_python(
+                root,
+                [AnalysisTarget("module_rebinding.py", source, "python")],
+                AnalysisBudget(5),
+            )
+            self.assertEqual(result.diagnostics, [])
 
     def test_anti_slop_limits_are_shared_across_backend_packs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

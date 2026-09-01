@@ -33,7 +33,7 @@ cannot establish semantic intent.
 | Rule ID | Language | Backend | Level | Confidence | Default | Contract boundary |
 | --- | --- | --- | --- | --- | --- | --- |
 | `anti-slop-python/no-widen-then-cast` | Python | `python-ast` | structural | high | yes | Same-expression `cast(Target, cast(Any/object, value))`; it does not assess justified API or protocol boundaries. |
-| `anti-slop-python/no-literal-getattr-without-default` | Python | `python-ast` | structural | medium | yes | Literal non-dunder lookup without a default; it does not prove that direct access is safe or required. |
+| `anti-slop-python/no-literal-getattr-without-default` | Python | `python-ast` | structural | medium | no | Experimental until binding-aware framework calibration reaches the precision gate; it does not prove that direct access is safe or required. |
 | `anti-slop/no-chained-type-assertions` | JavaScript/TypeScript | `oxlint-js-ts` | structural | medium | yes | Chained assertions may hide an unsafe narrowing; it does not prove the asserted type is wrong. |
 | `anti-slop/no-conditional-empty-object-spread` | JavaScript/TypeScript | `oxlint-js-ts` | structural | medium | yes | Conditional empty object spreads may obscure control flow; it does not prove a runtime defect. |
 | `anti-slop/no-known-value-widening` | JavaScript/TypeScript | `oxlint-js-ts` | structural | medium | yes | Known values widened to a less precise type may lose useful guarantees; it does not ban justified boundaries. |

@@ -169,8 +169,15 @@ reported as semantic findings.
   and content-hash identity for every artifact and subject.
 - Check disabled or bypassed tests, weakened assertions, circular or symmetric
   oracles, focal-subject mocking, tautologies, catch-all assertions, test-only
-  production markers, and missing test oracles. Structural matches are
-  candidates until the affected contract is verified.
+  production markers, unapproved new test files or test-only helpers/fixtures,
+  and missing test oracles. Structural matches are candidates until the
+  affected contract is verified.
+- Treat new unit, integration, end-to-end, and spec files as opt-in. Require an
+  explicit creation request or approval, or a matching
+  `review_options.test_integrity_approved_new_paths` entry. Prefer existing
+  tests and direct browser/runtime checks. Test changes should exercise
+  observable behaviour, not source strings, implementation shapes, or the
+  existence of tests.
 - Require explicit base-code/base-tests, base-code/head-tests,
   head-code/base-tests, and head-code/head-tests evidence when runtime tests are
   applicable. Bind approved execution to exact repository, patch, selector,

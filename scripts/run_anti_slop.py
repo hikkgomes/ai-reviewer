@@ -32,9 +32,15 @@ def _entries_paths(entries: Iterable[DiffEntry]) -> list[str]:
 def _load_config(root: Path) -> dict:
     try:
         value = json.loads((root / ".ai-review" / "local.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
-    return value if isinstance(value, dict) else {}
+    except OSError as error:
+        raise ValueError(f"could not read review configuration: {error}") from error
+    except ValueError as error:
+        raise ValueError(f"review configuration is not valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("review configuration must be a JSON object")
+    return value
 
 
 def _validated_paths(root: Path, paths: Iterable[str | Path]) -> tuple[str, ...]:
@@ -52,6 +58,14 @@ def _validated_paths(root: Path, paths: Iterable[str | Path]) -> tuple[str, ...]
             if not candidate.parts or ".." in candidate.parts:
                 raise ValueError(f"path escapes target root: {value}")
             relative = candidate.as_posix()
+            try:
+                cwd_path = (Path.cwd() / candidate).resolve()
+                relative = cwd_path.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                try:
+                    (root / candidate).resolve().relative_to(root)
+                except (OSError, ValueError) as error:
+                    raise ValueError(f"path escapes target root: {value}") from error
         output.append(relative)
     return tuple(output)
 

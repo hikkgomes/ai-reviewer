@@ -8,15 +8,17 @@ import subprocess
 from typing import Any, Iterable, Sequence
 
 from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded
-from dissect_checks.redaction import redact_sensitive_text
+from dissect_checks.redaction import redact_payload, redact_sensitive_text
 from .model import AnalysisTarget, BackendDiagnostic, BackendResult, LoadedAnalysisTarget, load_target
 from .chunking import CommandChunkError, iter_command_chunks
 from .rules import owner_for
+from ..source_validation import balanced_delimiter_error
 
 
 VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor" / "anti-slop"
 CONFIG_PATH = VENDOR_DIR / "ast-grep" / "sgconfig.yml"
 MAX_FILE_BYTES = 10 * 1024 * 1024
+AST_GREP_VERSION = "0.45.2"
 
 BACKENDS = {
     "ast-grep-go": ("go", "Go", "anti-slop-go"),
@@ -28,72 +30,28 @@ BACKENDS = {
 }
 
 
+def _delimiter_error(source: bytes) -> str | None:
+    """Keep the private helper available for callers using the Go default."""
+    return balanced_delimiter_error("source.go", source)
+
+
 def binary_path(vendor_dir: Path = VENDOR_DIR) -> Path:
     binary = vendor_dir / "node_modules" / ".bin" / "ast-grep"
     return binary.with_suffix(".cmd") if os.name == "nt" and not binary.exists() else binary
 
 
 def preflight(vendor_dir: Path = VENDOR_DIR) -> str | None:
-    if not binary_path(vendor_dir).is_file():
+    binary = binary_path(vendor_dir)
+    if not binary.is_file():
         return "deps_missing"
     if not (vendor_dir / "ast-grep" / "sgconfig.yml").is_file():
         return "rules_missing"
-    return None
-
-
-def _delimiter_error(source: bytes) -> str | None:
-    """Catch bounded, target-local syntax truncation before AST matching."""
-    text = source.decode("utf-8", errors="replace")
-    pairs = {"(": ")", "[": "]", "{": "}"}
-    closing = set(pairs.values())
-    stack: list[str] = []
-    quote = ""
-    escaped = False
-    line_comment = False
-    block_comment = False
-    index = 0
-    while index < len(text):
-        char = text[index]
-        next_char = text[index + 1] if index + 1 < len(text) else ""
-        if line_comment:
-            if char == "\n":
-                line_comment = False
-            index += 1
-            continue
-        if block_comment:
-            if char == "*" and next_char == "/":
-                block_comment = False
-                index += 2
-            else:
-                index += 1
-            continue
-        if quote:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = ""
-            index += 1
-            continue
-        if char == "/" and next_char == "/":
-            line_comment = True
-            index += 2
-            continue
-        if char == "/" and next_char == "*":
-            block_comment = True
-            index += 2
-            continue
-        if char in {'"', "'", "`"}:
-            quote = char
-        elif char in pairs:
-            stack.append(pairs[char])
-        elif char in closing:
-            if not stack or stack.pop() != char:
-                return "unbalanced_delimiters"
-        index += 1
-    if quote or block_comment or stack:
-        return "unbalanced_delimiters"
+    try:
+        tool = subprocess.run([str(binary), "--version"], capture_output=True, text=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return "tool_version_unavailable"
+    if tool.returncode != 0 or AST_GREP_VERSION not in f"{tool.stdout}\n{tool.stderr}":
+        return "tool_version_unsupported"
     return None
 
 
@@ -119,6 +77,56 @@ def _parse_output(stdout: str) -> list[dict[str, Any]]:
         return _raw_matches(json.loads(stdout))
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError("invalid ast-grep JSON output") from error
+
+
+def _parse_error_check(
+    binary: Path,
+    language_name: str,
+    files: Sequence[str],
+    *,
+    timeout: float,
+) -> tuple[str | None, str]:
+    """Ask tree-sitter for ERROR nodes before accepting rule results.
+
+    ast-grep recovers from many syntax errors and still returns a valid JSON
+    match array.  A delimiter check alone therefore cannot establish parse
+    completion.  The ERROR-node query is language-neutral and bounded by the
+    same command deadline as the rule scan.
+    """
+    if not files:
+        return None, ""
+    argv = [
+        str(binary), "run", "--lang", language_name, "--kind", "ERROR",
+        "--json=compact", "--color", "never",
+        "--no-ignore", "hidden", "--no-ignore", "dot", "--no-ignore", "exclude",
+        "--no-ignore", "global", "--no-ignore", "parent", "--no-ignore", "vcs",
+        *files,
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        return "total_timeout", str(error)
+    except OSError as error:
+        return "runner_error", str(error)
+    if completed.returncode not in {0, 1}:
+        return "process_failure", redact_sensitive_text((completed.stderr or "")[:500])
+    try:
+        errors = _parse_output(completed.stdout or "")
+    except ValueError as error:
+        return "invalid_json", str(error)
+    if errors:
+        paths = sorted({str(item.get("file", "")) for item in errors if item.get("file")})
+        detail = "ast-grep found parser ERROR nodes"
+        if paths:
+            detail += f": {', '.join(paths[:3])}"
+        return "parse_error", detail[:500]
+    return None, ""
 
 
 def _rule_id(value: dict[str, Any]) -> str:
@@ -198,13 +206,13 @@ def _matches_to_diagnostics(matches: Iterable[dict[str, Any]], root: Path, targe
             logical,
             line,
             column,
-            _message(match),
+            redact_sensitive_text(_message(match)),
             {
                 "source_layer": target.source_kind,
                 "content_sha256": target.content_sha256,
                 "analysis_level": "structural",
                 "discriminator": f"{rule}:{line}:{column}",
-                "metadata": match.get("meta", match.get("metadata", {})),
+                "metadata": redact_payload(match.get("meta", match.get("metadata", {}))),
             },
         ))
     return sorted(output, key=lambda item: (item.path, item.line, item.column, item.rule_id, item.message))
@@ -230,6 +238,14 @@ def _run_language(
             remaining = budget.remaining_seconds()
             if remaining <= 0:
                 return diagnostics, checked, "total_timeout", "ast-grep deadline exceeded"
+            parse_reason, parse_detail = _parse_error_check(
+                binary_path(vendor_dir),
+                language_name,
+                chunk,
+                timeout=remaining,
+            )
+            if parse_reason is not None:
+                return diagnostics, checked, parse_reason, parse_detail
             argv = [
                 str(binary_path(vendor_dir)), "scan", "--config", str(vendor_dir / "ast-grep" / "sgconfig.yml"),
                 "--filter", prefix, "--json=compact", "--include-metadata", "--color", "never",
@@ -270,13 +286,13 @@ def _prepare_targets(
     first_detail = ""
     parse_states: dict[str, str] = {}
     parse_errors: list[dict[str, Any]] = []
-    for target in applicable:
+    for index, target in enumerate(applicable):
         try:
             loaded = target if isinstance(target, LoadedAnalysisTarget) else load_target(
                 root, target, budget, max_file_bytes=max_file_bytes,
             )
             target = loaded.target
-            syntax_error = _delimiter_error(loaded.data)
+            syntax_error = balanced_delimiter_error(target.logical_path, loaded.data)
             key = target.target_id
             if syntax_error is not None:
                 skipped += 1
@@ -294,6 +310,9 @@ def _prepare_targets(
             parse_states[target.target_id] = "failed"
             parse_errors.append({"path": target.logical_path, "reason_code": error.reason_code})
             if error.reason_code in {"total_timeout", "max_files", "max_total_bytes"}:
+                for remaining in applicable[index + 1:]:
+                    parse_states[remaining.target_id] = "not_verified"
+                skipped += len(applicable) - index - 1
                 break
         except (OSError, ValueError, TypeError) as error:
             skipped += 1
@@ -323,7 +342,21 @@ def analyse(
     applicable = tuple(sorted((target for target in targets if target.language_id == language_id), key=lambda item: item.logical_path))
     reason = preflight(vendor_dir)
     if reason is not None:
-        return BackendResult(backend_id, "structural", (language_id,), "unavailable", len(applicable), 0, len(applicable), [], reason, "Skill-local ast-grep runtime is unavailable.")
+        return BackendResult(
+            backend_id, "structural", (language_id,), "unavailable", len(applicable), 0,
+            len(applicable), [], reason, "Skill-local ast-grep runtime is unavailable.",
+            {
+                (target.target if isinstance(target, LoadedAnalysisTarget) else target).target_id: "not_verified"
+                for target in applicable
+            },
+            [
+                {
+                    "path": (target.target if isinstance(target, LoadedAnalysisTarget) else target).logical_path,
+                    "reason_code": reason,
+                }
+                for target in applicable[:3]
+            ],
+        )
     runnable, skipped, first_skip_reason, first_skip_detail, parse_states, parse_errors = _prepare_targets(
         root, applicable, budget, max_file_bytes,
     )
@@ -341,7 +374,7 @@ def analyse(
         for target in runnable[:checked]:
             parse_states[target.target_id] = "complete"
         for target in runnable[checked:]:
-            parse_states[target.target_id] = "not_verified"
+            parse_states[target.target_id] = "failed" if reason_code == "parse_error" else "not_verified"
         parse_errors.append({"reason_code": reason_code, "detail": reason_text[:240]})
         return BackendResult(backend_id, "structural", (language_id,), "partial" if checked else "unavailable", len(applicable), checked, len(applicable) - checked, diagnostics, reason_code, reason_text, parse_states, parse_errors)
     for target in runnable:

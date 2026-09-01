@@ -102,6 +102,10 @@ Check for:
 - Tests fail for the bug they claim to prevent.
 - Fixtures represent realistic data and do not encode hallucinated schemas.
 - Mocks do not remove the behaviour under review.
+- New unit, integration, end-to-end, and spec files, plus test-only helpers or
+  fixtures, have explicit creation approval. Prefer existing tests and direct
+  browser/runtime checks. Test changes exercise observable behaviour rather
+  than source strings, implementation shapes, or test existence.
 
 For changed or challenged tests, also inspect the test artefact and subject
 mapping, independent oracle source, reachability, base/head distinction,
@@ -114,6 +118,20 @@ Review function complexity separately. Use the repository policy before the
 skill-local Lizard fallback. Complexity candidates need a concrete review risk,
 such as mixed responsibilities or unclear failure paths; a high number alone is
 not a correctness finding.
+
+Test-integrity static matches are candidates only. Test usefulness is separate
+evidence, not a score. Use test-artifact and subject mappings, an independent
+oracle, base/head scenarios, targeted changed-code mutation, repeated-run
+stability, and unique boundary coverage before recommending any test action.
+Compiler-valid acceptance fixtures are stronger evidence than parser pattern
+fixtures. A test which lacks execution or contract evidence is `Not verified`.
+
+Dynamic test evidence, mutation runs, and proof tests execute repository code.
+Run them only from an exact approved execution plan in a private tree with a
+bounded process group, isolated home and temp directories, and redacted output.
+A proposed proof test must stay outside the reviewed checkout, name its oracle
+source, reach the focal subject, and compare the current source with an
+independent base, known-good implementation, or targeted mutant.
 
 Error-path tests deserve deliberate attention; passing happy-path tests is not
 evidence that rollback, cancellation, or failure contracts hold.

@@ -28,6 +28,13 @@ def _sha256(value: Any, *, allow_empty: bool = False) -> bool:
     return allow_empty and value == "" or isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
+def _safe_relative_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    path = Path(value.replace("\\", "/"))
+    return not path.is_absolute() and bool(path.parts) and ".." not in path.parts
+
+
 def _forbidden_output(value: Any, path: str = "") -> list[str]:
     errors: list[str] = []
     if isinstance(value, dict):
@@ -38,6 +45,27 @@ def _forbidden_output(value: Any, path: str = "") -> list[str]:
                 errors.append(f"unbounded command or patch output is not allowed: {current}")
             errors.extend(_forbidden_output(child, current))
     elif isinstance(value, list):
+        if path.lower() == "environment" or path.lower().endswith(".environment"):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).lower()
+                value_text = item.get("value")
+                if any(token in name for token in ("token", "secret", "password", "private_key", "api_key", "access_key")) and not (
+                    isinstance(value_text, str) and value_text.startswith("[REDACTED")
+                ):
+                    errors.append(f"raw secret-bearing environment value is not allowed: {path}")
+        if path.lower() == "bindings" or path.lower().endswith(".bindings"):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).lower()
+                value_text = item.get("value")
+                if (
+                    any(token in name for token in ("token", "secret", "password", "private_key", "api_key", "access_key"))
+                    and not (isinstance(value_text, str) and value_text.startswith("[REDACTED"))
+                ):
+                    errors.append(f"raw secret-bearing execution binding is not allowed: {path}")
         for index, child in enumerate(value):
             errors.extend(_forbidden_output(child, f"{path}[{index}]"))
     return errors
@@ -56,6 +84,9 @@ def validate(data: Any) -> list[str]:
     if not isinstance(coverage, dict):
         errors.append("coverage must be an object")
     else:
+        for required_family in ("test-integrity", "complexity"):
+            if required_family not in coverage:
+                errors.append(f"coverage is missing {required_family}")
         for name, record in coverage.items():
             if not isinstance(record, dict):
                 errors.append(f"coverage {name} must be an object")
@@ -89,11 +120,24 @@ def validate(data: Any) -> list[str]:
                         errors.append(f"backend {backend_id} checked_files exceeds applicable_files")
                     if counts["checked_files"] + counts["skipped_files"] > counts["applicable_files"]:
                         errors.append(f"backend {backend_id} checked_files exceeds applicable_files when combined with skipped_files")
+                    if backend.get("status") == "complete" and (
+                            counts["checked_files"] != counts["applicable_files"]
+                            or counts["skipped_files"] != 0
+                    ):
+                        errors.append(f"backend {backend_id} complete status has incomplete file counts")
+                    if backend.get("status") == "not_applicable" and any(counts.values()):
+                        errors.append(f"backend {backend_id} not_applicable status has applicable files")
                 if not isinstance(backend.get("reason"), str) or not backend["reason"]:
                     errors.append(f"backend {backend_id} must have a reason")
                 status = backend.get("status")
                 if status is not None and status not in BACKEND_STATUSES and status not in INTERNAL_STATES:
                     errors.append(f"backend {backend_id} has an invalid internal status")
+                if status == "complete" and backend.get("state") != "Checked":
+                    errors.append(f"backend {backend_id} complete status must use Checked")
+                if status == "not_applicable" and backend.get("state") != "Not applicable":
+                    errors.append(f"backend {backend_id} not_applicable status must use Not applicable")
+                if status in {"partial", "planned", "unavailable", "failed"} and backend.get("state") != "Not verified":
+                    errors.append(f"backend {backend_id} incomplete status must use Not verified")
 
     candidates = data.get("candidates")
     candidate_ids: set[str] = set()
@@ -133,6 +177,9 @@ def validate(data: Any) -> list[str]:
     else:
         if complexity.get("status") not in COMPLEXITY_STATUSES:
             errors.append("complexity has an invalid internal status")
+        expected_state = "Checked" if complexity.get("status") == "complete" else "Not applicable" if complexity.get("status") == "not_applicable" else "Not verified"
+        if complexity.get("state") not in {None, expected_state}:
+            errors.append("complexity state does not match its internal status")
         counts = {key: complexity.get(key, 0) for key in ("applicable_files", "checked_files", "skipped_files")}
         for key, value in counts.items():
             if not _non_negative_integer(value):
@@ -142,10 +189,32 @@ def validate(data: Any) -> list[str]:
                 errors.append("complexity checked_files exceeds applicable_files")
             if counts["checked_files"] + counts["skipped_files"] > counts["applicable_files"]:
                 errors.append("complexity checked_files plus skipped_files exceeds applicable_files")
-        for function in complexity.get("functions", []):
+            if complexity.get("status") == "complete" and (
+                counts["checked_files"] != counts["applicable_files"]
+                or counts["skipped_files"] != 0
+            ):
+                errors.append("complexity complete status has incomplete file counts")
+            if complexity.get("status") == "not_applicable" and any(counts.values()):
+                errors.append("complexity not_applicable status has applicable files")
+        functions = complexity.get("functions", [])
+        candidates = complexity.get("candidates", [])
+        parse_states = complexity.get("parse_states", {})
+        if not isinstance(parse_states, dict) or any(
+            not _safe_relative_path(path)
+            or state not in {"complete", "failed", "not_verified", "not_run"}
+            for path, state in parse_states.items()
+        ):
+            errors.append("complexity parse_states must contain recognised states")
+        if not isinstance(complexity.get("parse_errors", []), list):
+            errors.append("complexity parse_errors must be an array")
+        if complexity.get("status") == "not_applicable" and (functions or candidates):
+            errors.append("complexity not_applicable status cannot contain functions or candidates")
+        for function in functions if isinstance(functions, list) else []:
             if not isinstance(function, dict):
                 errors.append("complexity function must be an object")
                 continue
+            if not _safe_relative_path(function.get("logical_path")):
+                errors.append("complexity function path must be repository-relative")
             if not _sha256(function.get("content_sha256")):
                 errors.append("complexity function has an invalid content hash")
             if not _non_negative_integer(function.get("start_line")) or function.get("start_line", 0) < 1:
@@ -155,12 +224,38 @@ def validate(data: Any) -> list[str]:
             threshold = function.get("threshold")
             if threshold is not None and (not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1):
                 errors.append("complexity function has an invalid threshold")
-            if threshold is not None and not isinstance(function.get("threshold_source"), str):
+            if threshold is not None and (
+                not isinstance(function.get("threshold_source"), str)
+                or not function.get("threshold_source")
+            ):
                 errors.append("complexity function has an invalid threshold source")
-        for candidate in complexity.get("candidates", []):
+            for key in ("cyclomatic", "nloc", "token_count", "parameter_count"):
+                value = function.get(key)
+                if not _non_negative_integer(value) or (key == "cyclomatic" and value < 1):
+                    errors.append(f"complexity function has an invalid {key}")
+        for candidate in candidates if isinstance(candidates, list) else []:
             if isinstance(candidate, dict):
+                if not isinstance(candidate.get("candidate_id"), str) or not candidate.get("candidate_id"):
+                    errors.append("complexity candidate requires a candidate_id")
+                if not isinstance(candidate.get("reason_code"), str) or not candidate.get("reason_code"):
+                    errors.append("complexity candidate requires a reason_code")
+                candidate_threshold = candidate.get("threshold")
+                if not _non_negative_integer(candidate_threshold) or candidate_threshold < 1:
+                    errors.append("complexity candidate has an invalid threshold")
+                if not isinstance(candidate.get("threshold_source"), str) or not candidate.get("threshold_source"):
+                    errors.append("complexity candidate has an invalid threshold source")
+                for key in ("head_complexity", "base_complexity", "delta"):
+                    value = candidate.get(key)
+                    if key == "base_complexity" and value is None:
+                        continue
+                    if key == "delta" and value is None:
+                        continue
+                    if not isinstance(value, int) or isinstance(value, bool):
+                        errors.append(f"complexity candidate has an invalid {key}")
                 function = candidate.get("function", {})
-                if isinstance(function, dict) and function.get("content_sha256") and not _sha256(function.get("content_sha256")):
+                if not isinstance(function, dict):
+                    errors.append("complexity candidate requires a function object")
+                elif function.get("content_sha256") and not _sha256(function.get("content_sha256")):
                     errors.append("complexity candidate has an invalid content hash")
     errors.extend(_forbidden_output(data))
     return errors

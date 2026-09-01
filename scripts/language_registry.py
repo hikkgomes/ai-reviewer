@@ -127,7 +127,7 @@ def paths_for_anti_slop(paths: Iterable[str | Path]) -> dict[str, tuple[str, ...
 def ambiguous_header_paths(paths: Iterable[str | Path]) -> tuple[str, ...]:
     values = [Path(path) for path in paths]
     header_language = _header_language(values)
-    return tuple(sorted(path.as_posix() for path in values if _suffix(path) == ".h" and header_language is None))
+    return tuple(sorted({path.as_posix() for path in values if _suffix(path) == ".h" and header_language is None}))
 
 
 def comment_style_for_path(path: str | Path) -> str | None:

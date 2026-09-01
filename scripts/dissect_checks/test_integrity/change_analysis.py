@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from diff_file_list import DiffEntry
 from file_paths import is_generated_path, is_ignored_path
 from .model import TestArtifact, TestChange, TestSubject, sha256_bytes
+from .inventory import _reference_source
 
 
 PARTITIONS = (
@@ -20,6 +21,10 @@ PARTITIONS = (
     "shared configuration patch",
     "documentation or generated patch",
 )
+TEST_ARTIFACT_ROLES = frozenset({
+    "test", "test helper", "fixture", "snapshot or golden file",
+    "test configuration", "CI test command",
+})
 
 
 @dataclass(frozen=True)
@@ -78,7 +83,8 @@ def _artifact_role(path: str, inventory: Any) -> str:
         if artifact.logical_path == path:
             return artifact.role
     lower = path.lower()
-    if any(token in lower for token in ("/test/", "/tests/", ".test.", ".spec.", "_test.")):
+    wrapped = f"/{lower.strip('/')}/"
+    if any(token in wrapped or token in lower for token in ("/test/", "/tests/", "/unit/", "/integration/", "/e2e/", "/end-to-end/", ".test.", ".spec.", ".unit.", ".integration.", ".e2e.", "_test.")):
         return "test"
     if any(token in lower for token in ("fixture", "snapshot", "golden")):
         return "fixture"
@@ -102,11 +108,55 @@ def partition_diff(
     root = root.resolve()
     groups: dict[str, list[str]] = {key: [] for key in PARTITIONS}
     uncertain: list[str] = []
-    for raw in sorted({_normalise(path) for path in paths}):
+    normalised_paths: set[str] = set()
+    for value in paths:
+        candidate = Path(value)
+        if candidate.is_absolute():
+            try:
+                raw = candidate.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+        else:
+            raw = _normalise(candidate)
+        normalised_paths.add(raw)
+    def has_both_mutable_layers(path: str) -> bool:
+        path_entries = [entry for entry in entries if entry.reviewed_path == path]
+        layers = {entry.source_kind for entry in path_entries}
+        if not {"index", "working-tree"} <= layers:
+            return False
+        # ``changed_entries`` includes a working-tree convenience record for
+        # staged-only changes.  Only mark a partition ambiguous when Git
+        # confirms that both the index and worktree contain distinct pending
+        # edits.  Synthetic entries without a Git repository remain
+        # conservative and are treated as ambiguous.
+        try:
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--", path],
+                cwd=root,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            unstaged = subprocess.run(
+                ["git", "diff", "--quiet", "--", path],
+                cwd=root,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True
+        if staged.returncode not in {0, 1} or unstaged.returncode not in {0, 1}:
+            return True
+        return staged.returncode == 1 and unstaged.returncode == 1
+
+    for raw in sorted(normalised_paths):
         if not raw or Path(raw).is_absolute() or ".." in Path(raw).parts:
             continue
         if is_ignored_path(root, raw):
             continue
+        if has_both_mutable_layers(raw):
+            uncertain.append(raw)
         role = _artifact_role(raw, inventory)
         physical = root / raw
         if is_generated_path(root, physical, dict(config or {})):
@@ -137,14 +187,30 @@ def partition_diff(
     )
 
 
-def _git_blob(root: Path, revision: str, path: str, *, max_bytes: int) -> bytes | None:
-    if not revision:
+def _git_blob(
+    root: Path,
+    revision: str,
+    path: str,
+    *,
+    max_bytes: int,
+    index_stage: int | None = None,
+) -> bytes | None:
+    if not revision or revision.startswith("-") or max_bytes <= 0:
+        return None
+    path_object = Path(path)
+    if path_object.is_absolute() or not path_object.parts or ".." in path_object.parts:
         return None
     try:
-        ref = f":{path}" if revision == ":" else f"{revision}:{path}"
+        if revision == ":":
+            stage = 0 if index_stage is None else index_stage
+            if isinstance(stage, bool) or not isinstance(stage, int) or stage < 0 or stage > 3:
+                return None
+            ref = f":{stage}:{path_object.as_posix()}"
+        else:
+            ref = f"{revision}:{path_object.as_posix()}"
         size_result = subprocess.run(
             ["git", "cat-file", "-s", ref],
-            cwd=root, capture_output=True, text=True, check=False,
+            cwd=root, capture_output=True, text=True, check=False, timeout=5,
         )
         size = int(size_result.stdout.strip()) if size_result.returncode == 0 else -1
         if size < 0 or size > max_bytes:
@@ -153,7 +219,7 @@ def _git_blob(root: Path, revision: str, path: str, *, max_bytes: int) -> bytes 
             ["git", "show", "--format=", ref],
             cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         return None
     try:
         data = process.stdout.read(max_bytes + 1) if process.stdout is not None else b""
@@ -180,17 +246,27 @@ def _git_blob(root: Path, revision: str, path: str, *, max_bytes: int) -> bytes 
 
 
 def read_source_state(root: Path, entry: DiffEntry, *, max_bytes: int = 5 * 1024 * 1024) -> SourceState | None:
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be greater than zero")
     path = _normalise(entry.reviewed_path)
+    path_object = Path(path)
+    if path_object.is_absolute() or not path_object.parts or ".." in path_object.parts:
+        return None
     data: bytes | None
     revision = entry.commit_revision
     if entry.source_kind == "working-tree" or entry.source_kind == "untracked":
         try:
-            with (root / path).open("rb") as handle:
+            physical = (root / path_object).resolve()
+            physical.relative_to(root.resolve())
+            with physical.open("rb") as handle:
                 data = handle.read(max_bytes + 1)
-        except OSError:
+        except (OSError, ValueError):
             data = None
     elif entry.source_kind == "index":
-        data = _git_blob(root, ":", entry.blob_path or path, max_bytes=max_bytes)
+        data = _git_blob(
+            root, ":", entry.blob_path or path,
+            max_bytes=max_bytes, index_stage=entry.index_stage,
+        )
     else:
         data = _git_blob(root, revision or "HEAD", entry.blob_path or path, max_bytes=max_bytes)
     if data is None:
@@ -248,27 +324,53 @@ def map_test_changes(
     base_contents: Mapping[str, str] | None = None,
     head_contents: Mapping[str, str] | None = None,
 ) -> tuple[TestChange, ...]:
+    normalised_base = {
+        path: value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+        for path, value in (base_contents or {}).items()
+    }
+    normalised_head = {
+        path: value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+        for path, value in (head_contents or {}).items()
+    }
     changed = set(changed_paths)
     subjects_by_name = tuple(subjects)
     output: list[TestChange] = []
     for artifact in sorted(artifacts, key=lambda item: item.logical_path):
-        if artifact.logical_path not in changed:
+        if artifact.logical_path not in changed or artifact.role not in TEST_ARTIFACT_ROLES:
             continue
-        before = (base_contents or {}).get(artifact.logical_path, "")
-        after = (head_contents or {}).get(artifact.logical_path, "")
+        before = normalised_base.get(artifact.logical_path, "")
+        after = normalised_head.get(artifact.logical_path, "")
         kinds: list[str] = []
-        if not before and after:
+        has_before = artifact.logical_path in normalised_base
+        has_after = artifact.logical_path in normalised_head
+        if not has_before and has_after:
             kinds.append("added")
-        elif before and not after:
+        elif has_before and not has_after:
             kinds.append("deleted")
         else:
             kinds.append("modified")
         if artifact.role == "test configuration":
             kinds.append("discovery_configuration")
-        if re.search(r"\b(?:skip|todo|xfail|ignore|disabled|continue-on-error|passWithNoTests)\b", after, re.I) and not re.search(r"\b(?:skip|todo|xfail|ignore|disabled|continue-on-error|passWithNoTests)\b", before, re.I):
+        disabled_marker = re.compile(
+            r"(?:pytest\.mark\.(?:skip|skipif|xfail)|pytest\.skip|unittest\.skip(?:If|Unless)?|"
+            r"(?:test|it|describe)\.skip|@(?:skip|ignore|disabled)|\[(?:Ignore|IgnoreIf)\]|"
+            r"continue-on-error\s*:\s*true|(?:\|\||&&)\s*true\b|"
+            r"--passWithNoTests\b|--allow-no-tests\b)",
+            re.I,
+        )
+        after_code = _reference_source(artifact.logical_path, after)
+        before_code = _reference_source(artifact.logical_path, before)
+        if disabled_marker.search(after_code) and not disabled_marker.search(before_code):
             kinds.append("disabled_or_bypassed")
-        affected = tuple(
+        # Keep a test-to-subject relation inside one source layer whenever the
+        # inventory contains staged and worktree copies of the same path.  A
+        # name match across layers would create a false hybrid relation.
+        layer_subjects = tuple(
             subject for subject in subjects_by_name
+            if subject.source_kind == artifact.source_kind
+        ) or subjects_by_name
+        affected = tuple(
+            subject for subject in layer_subjects
             if re.search(rf"(?<!\w){re.escape(subject.qualified_name.rsplit('.', 1)[-1])}(?!\w)", after or before)
         )
         oracle_match = re.search(

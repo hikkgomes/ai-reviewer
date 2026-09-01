@@ -41,11 +41,16 @@ falsification and semantic verification.
 
 Test-integrity analysis inventories tests, fixtures, helpers, configuration, CI
 commands, production subjects, and their evidence-backed relations. It detects
-only high-signal weakening or bypass patterns. Static matches remain
-candidates. The base/head matrix, targeted changed-code mutation, and proof-test
-workflow require exact approval before repository tests execute. Complexity
-uses repository thresholds first and skill-local Lizard 1.24.0 second. It is a
-review signal, not an LLM-authorship check or an automatic defect.
+only high-signal weakening or bypass patterns, including unapproved new test
+files and test-only helpers or fixtures. Static matches remain candidates. New
+unit, integration, end-to-end, and spec files require an explicit creation
+request or approval. Prefer existing tests and direct browser/runtime checks;
+test changes must exercise observable behaviour rather than source strings,
+implementation shapes, or test existence. The base/head matrix, targeted
+changed-code mutation, and proof-test workflow require exact approval before
+repository tests execute. Complexity uses repository thresholds first and
+skill-local Lizard 1.24.0 second. It is a review signal, not an LLM-authorship
+check or an automatic defect.
 
 No applicable backend is `Not applicable`. Disabled, missing, malformed,
 ambiguous, timed-out, or budget-limited applicable work is `Not verified`.
@@ -53,6 +58,13 @@ Generated files are excluded only by explicit `paths.generated` patterns.
 Unknown `.h` language is reported as `ambiguous_header_language` for the
 affected C/C++ backend. See `reference/anti-slop-rule-contract.md` and
 `reference/review-context-schema.json` for rule and coverage contracts.
+
+Static test-integrity matches are candidates only. Use compiler-valid acceptance
+fixtures, the exact base/head matrix, independent oracle evidence, targeted
+changed-code mutations, and approved proof tests before treating a test change
+as verified. Complexity is a review signal, not an authorship or correctness
+gate. `Checked` means that the selected analysis completed, not that the code
+or oracle is correct.
 
 ## Setup
 

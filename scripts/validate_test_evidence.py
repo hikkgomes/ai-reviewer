@@ -7,9 +7,18 @@ import json
 from pathlib import Path
 from typing import Any
 
-from dissect_checks.test_integrity.model import SCENARIO_IDS, PUBLIC_STATES, INTERNAL_STATES
+from review_ledger import validate_candidate
+from dissect_checks.test_integrity.model import ARTIFACT_ROLES, SCENARIO_IDS, PUBLIC_STATES, INTERNAL_STATES
 
-TEST_RULE_IDS = {f"GOV-TESTS-{index:03d}" for index in range(1, 10)}
+TEST_RULE_IDS = {f"GOV-TESTS-{index:03d}" for index in range(1, 11)}
+ORACLE_KINDS = {"user_intent", "public_contract", "existing_invariant", "external_spec", "independent_reference"}
+
+
+def _safe_relative_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    path = Path(value.replace("\\", "/"))
+    return not path.is_absolute() and bool(path.parts) and ".." not in path.parts
 
 
 def _forbidden_output(value: Any, path: str = "") -> list[str]:
@@ -22,6 +31,27 @@ def _forbidden_output(value: Any, path: str = "") -> list[str]:
                 errors.append(f"unbounded command or patch output is not allowed: {current}")
             errors.extend(_forbidden_output(child, current))
     elif isinstance(value, list):
+        if path.lower() == "environment" or path.lower().endswith(".environment"):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).lower()
+                value_text = item.get("value")
+                if any(token in name for token in ("token", "secret", "password", "private_key", "api_key", "access_key")) and not (
+                    isinstance(value_text, str) and value_text.startswith("[REDACTED")
+                ):
+                    errors.append(f"raw secret-bearing environment value is not allowed: {path}")
+        if path.lower() == "bindings" or path.lower().endswith(".bindings"):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).lower()
+                value_text = item.get("value")
+                if (
+                    any(token in name for token in ("token", "secret", "password", "private_key", "api_key", "access_key"))
+                    and not (isinstance(value_text, str) and value_text.startswith("[REDACTED"))
+                ):
+                    errors.append(f"raw secret-bearing execution binding is not allowed: {path}")
         for index, child in enumerate(value):
             errors.extend(_forbidden_output(child, f"{path}[{index}]"))
     return errors
@@ -51,6 +81,107 @@ def _count_record(value: Any, name: str, errors: list[str]) -> None:
             errors.append(f"{name}.checked_files plus skipped_files exceeds applicable_files")
 
 
+def _validate_run_result(value: Any, scenario_id: str, errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"matrix scenario {scenario_id} requires a result")
+        return
+    if value.get("scenario_id") != scenario_id:
+        errors.append(f"matrix scenario {scenario_id} result ID does not match")
+    completed = value.get("completed")
+    passed = value.get("passed")
+    if not isinstance(completed, bool):
+        errors.append(f"matrix scenario {scenario_id} completed must be boolean")
+    elif completed and not isinstance(passed, bool):
+        errors.append(f"matrix scenario {scenario_id} completed result needs boolean passed")
+    elif not completed and passed is not None:
+        errors.append(f"matrix scenario {scenario_id} incomplete result must not have passed")
+    exit_code = value.get("exit_code")
+    if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        errors.append(f"matrix scenario {scenario_id} exit_code must be an integer or null")
+    if completed and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        errors.append(f"matrix scenario {scenario_id} completed result needs an integer exit_code")
+    collected = value.get("collected_tests")
+    if collected is not None and (isinstance(collected, bool) or not isinstance(collected, int) or collected < 0):
+        errors.append(f"matrix scenario {scenario_id} collected_tests must be non-negative")
+    selected = value.get("selected_tests")
+    if not isinstance(selected, list) or not all(isinstance(item, str) and item for item in selected):
+        errors.append(f"matrix scenario {scenario_id} selected_tests must contain non-empty strings")
+    reachability = value.get("reachability", "unverified")
+    if reachability not in {"confirmed", "not_reached", "unverified"}:
+        errors.append(f"matrix scenario {scenario_id} reachability has an invalid state")
+    reached = value.get("reached_subjects", [])
+    if not isinstance(reached, list) or not all(isinstance(item, str) and item for item in reached):
+        errors.append(f"matrix scenario {scenario_id} reached_subjects must be an array of non-empty strings")
+    elif reachability == "confirmed" and not reached:
+        errors.append(f"matrix scenario {scenario_id} confirmed reachability requires reached subjects")
+    elif reachability == "not_reached" and reached:
+        errors.append(f"matrix scenario {scenario_id} not_reached result cannot contain reached subjects")
+    for key in ("command_plan_digest", "output_fingerprint", "production_patch_sha256", "test_patch_sha256", "shared_config_patch_sha256"):
+        if key in value and not _hash(value[key], allow_empty=True):
+            errors.append(f"matrix scenario {scenario_id} has an invalid {key}")
+    if completed:
+        if not _hash(value.get("command_plan_digest")):
+            errors.append(f"matrix scenario {scenario_id} completed result requires an approval plan digest")
+        if not _hash(value.get("output_fingerprint")):
+            errors.append(f"matrix scenario {scenario_id} completed result requires an output fingerprint")
+
+
+def _validate_mutation_record(
+    mutation: Any,
+    label: str,
+    errors: list[str],
+    subject_ids: set[str],
+    mutation_ids: set[str],
+    *,
+    allow_existing_id: bool = False,
+) -> None:
+    if not isinstance(mutation, dict):
+        errors.append(f"{label} must be an object")
+        return
+    identifier = mutation.get("mutation_id")
+    if not isinstance(identifier, str) or not identifier:
+        errors.append(f"{label} id is required")
+    elif identifier in mutation_ids and not allow_existing_id:
+        errors.append(f"duplicate mutation id: {identifier}")
+    else:
+        mutation_ids.add(identifier)
+    if not isinstance(mutation.get("mutation_kind"), str) or not mutation.get("mutation_kind"):
+        errors.append(f"{label} mutation_kind is required")
+    if not _hash(mutation.get("patch_sha256")):
+        errors.append(f"{label} has an invalid patch hash")
+    for key in ("command_plan_digest", "build_command_plan_digest"):
+        if key in mutation and not _hash(mutation.get(key), allow_empty=True):
+            errors.append(f"{label} has an invalid {key}")
+    subject = mutation.get("subject")
+    if not isinstance(subject, dict):
+        errors.append(f"{label} requires a subject")
+    else:
+        subject_id = subject.get("id")
+        if not isinstance(subject_id, str) or not subject_id:
+            errors.append(f"{label} subject requires an ID")
+        elif subject_id not in subject_ids:
+            errors.append(f"{label} references unknown test subject: {subject_id}")
+        if not _safe_relative_path(subject.get("logical_path")):
+            errors.append(f"{label} subject path must be repository-relative")
+        if not _hash(subject.get("content_sha256")):
+            errors.append(f"{label} subject has an invalid content hash")
+    build_valid = mutation.get("build_valid")
+    killed = mutation.get("killed")
+    killing_tests = mutation.get("killing_tests")
+    if build_valid is not None and not isinstance(build_valid, bool):
+        errors.append(f"{label} build_valid must be boolean or null")
+    if killed is not None and not isinstance(killed, bool):
+        errors.append(f"{label} killed must be boolean or null")
+    if build_valid is not True and killed is not None:
+        errors.append(f"{label} has a killed result without a valid build")
+    if not isinstance(killing_tests, list) or not all(isinstance(item, str) and item for item in killing_tests):
+        errors.append(f"{label} killing_tests must be an array of non-empty strings")
+    elif killed is not True and killing_tests:
+        errors.append(f"{label} has killing tests without a killed result")
+    if killed is not None and not _hash(mutation.get("command_plan_digest")):
+        errors.append(f"{label} executed result requires a command plan digest")
+
+
 def validate(data: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
@@ -59,12 +190,24 @@ def validate(data: Any) -> list[str]:
         errors.append("invalid internal test evidence status")
     if data.get("state") not in PUBLIC_STATES:
         errors.append("invalid public test evidence state")
-    arrays = ("artifacts", "subjects", "relations", "changes", "static_candidates", "matrix", "mutations", "proof_tests")
+    arrays = ("artifacts", "subjects", "relations", "changes", "static_candidates", "dynamic_candidates", "matrix", "mutations", "proof_tests")
     for key in arrays:
         if not isinstance(data.get(key), list):
             errors.append(f"{key} must be an array")
     if data.get("status") == "not_applicable" and data.get("state") != "Not applicable":
         errors.append("not_applicable test evidence must use the Not applicable public state")
+    test_artifacts_present = any(
+        isinstance(item, dict) and item.get("role") in {
+            "test", "test helper", "fixture", "snapshot or golden file",
+            "test configuration", "CI test command",
+        }
+        for item in data.get("artifacts", [])
+    ) if isinstance(data.get("artifacts"), list) else False
+    if data.get("status") == "not_applicable" and (
+        test_artifacts_present
+        or any(data.get(key) for key in ("relations", "changes", "static_candidates", "matrix", "mutations", "proof_tests") if isinstance(data.get(key), list))
+    ):
+        errors.append("not_applicable test evidence cannot contain applicable records")
     if data.get("status") == "complete" and data.get("state") != "Checked":
         errors.append("complete test evidence must use the Checked public state")
     if data.get("status") in {"partial", "planned", "unavailable", "failed"} and data.get("state") != "Not verified":
@@ -80,13 +223,25 @@ def validate(data: Any) -> list[str]:
             errors.append("test artefact id is required")
         elif identifier in artifact_ids:
             errors.append(f"duplicate test artefact id: {identifier}")
-        artifact_ids.add(identifier)
+        else:
+            artifact_ids.add(identifier)
         for key in ("logical_path", "framework_id", "role", "source_kind"):
             if not isinstance(artifact.get(key), str) or not artifact[key]:
                 errors.append(f"test artefact {identifier or '<missing>'} requires {key}")
+        if artifact.get("role") not in ARTIFACT_ROLES:
+            errors.append(f"test artefact {identifier or '<missing>'} has an unrecognised role")
         digest = artifact.get("content_sha256", "")
         if not _hash(digest):
             errors.append(f"invalid test artefact hash: {identifier}")
+        if not _safe_relative_path(artifact.get("logical_path")):
+            errors.append(f"test artefact {identifier or '<missing>'} path must be repository-relative")
+        classification = artifact.get("classification_evidence")
+        if (
+            not isinstance(classification, list)
+            or not classification
+            or not all(isinstance(item, str) and item for item in classification)
+        ):
+            errors.append(f"test artefact {identifier or '<missing>'} classification evidence must be a non-empty array of strings")
     subject_ids: set[str] = set()
     subjects = data.get("subjects", []) if isinstance(data.get("subjects"), list) else []
     for subject in subjects:
@@ -98,38 +253,29 @@ def validate(data: Any) -> list[str]:
             errors.append("test subject id is required")
         elif identifier in subject_ids:
             errors.append(f"duplicate test subject id: {identifier}")
-        subject_ids.add(identifier)
+        else:
+            subject_ids.add(identifier)
         if not isinstance(subject.get("logical_path"), str) or not subject.get("logical_path"):
             errors.append(f"test subject {identifier or '<missing>'} requires a path")
         if not isinstance(subject.get("qualified_name"), str) or not subject.get("qualified_name"):
             errors.append(f"test subject {identifier or '<missing>'} requires a qualified name")
         if isinstance(subject.get("start_line"), bool) or not isinstance(subject.get("start_line"), int) or subject.get("start_line", 0) < 1:
             errors.append(f"test subject {identifier or '<missing>'} has an invalid start line")
-        if isinstance(subject.get("end_line"), bool) or not isinstance(subject.get("end_line"), int) or subject.get("end_line", 0) < subject.get("start_line", 1):
+        start_line = subject.get("start_line")
+        end_line = subject.get("end_line")
+        if isinstance(end_line, bool) or not isinstance(end_line, int) or end_line < (start_line if isinstance(start_line, int) and not isinstance(start_line, bool) else 1):
             errors.append(f"test subject {identifier or '<missing>'} has an invalid end line")
         if not _hash(subject.get("content_sha256")):
             errors.append(f"invalid test subject hash: {identifier}")
+        if not _safe_relative_path(subject.get("logical_path")):
+            errors.append(f"test subject {identifier or '<missing>'} path must be repository-relative")
     mutation_ids: set[str] = set()
+    mutation_records: dict[str, str] = {}
     mutations = data.get("mutations", []) if isinstance(data.get("mutations"), list) else []
     for mutation in mutations:
-        if not isinstance(mutation, dict):
-            errors.append("mutation must be an object")
-            continue
-        identifier = mutation.get("mutation_id")
-        if not isinstance(identifier, str) or not identifier:
-            errors.append("mutation id is required")
-        elif identifier in mutation_ids:
-            errors.append(f"duplicate mutation id: {identifier}")
-        mutation_ids.add(identifier)
-        if not _hash(mutation.get("patch_sha256")):
-            errors.append(f"mutation {identifier or '<missing>'} has an invalid patch hash")
-        if "command_plan_digest" in mutation and not _hash(mutation.get("command_plan_digest"), allow_empty=True):
-            errors.append(f"mutation {identifier or '<missing>'} has an invalid command plan digest")
-        subject = mutation.get("subject")
-        if not isinstance(subject, dict):
-            errors.append(f"mutation {identifier or '<missing>'} requires a subject")
-        elif subject.get("id") and subject.get("id") not in subject_ids:
-            errors.append(f"mutation references unknown test subject: {subject.get('id')}")
+        _validate_mutation_record(mutation, "mutation", errors, subject_ids, mutation_ids)
+        if isinstance(mutation, dict) and isinstance(mutation.get("mutation_id"), str):
+            mutation_records[mutation["mutation_id"]] = json.dumps(mutation, sort_keys=True, separators=(",", ":"))
     mutation_run = data.get("targeted_mutation")
     if mutation_run is not None:
         if not isinstance(mutation_run, dict):
@@ -137,6 +283,26 @@ def validate(data: Any) -> list[str]:
         else:
             if mutation_run.get("status") not in INTERNAL_STATES:
                 errors.append("targeted_mutation has an invalid status")
+            run_results = mutation_run.get("results")
+            if not isinstance(run_results, list):
+                errors.append("targeted_mutation.results must be an array")
+            else:
+                for mutation in run_results:
+                    identifier = mutation.get("mutation_id") if isinstance(mutation, dict) else None
+                    _validate_mutation_record(
+                        mutation,
+                        "targeted_mutation result",
+                        errors,
+                        subject_ids,
+                        mutation_ids,
+                        allow_existing_id=isinstance(identifier, str) and identifier in mutation_ids,
+                    )
+                    if isinstance(mutation, dict) and isinstance(identifier, str) and identifier in mutation_records:
+                        current = json.dumps(mutation, sort_keys=True, separators=(",", ":"))
+                        if current != mutation_records[identifier]:
+                            errors.append(f"targeted_mutation result does not match mutation record: {identifier}")
+                    elif isinstance(mutation, dict) and isinstance(identifier, str):
+                        mutation_records[identifier] = json.dumps(mutation, sort_keys=True, separators=(",", ":"))
             for key in ("kill_sets", "unique_kill_sets"):
                 values = mutation_run.get(key)
                 if not isinstance(values, dict):
@@ -158,49 +324,199 @@ def validate(data: Any) -> list[str]:
             errors.append("test change id is required")
         elif identifier in change_ids:
             errors.append(f"duplicate test change id: {identifier}")
-        change_ids.add(identifier)
+        else:
+            change_ids.add(identifier)
         test = change.get("test")
-        if isinstance(test, dict) and test.get("id") and test.get("id") not in artifact_ids:
+        if not isinstance(test, dict):
+            errors.append(f"test change {identifier or '<missing>'} requires a test artefact")
+        elif test.get("id") and test.get("id") not in artifact_ids:
             errors.append(f"test change references unknown test artefact: {test.get('id')}")
+        change_kinds = change.get("change_kinds")
+        if (
+            not isinstance(change_kinds, list)
+            or not change_kinds
+            or not all(isinstance(item, str) and item for item in change_kinds)
+        ):
+            errors.append(f"test change {identifier or '<missing>'} requires non-empty change_kinds")
+        affected = change.get("affected_subjects")
+        if not isinstance(affected, list):
+            errors.append(f"test change {identifier or '<missing>'} affected_subjects must be an array")
+        else:
+            for subject in affected:
+                if not isinstance(subject, dict) or subject.get("id") not in subject_ids:
+                    errors.append(f"test change {identifier or '<missing>'} references an unknown subject")
         oracle = change.get("oracle_source")
         if not isinstance(oracle, dict) or not isinstance(oracle.get("kind"), str) or not oracle.get("kind") or not isinstance(oracle.get("reference"), str) or not oracle.get("reference"):
             errors.append(f"test change {identifier or '<missing>'} requires an oracle source record")
+        elif data.get("status") == "complete" and oracle.get("kind") not in ORACLE_KINDS:
+            errors.append(f"test change {identifier or '<missing>'} is complete without an independent oracle")
+    static_candidates = data.get("static_candidates", [])
+    dynamic_candidates = data.get("dynamic_candidates", [])
+    candidate_ids: set[str] = set()
+    for candidate_list, label in ((static_candidates, "static"), (dynamic_candidates, "dynamic")):
+        if candidate_list is None:
+            continue
+        if not isinstance(candidate_list, list):
+            errors.append(f"{label}_candidates must be an array")
+            continue
+        for candidate in candidate_list:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_id = candidate.get("id")
+            if not isinstance(candidate_id, str) or not candidate_id:
+                errors.append(f"{label} candidate requires an ID")
+            elif candidate_id in candidate_ids:
+                errors.append(f"duplicate test-integrity candidate ID: {candidate_id}")
+            else:
+                candidate_ids.add(candidate_id)
+            errors.extend(
+                f"{label} candidate {candidate_id or '<missing>'}: {error}"
+                for error in validate_candidate(candidate)
+            )
+            for evidence in candidate.get("supporting_evidence", ()):
+                if isinstance(evidence, dict) and evidence.get("rule_id") and evidence["rule_id"] not in TEST_RULE_IDS:
+                    errors.append(f"{label} candidate {candidate_id or '<missing>'} has an unknown rule ID")
     scenarios = data.get("matrix", [])
-    scenario_ids = [item.get("scenario_id") for item in scenarios if isinstance(item, dict)] if isinstance(scenarios, list) else []
-    if scenario_ids and (len(scenario_ids) != len(SCENARIO_IDS) or set(scenario_ids) != set(SCENARIO_IDS)):
+    scenario_ids = [
+        item.get("scenario_id")
+        for item in scenarios
+        if isinstance(item, dict) and isinstance(item.get("scenario_id"), str)
+    ] if isinstance(scenarios, list) else []
+    if scenarios and (len(scenario_ids) != len(SCENARIO_IDS) or set(scenario_ids) != set(SCENARIO_IDS)):
         errors.append("matrix must contain exactly the four test evidence scenarios")
     if len(scenario_ids) != len(set(scenario_ids)):
         errors.append("matrix scenario IDs must be unique")
+    if data.get("status") == "complete" and test_artifacts_present and set(scenario_ids) != set(SCENARIO_IDS):
+        errors.append("complete test evidence with test artefacts requires all four matrix scenarios")
+    if data.get("status") == "complete" and isinstance(scenarios, list):
+        if any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("result"), dict)
+            or item["result"].get("completed") is not True
+            or not isinstance(item["result"].get("passed"), bool)
+            for item in scenarios
+        ):
+            errors.append("complete test evidence requires completed matrix results")
     for scenario in scenarios if isinstance(scenarios, list) else []:
         if not isinstance(scenario, dict):
             errors.append("matrix scenario must be an object")
             continue
+        scenario_id = scenario.get("scenario_id")
+        valid_scenario_id = scenario_id if isinstance(scenario_id, str) else None
+        if valid_scenario_id not in SCENARIO_IDS:
+            errors.append(f"matrix scenario has an invalid ID: {scenario_id}")
+        if scenario.get("production_state") not in {"base", "head"}:
+            errors.append(f"matrix scenario {scenario_id} has an invalid production state")
+        if scenario.get("test_state") not in {"base", "head"}:
+            errors.append(f"matrix scenario {scenario_id} has an invalid test state")
+        expected_states = {
+            "base-code-base-tests": ("base", "base"),
+            "base-code-head-tests": ("base", "head"),
+            "head-code-base-tests": ("head", "base"),
+            "head-code-head-tests": ("head", "head"),
+        }.get(valid_scenario_id)
+        if expected_states is not None and (
+            scenario.get("production_state"), scenario.get("test_state")
+        ) != expected_states:
+            errors.append(f"matrix scenario {scenario_id} states do not match its ID")
         if not isinstance(scenario.get("source_hashes"), dict):
-            errors.append(f"matrix scenario {scenario.get('scenario_id')} requires source hashes")
+            errors.append(f"matrix scenario {scenario_id} requires source hashes")
+        else:
+            source_hashes_value = scenario["source_hashes"]
+            for key in ("source_files_sha256", "source_files_present", "source_files_absent"):
+                if key not in source_hashes_value:
+                    errors.append(f"matrix scenario {scenario_id} source hashes require {key}")
         if not isinstance(scenario.get("selected_tests"), list) or not all(isinstance(item, str) for item in scenario.get("selected_tests", [])):
-            errors.append(f"matrix scenario {scenario.get('scenario_id')} selected_tests must be an array of strings")
+            errors.append(f"matrix scenario {scenario_id} selected_tests must be an array of strings")
+        _validate_run_result(scenario.get("result"), str(scenario_id), errors)
         result = scenario.get("result")
         if not isinstance(result, dict):
-            errors.append(f"matrix scenario {scenario.get('scenario_id')} requires a result")
             continue
-        if result.get("scenario_id") not in {None, scenario.get("scenario_id")}:
-            errors.append(f"matrix scenario {scenario.get('scenario_id')} result ID does not match")
+        if "reachability" in scenario and scenario.get("reachability") != result.get("reachability", "unverified"):
+            errors.append(f"matrix scenario {scenario_id} reachability differs between scenario and result")
+        if "reached_subjects" in scenario and scenario.get("reached_subjects") != result.get("reached_subjects", []):
+            errors.append(f"matrix scenario {scenario_id} reached subjects differ between scenario and result")
+        if isinstance(scenario.get("selected_tests"), list) and isinstance(result.get("selected_tests"), list) and scenario["selected_tests"] != result["selected_tests"]:
+            errors.append(f"matrix scenario {scenario_id} selected tests differ between plan and result")
+        focal_subjects = scenario.get("focal_subjects", [])
+        if not isinstance(focal_subjects, list) or not all(isinstance(item, str) and item for item in focal_subjects):
+            errors.append(f"matrix scenario {scenario_id} focal_subjects must be an array of non-empty strings")
+        repeated = scenario.get("repeated_runs", [])
+        if not isinstance(repeated, list):
+            errors.append(f"matrix scenario {scenario_id} repeated_runs must be an array")
+        else:
+            for repeat in repeated:
+                if not isinstance(repeat, dict):
+                    errors.append(f"matrix scenario {scenario_id} repeated run must be an object")
+                else:
+                    if repeat.get("scenario_id") != scenario_id:
+                        errors.append(f"matrix scenario {scenario_id} repeated run ID does not match")
+                    _validate_run_result(repeat, scenario_id, errors)
+            flakiness = scenario.get("flakiness")
+            if flakiness is not None and not isinstance(flakiness, dict):
+                errors.append(f"matrix scenario {scenario_id} flakiness must be an object")
+            if isinstance(flakiness, dict):
+                run_count = flakiness.get("run_count")
+                for key in ("run_count", "pass_count", "fail_count"):
+                    value = flakiness.get(key)
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        errors.append(f"matrix scenario {scenario_id} flakiness {key} must be a non-negative integer")
+                if all(isinstance(flakiness.get(key), int) and not isinstance(flakiness.get(key), bool) and flakiness.get(key) >= 0 for key in ("run_count", "pass_count", "fail_count")):
+                    if flakiness["pass_count"] + flakiness["fail_count"] > flakiness["run_count"]:
+                        errors.append(f"matrix scenario {scenario_id} flakiness counts exceed run_count")
+                if flakiness.get("status") not in {"stable", "flaky", "not_verified"}:
+                    errors.append(f"matrix scenario {scenario_id} flakiness has an invalid status")
         for key in ("production_patch_sha256", "test_patch_sha256", "shared_config_patch_sha256"):
             if key in result and not _hash(result[key], allow_empty=True):
                 errors.append(f"matrix scenario {scenario.get('scenario_id')} has an invalid {key}")
         source_hashes = scenario.get("source_hashes")
         if isinstance(source_hashes, dict):
+            present_paths = source_hashes.get("source_files_present")
+            absent_paths = source_hashes.get("source_files_absent")
+            if isinstance(present_paths, list) and all(isinstance(item, str) for item in present_paths) and len(present_paths) != len(set(present_paths)):
+                errors.append(f"matrix scenario {scenario.get('scenario_id')} has duplicate present source paths")
+            if isinstance(absent_paths, list) and all(isinstance(item, str) for item in absent_paths) and len(absent_paths) != len(set(absent_paths)):
+                errors.append(f"matrix scenario {scenario.get('scenario_id')} has duplicate absent source paths")
+            if isinstance(present_paths, list) and isinstance(absent_paths, list) and all(isinstance(item, str) for item in (*present_paths, *absent_paths)) and set(present_paths) & set(absent_paths):
+                errors.append(f"matrix scenario {scenario.get('scenario_id')} marks a source path both present and absent")
             for key, value in source_hashes.items():
                 if key == "source_files_sha256" and isinstance(value, dict):
                     if any(not _hash(item) for item in value.values()):
                         errors.append(f"matrix scenario {scenario.get('scenario_id')} has an invalid source file hash")
+                    if any(not _safe_relative_path(path) for path in value):
+                        errors.append(f"matrix scenario {scenario.get('scenario_id')} has an unsafe source file path")
+                elif key == "source_files_sha256":
+                    errors.append(f"matrix scenario {scenario.get('scenario_id')} source_files_sha256 must be an object")
+                elif key == "source_files_present" and (
+                    not isinstance(value, list) or not all(isinstance(item, str) and item for item in value)
+                ):
+                    errors.append(f"matrix scenario {scenario.get('scenario_id')} source_files_present must be an array of paths")
+                elif key == "source_files_absent" and (
+                    not isinstance(value, list) or not all(isinstance(item, str) and item for item in value)
+                ):
+                    errors.append(f"matrix scenario {scenario.get('scenario_id')} source_files_absent must be an array of paths")
+                elif key in {"source_files_present", "source_files_absent"} and (
+                    not all(_safe_relative_path(item) for item in value)
+                ):
+                    errors.append(f"matrix scenario {scenario.get('scenario_id')} contains an unsafe source path")
                 elif key.endswith("_sha256") and not _hash(value, allow_empty=True):
                     errors.append(f"matrix scenario {scenario.get('scenario_id')} has an invalid source hash: {key}")
-    for candidate in data.get("static_candidates", []) if isinstance(data.get("static_candidates"), list) else []:
+            if isinstance(present_paths, list) and isinstance(source_hashes.get("source_files_sha256"), dict):
+                if sorted(present_paths) != sorted(source_hashes["source_files_sha256"]):
+                    errors.append(f"matrix scenario {scenario.get('scenario_id')} present paths do not match source file hashes")
+    for candidate in static_candidates if isinstance(static_candidates, list) else []:
         if not isinstance(candidate, dict):
             errors.append("static candidate must be an object")
             continue
-        for evidence in candidate.get("supporting_evidence", []):
+        errors.extend(
+            f"static candidate {candidate.get('id', '<missing>')}: {error}"
+            for error in validate_candidate(candidate)
+        )
+        candidate_evidence = candidate.get("supporting_evidence", [])
+        if not isinstance(candidate_evidence, list):
+            errors.append(f"static candidate {candidate.get('id', '<missing>')} supporting_evidence must be an array")
+            candidate_evidence = []
+        for evidence in candidate_evidence:
             if not isinstance(evidence, dict):
                 continue
             if evidence.get("rule_id") and evidence["rule_id"] not in TEST_RULE_IDS:
@@ -217,6 +533,45 @@ def validate(data: Any) -> list[str]:
             errors.append(f"relation references unknown test artefact: {relation['test_artifact_id']}")
         if relation.get("subject_id") and relation["subject_id"] not in subject_ids:
             errors.append(f"relation references unknown test subject: {relation['subject_id']}")
+    for proof in data.get("proof_tests", []) if isinstance(data.get("proof_tests"), list) else []:
+        if not isinstance(proof, dict):
+            errors.append("proof test must be an object")
+            continue
+        if proof.get("candidate_id") and not isinstance(proof["candidate_id"], str):
+            errors.append("proof test candidate_id must be a string")
+        if proof.get("outcome") is not None and proof.get("outcome") not in {"disproved", "supported", "inconclusive"}:
+            errors.append("proof test has an invalid outcome")
+        if proof.get("reachability") is not None and proof.get("reachability") not in {"confirmed", "not_reached", "unverified"}:
+            errors.append("proof test has an invalid reachability state")
+        if proof.get("test_patch_sha256") is not None and not _hash(proof["test_patch_sha256"]):
+            errors.append("proof test has an invalid patch hash")
+        if proof.get("command_plan_digest") is not None and not _hash(proof["command_plan_digest"], allow_empty=True):
+            errors.append("proof test has an invalid command plan digest")
+        if isinstance(proof.get("candidate_id"), str) and proof["candidate_id"] and proof["candidate_id"] not in candidate_ids:
+            errors.append(f"proof test references unknown candidate: {proof['candidate_id']}")
+        oracle_kind = proof.get("oracle_kind", proof.get("oracle_source", {}).get("kind") if isinstance(proof.get("oracle_source"), dict) else None)
+        if proof.get("outcome") in {"disproved", "supported"} and oracle_kind not in ORACLE_KINDS:
+            errors.append("completed proof test requires an independent oracle")
+        if proof.get("outcome") in {"disproved", "supported"}:
+            if proof.get("reachability") != "confirmed":
+                errors.append("completed proof test requires confirmed reachability")
+            if proof.get("current_result") not in {"pass", "fail"} or proof.get("control_result") not in {"pass", "fail"}:
+                errors.append("completed proof test requires current and control results")
+    static_analysis = data.get("static_analysis")
+    if static_analysis is not None:
+        _count_record(static_analysis, "static_analysis", errors)
+        if isinstance(static_analysis, dict):
+            if static_analysis.get("status") not in {"complete", "partial", "not_applicable", "failed"}:
+                errors.append("static_analysis has an invalid status")
+            if static_analysis.get("status") == "complete" and (
+                static_analysis.get("checked_files") != static_analysis.get("applicable_files")
+                or static_analysis.get("skipped_files") != 0
+            ):
+                errors.append("complete static_analysis cannot contain skipped files")
+            if static_analysis.get("status") == "not_applicable" and any(
+                static_analysis.get(key, 0) for key in ("applicable_files", "checked_files", "skipped_files")
+            ):
+                errors.append("not_applicable static_analysis cannot contain files")
     errors.extend(_forbidden_output(data))
     return errors
 

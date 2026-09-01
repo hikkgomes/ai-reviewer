@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -14,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from dissect_checks.complexity.orchestrator import analyse  # noqa: E402
 from dissect_checks.redaction import redact_payload, redact_sensitive_text  # noqa: E402
 from diff_file_list import DiffEntry, changed_entries, read_diff_entries  # noqa: E402
-from dissect_checks.test_integrity.orchestrator import source_maps  # noqa: E402
+from dissect_checks.test_integrity.orchestrator import _head_source_kinds, source_maps  # noqa: E402
 
 
 def _hunk_ranges(diff_text: str) -> list[tuple[int, int]]:
@@ -22,10 +23,11 @@ def _hunk_ranges(diff_text: str) -> list[tuple[int, int]]:
     for line in diff_text.splitlines():
         if not line.startswith("@@"):
             continue
-        marker = line.split("@@", 2)[1].strip().split()[1]
-        start_text, _, count_text = marker.removeprefix("+").partition(",")
-        start = int(start_text)
-        count = int(count_text or "1")
+        match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+        if match is None:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
         if count:
             ranges.append((start, start + count - 1))
     return ranges
@@ -34,10 +36,32 @@ def _hunk_ranges(diff_text: str) -> list[tuple[int, int]]:
 def _diff_ranges(root: Path, path: str, entries: list[DiffEntry], base: str, text: str) -> list[tuple[int, int]] | None:
     if any(item.source_kind == "untracked" and item.reviewed_path == path for item in entries):
         return [(1, max(1, len(text.splitlines())))]
-    commands = [["git", "diff", "--unified=0", base, "--", path]] if base else [
-        ["git", "diff", "--unified=0", "--", path],
-        ["git", "diff", "--cached", "--unified=0", "--", path],
-    ]
+    if base:
+        left = base.split("...", 1)[0] if "..." in base else base
+        right = base.split("...", 1)[1] if "..." in base else "HEAD"
+        commands = [["git", "diff", "--unified=0", left, right, "--", path]]
+    else:
+        matching = [item for item in entries if item.reviewed_path == path]
+        has_unstaged = any(item.source_kind == "working-tree" for item in matching)
+        if has_unstaged:
+            try:
+                probe = subprocess.run(
+                    ["git", "diff", "--quiet", "--", path],
+                    cwd=root,
+                    capture_output=True,
+                    check=False,
+                )
+                has_unstaged = probe.returncode == 1
+            except OSError:
+                has_unstaged = False
+        if has_unstaged:
+            commands = [["git", "diff", "--unified=0", "--", path]]
+        elif any(item.source_kind == "index" for item in matching):
+            commands = [["git", "diff", "--cached", "--unified=0", "--", path]]
+        elif any(item.source_kind == "commit" for item in matching):
+            commands = [["git", "diff", "--unified=0", "HEAD^", "HEAD", "--", path]]
+        else:
+            commands = [["git", "diff", "--unified=0", "--", path]]
     outputs: list[str] = []
     succeeded = False
     for command in commands:
@@ -56,9 +80,14 @@ def _diff_inputs(
     requested: list[str],
     base: str,
     file_list: Path | None,
-) -> tuple[list[str], dict[str, str], dict[str, str], dict[str, list[tuple[int, int]] | None], str]:
+) -> tuple[list[str], dict[str, str], dict[str, str], dict[str, list[tuple[int, int]] | None], str, dict[str, str]]:
     try:
-        entries = read_diff_entries(file_list) if file_list is not None else changed_entries(root, base)
+        committed_range = (
+            f"{base}...HEAD"
+            if base and "..." not in base
+            else base
+        )
+        entries = read_diff_entries(file_list) if file_list is not None else changed_entries(root, committed_range)
     except RuntimeError:
         entries = []
     requested_set = set(requested)
@@ -74,8 +103,8 @@ def _diff_inputs(
         root,
         selected_entries,
         paths,
-        base_revision=base,
-        head_revision="HEAD",
+        base_revision=base.split("...", 1)[0] if "..." in base else base,
+        head_revision=base.split("...", 1)[1] if "..." in base and base.split("...", 1)[1] else "HEAD",
     )
     changed_ranges = {
         path: _diff_ranges(root, path, selected_entries, base, head_contents.get(path, ""))
@@ -86,7 +115,10 @@ def _diff_inputs(
         (layer for layer in ("working-tree", "untracked", "index", "commit") if layer in layers),
         "working-tree",
     )
-    return paths, base_contents, head_contents, changed_ranges, source_kind
+    normalized_base = base.split("...", 1)[0] if "..." in base else base
+    return paths, base_contents, head_contents, changed_ranges, source_kind, _head_source_kinds(
+        selected_entries, paths, normalized_base, root=root,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,9 +135,11 @@ def main(argv: list[str] | None = None) -> int:
         config_path = args.root / ".ai-review" / "local.json"
         if config_path.is_file():
             loaded = json.loads(config_path.read_text(encoding="utf-8"))
-            config = loaded if isinstance(loaded, dict) else {}
+            if not isinstance(loaded, dict):
+                raise ValueError("review configuration must be a JSON object")
+            config = loaded
         if args.mode == "diff":
-            paths, base_contents, head_contents, changed_ranges, source_kind = _diff_inputs(
+            paths, base_contents, head_contents, changed_ranges, source_kind, source_kind_by_path = _diff_inputs(
                 args.root.resolve(), args.file, args.base, args.file_list,
             )
             result = analyse(
@@ -117,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
                 head_contents=head_contents,
                 changed_ranges=changed_ranges,
                 source_kind=source_kind,
+                source_kind_by_path=source_kind_by_path,
             )
         else:
             result = analyse(args.root, args.file or None, mode="full", config=config)

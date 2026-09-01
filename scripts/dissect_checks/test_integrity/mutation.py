@@ -18,7 +18,9 @@ from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded
 from dissect_checks.execution_plan import build_execution_plan, execute_approved_plan
 from dissect_checks.redaction import redact_sensitive_text
 from .change_analysis import ChangePartition
+from .evidence_matrix import _archive_revision
 from .model import MutationResult, TestSubject, bounded_fingerprint, digest_payload, sha256_bytes
+from ..source_validation import balanced_delimiter_error
 
 
 @dataclass(frozen=True)
@@ -35,9 +37,14 @@ class MutationSpec:
     def __post_init__(self) -> None:
         if not self.mutation_id or not self.mutation_kind or not self.logical_path:
             raise ValueError("mutation specifications require an ID, kind, and path")
+        path = Path(self.logical_path)
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise ValueError("mutation specification path must be repository-relative")
         for name, value in (("original_sha256", self.original_sha256), ("mutated_sha256", self.mutated_sha256), ("patch_sha256", self.patch_sha256)):
             if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
                 raise ValueError(f"{name} must be a lowercase SHA-256")
+        if self.subject.logical_path != self.logical_path:
+            raise ValueError("mutation subject path must match the mutation path")
         if sha256_bytes(self.mutated_source.encode("utf-8", errors="surrogatepass")) != self.mutated_sha256:
             raise ValueError("mutation source does not match mutated_sha256")
 
@@ -61,6 +68,29 @@ class MutationRun:
     kill_sets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     unique_kill_sets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.status not in {"complete", "partial", "not_applicable", "planned", "unavailable", "failed"}:
+            raise ValueError("invalid mutation run status")
+        identifiers = [item.mutation_id for item in self.results]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("mutation IDs must be unique within a run")
+        result_ids = set(identifiers)
+        for name, values in (("kill_sets", self.kill_sets), ("unique_kill_sets", self.unique_kill_sets)):
+            if not isinstance(values, Mapping):
+                raise ValueError(f"{name} must be a mapping")
+            for test_name, mutant_ids in values.items():
+                if not isinstance(test_name, str) or not test_name:
+                    raise ValueError(f"{name} test identifiers must be non-empty strings")
+                if not isinstance(mutant_ids, (tuple, list, set, frozenset)):
+                    raise ValueError(f"{name} mutation identifiers must be an array")
+                if any(not isinstance(mutant_id, str) or not mutant_id for mutant_id in mutant_ids):
+                    raise ValueError(f"{name} mutation identifiers must be non-empty strings")
+                if any(mutant_id not in result_ids for mutant_id in mutant_ids):
+                    raise ValueError(f"{name} references an unknown mutation")
+        for test_name, mutant_ids in self.unique_kill_sets.items():
+            if not set(mutant_ids) <= set(self.kill_sets.get(test_name, ())):
+                raise ValueError("unique kill sets must be subsets of kill sets")
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
@@ -79,36 +109,7 @@ def _line_slice(text: str, start: int, end: int) -> tuple[int, int]:
 
 
 def _valid_source(path: str, source: str) -> bool:
-    suffix = Path(path).suffix.lower()
-    if suffix in {".py", ".pyi"}:
-        try:
-            ast.parse(source, filename=path)
-        except (SyntaxError, ValueError, TypeError):
-            return False
-        return True
-    if "\0" in source:
-        return False
-    pairs = {"{": "}", "(": ")", "[": "]"}
-    stack: list[str] = []
-    quote = ""
-    escaped = False
-    for char in source:
-        if quote:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = ""
-            continue
-        if char in {'"', "'", "`"}:
-            quote = char
-        elif char in pairs:
-            stack.append(pairs[char])
-        elif char in pairs.values():
-            if not stack or stack.pop() != char:
-                return False
-    return not stack and not quote
+    return balanced_delimiter_error(path, source) is None
 
 
 def _python_span(source: str, subject: TestSubject) -> tuple[int, int] | None:
@@ -211,8 +212,16 @@ def _mutated_spec(path: str, head: str, base: str, subject: TestSubject, index: 
     mutation_id = digest_payload({
         "path": path, "subject": subject.qualified_name, "span": [subject.start_line, subject.end_line],
         "kind": "revert_changed_function", "patch": patch_hash, "index": index,
+        "source_layer": subject.source_kind,
+        "subject_content_sha256": subject.content_sha256,
     }, prefix="mutation-")
     return MutationSpec(mutation_id, subject, "revert_changed_function", path, original_hash, mutated_hash, mutated, patch_hash)
+
+
+def _source_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 def generate_mutations(
@@ -223,22 +232,35 @@ def generate_mutations(
     head_contents: Mapping[str, str],
     max_mutants: int = 25,
     max_per_function: int = 3,
+    excluded_paths: Iterable[str] = (),
+    changed_ranges: Mapping[str, Iterable[tuple[int, int]]] | None = None,
 ) -> tuple[MutationSpec, ...]:
     """Generate deterministic reversion mutants for changed production functions."""
     if max_mutants < 0 or max_per_function < 0:
         raise ValueError("mutation limits must not be negative")
     output: list[MutationSpec] = []
     counts: dict[str, int] = {}
+    excluded = {Path(path).as_posix() for path in excluded_paths}
     for subject in sorted(subjects, key=lambda item: (item.logical_path, item.start_line, item.qualified_name)):
         if subject.logical_path not in partition.production:
             continue
-        key = f"{subject.logical_path}:{subject.qualified_name}:{subject.start_line}"
+        if changed_ranges is not None:
+            ranges = tuple(changed_ranges.get(subject.logical_path) or ())
+            if ranges is None or not any(
+                subject.start_line <= int(end) and subject.end_line >= int(start)
+                for start, end in ranges
+            ):
+                continue
+        parts = set(Path(subject.logical_path).parts)
+        if subject.logical_path in excluded or parts & {"vendor", "node_modules", "generated"}:
+            continue
+        key = f"{subject.logical_path}:{subject.source_kind}:{subject.content_sha256}:{subject.qualified_name}:{subject.start_line}"
         if counts.get(key, 0) >= max_per_function or len(output) >= max_mutants:
             continue
         spec = _mutated_spec(
             subject.logical_path,
-            head_contents.get(subject.logical_path, ""),
-            base_contents.get(subject.logical_path, ""),
+            _source_text(head_contents.get(subject.logical_path)),
+            _source_text(base_contents.get(subject.logical_path)),
             subject,
             counts.get(key, 0),
         )
@@ -282,20 +304,29 @@ def _repository_identity(root: Path) -> str:
 
 
 def _killing_tests(output: str, selection: Sequence[str]) -> tuple[str, ...]:
+    if len(selection) == 1:
+        return (selection[0],)
     values = set(re.findall(r"(?:FAILED|FAIL(?:ED)?[: ])\s*([\w./:-]+)", output, re.I))
-    if not values and len(selection) == 1:
-        values.add(selection[0])
-    return tuple(sorted(values))
+    for selected in selection:
+        if selected in output or Path(selected).name in output:
+            values.add(selected)
+    allowed = set(selection)
+    return tuple(sorted(value for value in values if value in allowed))
 
 
-def _copy_private_tree(root: Path, destination: Path, overrides: Mapping[str, str]) -> None:
+def _copy_private_tree(root: Path, destination: Path, overrides: Mapping[str, str | bytes]) -> None:
+    base_ignore = shutil.ignore_patterns(
+        ".git", "node_modules", "__pycache__", "*.pyc", "target",
+        ".env", ".env.*", "*.pem", "*.key", "credentials.json", "secrets.json",
+    )
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = set(base_ignore(directory, names))
+        ignored.update(name for name in names if (Path(directory) / name).is_symlink())
+        return ignored
     shutil.copytree(
         root,
         destination,
-        ignore=shutil.ignore_patterns(
-            ".git", "node_modules", "__pycache__", "*.pyc", "target",
-            ".env", ".env.*", "*.pem", "*.key", "credentials.json", "secrets.json",
-        ),
+        ignore=ignore,
         dirs_exist_ok=True,
     )
     for path, source in overrides.items():
@@ -303,8 +334,73 @@ def _copy_private_tree(root: Path, destination: Path, overrides: Mapping[str, st
         if path_object.is_absolute() or ".." in path_object.parts:
             raise ValueError(f"mutation override path is outside the private tree: {path}")
         target = destination / path_object
+        if target.is_symlink():
+            target.unlink()
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source, encoding="utf-8")
+        target.write_bytes(source if isinstance(source, bytes) else source.encode("utf-8", errors="surrogatepass"))
+
+
+def _is_git_repository(root: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def _source_override_hashes(overrides: Mapping[str, str | bytes]) -> dict[str, str]:
+    return {
+        path: sha256_bytes(value if isinstance(value, bytes) else value.encode("utf-8", errors="surrogatepass"))
+        for path, value in sorted(overrides.items())
+    }
+
+
+def _source_hash(root: Path, path: str) -> str | None:
+    path_object = Path(path)
+    if path_object.is_absolute() or not path_object.parts or ".." in path_object.parts:
+        return None
+    physical = (root / path_object).resolve()
+    try:
+        physical.relative_to(root.resolve())
+        size = physical.stat().st_size
+        if size > 5 * 1024 * 1024:
+            return None
+        with physical.open("rb") as handle:
+            data = handle.read(size)
+        if len(data) != size or physical.stat().st_size != size:
+            return None
+    except (OSError, ValueError):
+        return None
+    return sha256_bytes(data)
+
+
+def _verify_source_overrides(tree: Path, expected: Mapping[str, str]) -> bool:
+    for path, digest in expected.items():
+        path_object = Path(path)
+        if path_object.is_absolute() or not path_object.parts or ".." in path_object.parts:
+            return False
+        physical = (tree / path_object).resolve()
+        try:
+            physical.relative_to(tree.resolve())
+            size = physical.stat().st_size
+            if size > 5 * 1024 * 1024:
+                return False
+            with physical.open("rb") as handle:
+                data = handle.read(size)
+            if len(data) != size or physical.stat().st_size != size:
+                return False
+        except (OSError, ValueError):
+            return False
+        if sha256_bytes(data) != digest:
+            return False
+    return True
 
 
 def run_mutations(
@@ -317,8 +413,27 @@ def run_mutations(
     approved_digests: Mapping[str, str] | None = None,
     timeout_seconds: float = 300,
     output_limit: int = 64 * 1024,
+    source_overrides: Mapping[str, str | bytes] | None = None,
+    source_revision: str = "",
+    production_patch_sha256: str = "",
+    test_patch_sha256: str = "",
+    shared_config_patch_sha256: str = "",
 ) -> MutationRun:
     """Plan every mutant and execute only an exact approved plan."""
+    for name, value in (
+        ("production_patch_sha256", production_patch_sha256),
+        ("test_patch_sha256", test_patch_sha256),
+        ("shared_config_patch_sha256", shared_config_patch_sha256),
+    ):
+        if value and (len(value) != 64 or any(character not in "0123456789abcdef" for character in value)):
+            raise ValueError(f"{name} must be a lowercase SHA-256 or empty")
+    if approved_digests is not None:
+        expected_approvals = {spec.mutation_id for spec in specs}
+        if build_command:
+            expected_approvals.update(f"{spec.mutation_id}:build" for spec in specs)
+        unknown_approvals = sorted(set(approved_digests) - expected_approvals)
+        if unknown_approvals:
+            raise ValueError(f"unknown mutation approval(s): {', '.join(unknown_approvals)}")
     if not specs:
         return MutationRun("not_applicable", ())
     argv = _command_argv(command) if command else None
@@ -326,6 +441,31 @@ def run_mutations(
     reason: str | None = None
     review_budget = AnalysisBudget(timeout_seconds, max_files=len(specs))
     with tempfile.TemporaryDirectory(prefix="dissect-mutations-") as directory:
+        source_root = root
+        archived_source = Path(directory) / "head-source"
+        if source_revision and _is_git_repository(root):
+            if not _archive_revision(root, source_revision, archived_source):
+                reason = "source_snapshot_unavailable"
+                return MutationRun(
+                    "partial",
+                    tuple(
+                        MutationResult(
+                            spec.mutation_id,
+                            spec.subject,
+                            spec.mutation_kind,
+                            spec.patch_sha256,
+                            None,
+                            None,
+                            (),
+                            reason,
+                        )
+                        for spec in specs
+                    ),
+                    reason,
+                    {},
+                    {},
+                )
+            source_root = archived_source
         for index, spec in enumerate(specs):
             try:
                 review_budget.claim_file()
@@ -341,8 +481,71 @@ def run_mutations(
                 results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, None, None, (), "command_not_configured"))
                 reason = reason or "command_not_configured"
                 continue
+            if not _valid_source(spec.logical_path, spec.mutated_source):
+                results.append(MutationResult(
+                    spec.mutation_id,
+                    spec.subject,
+                    spec.mutation_kind,
+                    spec.patch_sha256,
+                    False,
+                    None,
+                    (),
+                    "invalid_mutant",
+                ))
+                reason = reason or "invalid_mutant"
+                continue
+            expected_original = spec.original_sha256
+            supplied_original = (source_overrides or {}).get(spec.logical_path)
+            observed_original = (
+                sha256_bytes(supplied_original if isinstance(supplied_original, bytes) else supplied_original.encode("utf-8", errors="surrogatepass"))
+                if supplied_original is not None
+                else _source_hash(source_root, spec.logical_path)
+            )
+            if observed_original != expected_original:
+                results.append(MutationResult(
+                    spec.mutation_id,
+                    spec.subject,
+                    spec.mutation_kind,
+                    spec.patch_sha256,
+                    None,
+                    None,
+                    (),
+                    "source_snapshot_changed",
+                ))
+                reason = reason or "source_snapshot_changed"
+                continue
             tree = Path(directory) / spec.mutation_id
-            _copy_private_tree(root, tree, {spec.logical_path: spec.mutated_source})
+            overrides = dict(source_overrides or {})
+            overrides[spec.logical_path] = spec.mutated_source
+            override_hashes = _source_override_hashes(overrides)
+            try:
+                _copy_private_tree(source_root, tree, overrides)
+            except (OSError, ValueError) as error:
+                results.append(MutationResult(
+                    spec.mutation_id,
+                    spec.subject,
+                    spec.mutation_kind,
+                    spec.patch_sha256,
+                    None,
+                    None,
+                    (),
+                    "private_tree_failure",
+                ))
+                reason = reason or "private_tree_failure"
+                continue
+            if not source_overrides and _source_hash(source_root, spec.logical_path) != expected_original:
+                results.append(MutationResult(
+                    spec.mutation_id,
+                    spec.subject,
+                    spec.mutation_kind,
+                    spec.patch_sha256,
+                    None,
+                    None,
+                    (),
+                    "source_snapshot_changed",
+                ))
+                reason = reason or "source_snapshot_changed"
+                continue
             build_argv = _command_argv(build_command) if build_command else None
             if build_command and build_argv is None:
                 results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, None, None, (), "invalid_build_command"))
@@ -369,6 +572,10 @@ def run_mutations(
                         "original_sha256": spec.original_sha256,
                         "mutated_sha256": spec.mutated_sha256,
                         "phase": "build",
+                        "source_snapshot_sha256": digest_payload(override_hashes),
+                        "production_patch_sha256": production_patch_sha256,
+                        "test_patch_sha256": test_patch_sha256,
+                        "shared_config_patch_sha256": shared_config_patch_sha256,
                     },
                 )
                 if build_plan is None:
@@ -393,6 +600,10 @@ def run_mutations(
                     "original_sha256": spec.original_sha256,
                     "mutated_sha256": spec.mutated_sha256,
                     "test_selection": "\0".join(test_selection),
+                    "source_snapshot_sha256": digest_payload(override_hashes),
+                    "production_patch_sha256": production_patch_sha256,
+                    "test_patch_sha256": test_patch_sha256,
+                    "shared_config_patch_sha256": shared_config_patch_sha256,
                 },
             )
             if plan is None:
@@ -405,18 +616,53 @@ def run_mutations(
                 results.append(MutationResult(
                     spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
                     None, None, (), "not_approved", plan.approval_digest,
+                    build_plan.approval_digest if build_plan is not None else "",
                 ))
                 reason = reason or "not_approved"
+                continue
+            if not _verify_source_overrides(tree, override_hashes):
+                results.append(MutationResult(
+                    spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
+                    None, None, (), "source_snapshot_changed", plan.approval_digest,
+                    build_plan.approval_digest if build_plan is not None else "",
+                ))
+                reason = reason or "source_snapshot_changed"
                 continue
             if build_plan is not None:
                 build_completed, build_execution_error = execute_approved_plan(build_plan, build_approval)
                 if build_completed is None or build_completed.returncode != 0:
-                    results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, False, None, (), "invalid_mutant" if build_completed is not None else build_execution_error or "build_failed"))
-                    reason = reason or ("invalid_mutant" if build_completed is not None else build_execution_error or "build_failed")
+                    build_reason = (
+                        "build_timeout" if build_completed is not None and build_completed.returncode == 124
+                        else "invalid_mutant" if build_completed is not None
+                        else build_execution_error or "build_failed"
+                    )
+                    results.append(MutationResult(
+                        spec.mutation_id, spec.subject, spec.mutation_kind,
+                        spec.patch_sha256,
+                        None if build_reason == "build_timeout" else False,
+                        None,
+                        (),
+                        build_reason,
+                        plan.approval_digest,
+                        build_plan.approval_digest if build_plan is not None else "",
+                    ))
+                    reason = reason or build_reason
                     continue
+            if not _verify_source_overrides(tree, override_hashes):
+                results.append(MutationResult(
+                    spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
+                    None, None, (), "source_snapshot_changed", plan.approval_digest,
+                    build_plan.approval_digest if build_plan is not None else "",
+                ))
+                reason = reason or "source_snapshot_changed"
+                continue
             completed, execution_error = execute_approved_plan(plan, approval)
             if completed is None:
-                results.append(MutationResult(spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256, None, None, (), execution_error or "execution_failed", plan.approval_digest))
+                results.append(MutationResult(
+                    spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
+                    None, None, (), execution_error or "execution_failed", plan.approval_digest,
+                    build_plan.approval_digest if build_plan is not None else "",
+                ))
                 reason = reason or execution_error or "execution_failed"
                 continue
             output = redact_sensitive_text(((completed.stdout or "") + (completed.stderr or ""))[:output_limit])
@@ -425,14 +671,21 @@ def run_mutations(
             # the mutant failed to build. Build failures are excluded during
             # generation rather than being counted as killed mutants.
             build_valid = True
-            killed = completed.returncode != 0
+            timed_out = completed.returncode == 124
+            killed = None if timed_out else completed.returncode != 0
             results.append(MutationResult(
                 spec.mutation_id, spec.subject, spec.mutation_kind, spec.patch_sha256,
                 build_valid, killed, _killing_tests(output, test_selection) if killed else (),
-                None if completed.returncode == 0 else "mutant_killed", plan.approval_digest,
+                "test_timeout" if timed_out else None if completed.returncode == 0 else "mutant_killed", plan.approval_digest,
+                build_plan.approval_digest if build_plan is not None else "",
             ))
             _ = bounded_fingerprint(output)
-    status = "complete" if all(item.reason_code != "not_approved" for item in results) and not reason else "planned" if reason == "not_approved" else "partial"
+    status = (
+        "complete" if all(item.reason_code != "not_approved" for item in results) and not reason
+        else "planned" if reason == "not_approved"
+        else "unavailable" if reason == "command_not_configured"
+        else "partial"
+    )
     mutation_results = tuple(results)
     return MutationRun(
         status,

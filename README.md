@@ -125,8 +125,9 @@ They never promote syntax matches to findings:
   Terraform, YAML, Kotlin, Swift, Shell, PowerShell, HTML, Markdown, XML,
   SVG, and configuration files.
 - Test-integrity inventories test artefacts, production subjects, and their
-  evidence-backed relations. It emits static candidates, an approval-bound
-  base/head matrix, targeted mutation evidence, and inert proof-test plans.
+  evidence-backed relations. It emits static candidates, separate usefulness
+  dimensions, an approval-bound base/head matrix, targeted mutation evidence,
+  and inert proof-test plans.
 - Complexity analysis measures selected functions with repository policy first
   and the skill-local Lizard 1.24.0 fallback second. Complexity is a review
   signal, not an automatic defect or authorship detector.
@@ -184,6 +185,32 @@ See `reference/anti-slop-rule-contract.md`,
 `reference/test-integrity-rule-contract.md`, and
 `reference/complexity-policy.md` for rule boundaries and
 `reference/review-context-schema.json` for backend-aware coverage.
+
+Static test-integrity matches are candidates only. A changed test is not a
+removal candidate without independent contract, reachability, matrix, and
+mutation evidence. Dynamic tests, mutations, and proof tests run only from an
+exact approved plan in a private tree. Generate a focused proof-test plan with:
+
+New test files and test-only helpers or fixtures are opt-in. `GOV-TESTS-010`
+reports an unapproved addition unless the review intent explicitly requests or
+approves creation, or the path matches
+`review_options.test_integrity_approved_new_paths`. Generic implementation,
+fix, test, or verification requests do not authorise a new test file. Existing
+tests and direct browser/runtime checks are preferred. Test changes must check
+observable behaviour rather than source strings, implementation shapes, or the
+existence of tests.
+
+```bash
+python3 scripts/prove_candidate.py \
+  --context <context.json> \
+  --candidate-id <candidate-id> \
+  --test-patch <patch-file> \
+  --format json
+```
+
+The proof patch is never written to the reviewed checkout. A proof test needs
+an independent oracle and a known-good or mutant control. Complexity is a
+review signal, and there is no LLM-authorship check.
 
 Static/local review is the default. Dissect does not probe public applications,
 bypass authentication, create production accounts, retrieve private data,
@@ -246,6 +273,8 @@ Optional structural analysis uses the safe limits below unless overridden.
 `paths.generated` is the only generated-file policy for comment-slop and
 anti-slop. Unsupported files are filtered before any analyser read, and the
 full context worker has an external hard timeout.
+The Python literal-`getattr` rule is experimental and remains disabled unless
+`review_options.anti_slop_python_getattr` is explicitly enabled after review.
 
 ```json
 {

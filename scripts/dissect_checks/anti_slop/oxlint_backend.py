@@ -25,6 +25,7 @@ BACKEND_ID = "oxlint-js-ts"
 LANGUAGES = ("javascript", "typescript")
 RULE_PREFIXES = ("anti-slop/", "anti-slop-effect/")
 MIN_NODE = (22, 18)
+OXLINT_VERSION = "1.78.0"
 MAX_FILE_BYTES = 10 * 1024 * 1024
 VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor" / "anti-slop"
 
@@ -68,8 +69,15 @@ def preflight(vendor_dir: Path) -> str | None:
     version = _node_version(node)
     if version is None or version[:2] < MIN_NODE:
         return "node_version_unsupported"
-    if not _oxlint_path(vendor_dir).is_file():
+    binary = _oxlint_path(vendor_dir)
+    if not binary.is_file():
         return "deps_missing"
+    try:
+        tool = subprocess.run([str(binary), "--version"], capture_output=True, text=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return "tool_version_unavailable"
+    if tool.returncode != 0 or OXLINT_VERSION not in f"{tool.stdout}\n{tool.stderr}":
+        return "tool_version_unsupported"
     return None
 
 
@@ -94,9 +102,76 @@ def filter_files(paths: Iterable[str | Path], target_root: Path, config: dict[st
 
 def _has_effect_dependency(data: Any) -> bool:
     return isinstance(data, dict) and any(
-        isinstance(data.get(section), dict) and "effect" in data[section]
+        isinstance(data.get(section), dict)
+        and any(
+            str(name).lower() == "effect" or str(name).lower().startswith("@effect/")
+            for name in data[section]
+        )
         for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
     )
+
+
+def _physical_snapshot_manifest(
+    target: AnalysisTarget,
+    max_file_bytes: int,
+    *,
+    budget: AnalysisBudget | None,
+    cache: dict[tuple[str, str, str], tuple[str, str, str, bool] | None],
+) -> tuple[str, str, str, bool]:
+    """Resolve a manifest beside an explicitly materialised target tree."""
+    try:
+        physical = target.physical_path.resolve(strict=True)
+    except OSError:
+        return "", "", "", False
+    logical_parts = Path(target.logical_path).parts
+    snapshot_root = physical
+    for _ in logical_parts:
+        snapshot_root = snapshot_root.parent
+    directory = physical.parent
+    while directory == snapshot_root or snapshot_root in directory.parents:
+        manifest = directory / "package.json"
+        manifest_path = manifest.relative_to(snapshot_root).as_posix()
+        cache_key = ("physical:" + target.source_kind, str(snapshot_root), manifest_path)
+        if cache_key in cache:
+            value = cache[cache_key]
+            if value is not None:
+                return value
+        try:
+            size = manifest.stat().st_size
+        except OSError:
+            cache[cache_key] = None
+            if directory == snapshot_root:
+                break
+            directory = directory.parent
+            continue
+        if size > max_file_bytes:
+            value = (manifest_path, target.source_kind, "", False)
+            cache[cache_key] = value
+            return value
+        try:
+            if budget is not None:
+                budget.claim_source(size)
+            with manifest.open("rb") as handle:
+                data = handle.read(size)
+            if len(data) != size or manifest.stat().st_size != size:
+                value = (manifest_path, target.source_kind, "", False)
+                cache[cache_key] = value
+                return value
+            digest = hashlib.sha256(data).hexdigest()
+            parsed = json.loads(data.decode("utf-8"))
+        except AnalysisBudgetExceeded:
+            raise
+        except (OSError, UnicodeError, ValueError):
+            value = (manifest_path, target.source_kind, "", False)
+            cache[cache_key] = value
+            return value
+        if not isinstance(parsed, dict):
+            value = (manifest_path, target.source_kind, digest, False)
+        else:
+            value = (manifest_path, target.source_kind, digest, _has_effect_dependency(parsed))
+        cache[cache_key] = value
+        return value
+    return "", "", "", False
 
 
 def _manifest_metadata(
@@ -109,6 +184,20 @@ def _manifest_metadata(
 ) -> tuple[str, str, str, bool]:
     """Resolve the nearest manifest from the same current source snapshot."""
     metadata_cache = cache if cache is not None else {}
+    if target.physical_snapshot:
+        try:
+            physical = target.physical_path.resolve()
+            physical.relative_to(root.resolve())
+            use_physical_snapshot = target.data is not None
+        except (OSError, ValueError):
+            use_physical_snapshot = True
+        if use_physical_snapshot:
+            return _physical_snapshot_manifest(
+                target,
+                max_file_bytes,
+                budget=budget,
+                cache=metadata_cache,
+            )
     if target.source_kind not in {"working-tree", "untracked"}:
         if target.manifest_path and target.manifest_sha256:
             return target.manifest_path, target.manifest_source_layer, target.manifest_sha256, target.config_variant == "effect"
@@ -125,42 +214,56 @@ def _manifest_metadata(
                     break
                 directory = directory.parent
                 continue
-            reference = (
-                f":{target.source_kind.split(':', 1)[-1] if target.source_kind.startswith('index:') else 0}:{manifest_path}"
-                if target.source_kind.startswith("index")
-                else f"{revision}:{manifest_path}"
-            )
+            if target.source_kind.startswith("index"):
+                stage = _index_stage(target)
+                reference = f":{stage}:{manifest_path}"
+            else:
+                reference = f"{revision}:{manifest_path}"
             try:
                 size_result = subprocess.run(["git", "cat-file", "-s", reference], cwd=root, capture_output=True, text=True, check=False)
                 size = int(size_result.stdout.strip()) if size_result.returncode == 0 else -1
-            except OSError:
+            except (OSError, subprocess.SubprocessError, ValueError):
                 size = -1
-            if size < 0 or size > max_file_bytes:
+            if size < 0:
                 metadata_cache[cache_key] = None
                 if directory == Path("."):
                     break
                 directory = directory.parent
                 continue
+            if size > max_file_bytes:
+                # A nearest manifest which cannot be bounded is still the
+                # applicable manifest. Do not inherit a parent package's
+                # Effect configuration and silently analyse with the wrong
+                # rule pack.
+                metadata = (manifest_path, target.source_kind, "", False)
+                metadata_cache[cache_key] = metadata
+                return metadata
             if budget is not None:
-                budget.claim_file()
-                budget.claim_bytes(size)
+                budget.claim_source(size)
             try:
                 result = subprocess.run(
                     ["git", "show", "--format=", reference],
                     cwd=root,
                     capture_output=True,
                     check=False,
+                    timeout=5,
                 )
                 data = result.stdout if result.returncode == 0 and len(result.stdout) == size else b""
-            except OSError:
+            except (OSError, subprocess.SubprocessError):
                 data = b""
-            if data and len(data) <= max_file_bytes:
+            if data is not None and len(data) <= max_file_bytes:
+                digest = hashlib.sha256(data).hexdigest()
                 try:
                     value = json.loads(data.decode("utf-8"))
                 except (UnicodeError, ValueError):
-                    value = None
+                    # A nearest manifest still owns the source snapshot even
+                    # when it is malformed.  Do not silently inherit a
+                    # parent package's Effect configuration.
+                    metadata = (manifest_path, target.source_kind, digest, False)
+                    metadata_cache[cache_key] = metadata
+                    return metadata
                 if isinstance(value, dict):
-                    metadata = (manifest_path, target.source_kind, hashlib.sha256(data).hexdigest(), _has_effect_dependency(value))
+                    metadata = (manifest_path, target.source_kind, digest, _has_effect_dependency(value))
                     metadata_cache[cache_key] = metadata
                     return metadata
             metadata_cache[cache_key] = None
@@ -194,21 +297,23 @@ def _manifest_metadata(
                 data = b""
             else:
                 if budget is not None:
-                    budget.claim_file()
-                    budget.claim_bytes(size)
+                    budget.claim_source(size)
                 with manifest.open("rb") as handle:
                     data = handle.read(size)
                 if len(data) != size or manifest.stat().st_size != size:
                     data = b""
         except (OSError, ValueError):
             data = b""
-        if data and len(data) <= max_file_bytes:
+        if data is not None and len(data) <= max_file_bytes:
+            digest = hashlib.sha256(data).hexdigest()
             try:
                 value = json.loads(data.decode("utf-8"))
             except (UnicodeError, ValueError):
-                value = None
+                metadata = (logical, target.source_kind, digest, False)
+                metadata_cache[cache_key] = metadata
+                return metadata
             if isinstance(value, dict):
-                metadata = (logical, target.source_kind, hashlib.sha256(data).hexdigest(), _has_effect_dependency(value))
+                metadata = (logical, target.source_kind, digest, _has_effect_dependency(value))
                 metadata_cache[cache_key] = metadata
                 return metadata
         metadata_cache[cache_key] = None
@@ -216,6 +321,27 @@ def _manifest_metadata(
             break
         directory = directory.parent
     return "", "", "", False
+
+
+def _index_stage(target: AnalysisTarget) -> int:
+    """Return the Git index stage encoded by a snapshot target.
+
+    Diff entries normally use stage zero.  Accept the explicit ``index:N``
+    form and a numeric revision as well so callers cannot accidentally read
+    the current HEAD manifest for an index target.
+    """
+    value = ""
+    if ":" in target.source_kind:
+        value = target.source_kind.rsplit(":", 1)[-1]
+    elif target.revision.startswith(":"):
+        value = target.revision[1:].split(":", 1)[0]
+    elif target.revision.isdigit():
+        value = target.revision
+    try:
+        stage = int(value or "0")
+    except ValueError:
+        stage = 0
+    return stage if 0 <= stage <= 3 else 0
 
 
 def enrich_targets(
@@ -237,9 +363,22 @@ def enrich_targets(
                 root, target, max_file_bytes, budget=budget, cache=cache,
             )
         except AnalysisBudgetExceeded:
-            # The source loader below will record the terminal budget state
-            # for this target. Keep the target on the normal coverage path.
-            output.append(target)
+            # A budget failure while resolving the variant is evidence that
+            # this target was not analysed with a known rule configuration.
+            # Do not silently fall back to the generic pack.
+            output.append(replace(target, config_variant="unavailable"))
+            continue
+        if path and not digest:
+            # A nearest manifest exists but is too large or unavailable. It
+            # still owns the target's configuration; inheriting a parent or
+            # generic pack would mix source snapshots.
+            output.append(replace(
+                target,
+                config_variant="unavailable",
+                manifest_path=path,
+                manifest_source_layer=layer,
+                manifest_sha256=digest,
+            ))
             continue
         output.append(replace(
             target,
@@ -364,14 +503,27 @@ def _diagnostic_location(diagnostic: dict[str, Any]) -> tuple[int, int]:
 
 
 def _is_parser_diagnostic(diagnostic: dict[str, Any]) -> bool:
-    code = str(diagnostic.get("code", diagnostic.get("rule_id", diagnostic.get("ruleId", "")))).lower()
+    raw_code = diagnostic.get("code", diagnostic.get("rule_id", diagnostic.get("ruleId", "")))
+    code = str(raw_code).lower()
     category = str(diagnostic.get("category", diagnostic.get("severity", ""))).lower()
     message = str(diagnostic.get("message", "")).lower()
+    # Oxlint's parser diagnostics intentionally have no rule code.  They use
+    # messages such as "Unexpected token" and "Expected `}` but found `EOF`".
+    # Filtering only by anti-slop rule IDs would otherwise turn malformed
+    # source into a false complete result.
+    has_known_rule = bool(_canonical_rule_id(raw_code))
+    parser_message = bool(re.search(
+        r"\b(?:unexpected\s+(?:token|character|end)|expected\b.*\b(?:found|eof|statement)|"
+        r"unterminated\b|missing\s+['`\"]|invalid\s+(?:character|syntax)|"
+        r"parse(?:r)?\s+error|syntax\s+error)\b",
+        message,
+        re.I,
+    ))
     return (
         code.startswith(("parse", "syntax", "parser"))
         or code in {"e_parse", "e-syntax", "oxlint/parse-error"}
-        or "parse error" in message
-        or "syntax error" in message
+        or (not has_known_rule and parser_message)
+        or (not has_known_rule and category == "error" and not code and bool(diagnostic.get("labels")))
         or category in {"parse", "parser", "syntax"}
     )
 
@@ -392,7 +544,7 @@ def parse_diagnostics_with_errors(stdout: str, stderr: str = "") -> tuple[list[d
         if _is_parser_diagnostic(diagnostic):
             parser_errors.append({
                 "filename": str(diagnostic.get("filename", diagnostic.get("file", diagnostic.get("path", "")))),
-                "message": str(diagnostic.get("message", "Parser rejected the source."))[:240],
+                "message": redact_sensitive_text(str(diagnostic.get("message", "Parser rejected the source."))[:240]),
             })
             continue
         rule = _canonical_rule_id(diagnostic.get("code", diagnostic.get("rule_id", diagnostic.get("ruleId", diagnostic.get("rule")))))
@@ -405,6 +557,19 @@ def parse_diagnostics_with_errors(stdout: str, stderr: str = "") -> tuple[list[d
             "filename": str(diagnostic.get("filename", diagnostic.get("file", diagnostic.get("path", "")))),
             "line": line,
             "column": column,
+        })
+    # Some tool versions print a parser failure to stderr and leave an empty
+    # JSON diagnostics array.  Preserve that failure as target-wide evidence;
+    # the caller will conservatively mark the requested group incomplete.
+    if not parser_errors and not parsed and re.search(
+        r"\b(?:parse(?:r)?\s+error|syntax\s+error|unexpected\s+(?:token|character|end)|"
+        r"expected\b.*\b(?:found|eof))\b",
+        stderr or "",
+        re.I,
+    ):
+        parser_errors.append({
+            "filename": "",
+            "message": redact_sensitive_text((stderr or "Parser rejected the source.")[:240]),
         })
     return parsed, parser_errors
 
@@ -487,7 +652,7 @@ def diagnostics_from_tool(
             relpath,
             line,
             column,
-            str(diagnostic.get("message", "")),
+            redact_sensitive_text(str(diagnostic.get("message", ""))),
             metadata,
         ))
     return sorted(output, key=lambda item: (item.path, item.line, item.column, item.rule_id, item.message))
@@ -506,26 +671,41 @@ def _load_runnable_targets(
     applicable: Sequence[AnalysisTarget],
     budget: AnalysisBudget,
     max_file_bytes: int,
-) -> tuple[list[AnalysisTarget], int, str | None, str]:
+) -> tuple[list[AnalysisTarget], int, str | None, str, dict[str, str], list[dict[str, Any]]]:
     runnable: list[AnalysisTarget] = []
     skipped = 0
     first_reason: str | None = None
     first_detail = ""
-    for target in applicable:
+    parse_states: dict[str, str] = {}
+    parse_errors: list[dict[str, Any]] = []
+    for index, target in enumerate(applicable):
+        original_target = target.target if isinstance(target, LoadedAnalysisTarget) else target
+        raw_key = original_target.target_id
         try:
             loaded = target if isinstance(target, LoadedAnalysisTarget) else load_target(
                 root, target, budget, max_file_bytes=max_file_bytes,
             )
             runnable.append(loaded.target)
+            parse_states[loaded.target.target_id] = "not_run"
         except AnalysisBudgetExceeded as error:
             skipped += 1
             first_reason = first_reason or error.reason_code
             first_detail = first_detail or error.detail
+            parse_states[raw_key] = "failed"
+            parse_errors.append({"path": original_target.logical_path, "reason_code": error.reason_code, "detail": error.detail[:240]})
+            if error.reason_code in {"total_timeout", "max_files", "max_total_bytes"}:
+                for remaining in applicable[index + 1:]:
+                    remaining_target = remaining.target if isinstance(remaining, LoadedAnalysisTarget) else remaining
+                    parse_states[remaining_target.target_id] = "not_verified"
+                skipped += len(applicable) - index - 1
+                break
         except (OSError, ValueError, TypeError) as error:
             skipped += 1
             first_reason = first_reason or "read_failure"
             first_detail = first_detail or str(error)
-    return runnable, skipped, first_reason, first_detail
+            parse_states[raw_key] = "failed"
+            parse_errors.append({"path": original_target.logical_path, "reason_code": "read_failure", "detail": str(error)[:240]})
+    return runnable, skipped, first_reason, first_detail, parse_states, parse_errors
 
 
 def _analyse_variants(
@@ -575,6 +755,8 @@ def _analyse_variants(
             checked += completed_count
             for target in group[:completed_count]:
                 parse_states[_target_state_key(target)] = "complete"
+            for target in group[completed_count:]:
+                parse_states[_target_state_key(target)] = "not_verified"
             if error.partial_outputs:
                 try:
                     partial_items: list[dict[str, Any]] = []
@@ -587,6 +769,8 @@ def _analyse_variants(
         except (RunnerError, OSError, ValueError) as error:
             runner_reason = runner_reason or "runner_error"
             runner_detail = runner_detail or redact_sensitive_text(str(error)[:500])
+            for target in group:
+                parse_states[_target_state_key(target)] = "not_verified"
             break
     return diagnostics, checked, runner_reason, runner_detail, parse_states, parse_errors
 
@@ -629,15 +813,29 @@ def analyse(
             BACKEND_ID, "structural", LANGUAGES, "not_applicable",
             0, 0, 0, [], None, "No applicable JavaScript or TypeScript files.",
         )
-    reason = preflight(vendor_dir)
+    unresolved_configuration = tuple(
+        target for target in applicable
+        if (target.target if isinstance(target, LoadedAnalysisTarget) else target).config_variant == "unavailable"
+    )
+    runnable_configuration = tuple(
+        target for target in applicable
+        if (target.target if isinstance(target, LoadedAnalysisTarget) else target).config_variant != "unavailable"
+    )
+    reason = preflight(vendor_dir) if runnable_configuration else None
     if reason is not None:
+        state = {
+            (target.target if isinstance(target, LoadedAnalysisTarget) else target).target_id: "not_verified"
+            for target in applicable
+        }
         return BackendResult(
             BACKEND_ID, "structural", LANGUAGES, "unavailable", len(applicable), 0,
             len(applicable), [], reason, "Skill-local Oxlint runtime is unavailable.",
+            state,
+            [{"path": (target.target if isinstance(target, LoadedAnalysisTarget) else target).logical_path, "reason_code": reason} for target in applicable[:3]],
         )
 
-    runnable, skipped, first_skip_reason, first_skip_detail = _load_runnable_targets(
-        root, applicable, budget, max_file_bytes,
+    runnable, skipped, first_skip_reason, first_skip_detail, load_parse_states, load_parse_errors = _load_runnable_targets(
+        root, runnable_configuration, budget, max_file_bytes,
     )
 
     diagnostics, checked, runner_reason, runner_detail, parse_states, parse_errors = _analyse_variants(
@@ -648,6 +846,20 @@ def analyse(
         max_files=max_files,
         max_argument_bytes=max_argument_bytes,
     )
+    for key, value in load_parse_states.items():
+        parse_states.setdefault(key, value)
+    parse_errors = [*load_parse_errors, *parse_errors]
+    for target in unresolved_configuration:
+        base_target = target.target if isinstance(target, LoadedAnalysisTarget) else target
+        parse_states[base_target.target_id] = "failed"
+        parse_errors.append({
+            "path": base_target.logical_path,
+            "reason_code": "manifest_unavailable",
+        })
+    if unresolved_configuration:
+        skipped += len(unresolved_configuration)
+        first_skip_reason = first_skip_reason or "manifest_unavailable"
+        first_skip_detail = first_skip_detail or "The nearest package manifest was unavailable or exceeded the source limit."
 
     diagnostics.sort(key=lambda item: (item.path, item.line, item.column, item.rule_id, item.message))
     total_skipped = len(applicable) - checked

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import ast
 import difflib
+import fnmatch
 import io
 import re
 from pathlib import Path
@@ -12,16 +13,19 @@ import tokenize
 from typing import Any, Iterable, Mapping, Sequence
 
 from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded
+from dissect_checks.redaction import redact_payload
 from review_ledger import blank_candidate, validate_candidate
 from .inventory import InventoryResult
 from .model import TestArtifact, TestChange, TestSubject, digest_payload
 
 
 RULE_PREFIX = "GOV-TESTS-"
-RULES = tuple(f"{RULE_PREFIX}{index:03d}" for index in range(1, 10))
-DEFAULT_ENABLED_RULES = frozenset(f"{RULE_PREFIX}{index:03d}" for index in range(1, 7))
+RULES = tuple(f"{RULE_PREFIX}{index:03d}" for index in range(1, 11))
+DEFAULT_ENABLED_RULES = frozenset(f"{RULE_PREFIX}{index:03d}" for index in range(1, 7)) | {"GOV-TESTS-010"}
+NEW_TEST_ARTIFACT_ROLES = frozenset({"test", "test helper", "fixture", "snapshot or golden file"})
 MAX_CANDIDATES = 500
-MAX_DIFF_LINES = 20_000
+MAX_DIFF_LINES = 5_000
+MAX_DIFF_COMPARISONS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,18 @@ class StaticAnalysisResult:
     candidates: tuple[dict[str, Any], ...]
     evidence: tuple[Mapping[str, Any], ...]
     reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"complete", "partial", "not_applicable", "failed"}:
+            raise ValueError("invalid static test-integrity status")
+        if min(self.applicable_files, self.checked_files, self.skipped_files) < 0:
+            raise ValueError("static test-integrity counts must not be negative")
+        if self.checked_files > self.applicable_files or self.checked_files + self.skipped_files > self.applicable_files:
+            raise ValueError("static test-integrity counts exceed applicable files")
+        if self.status == "complete" and self.checked_files != self.applicable_files:
+            raise ValueError("complete static test-integrity results require every file to be checked")
+        if self.status == "not_applicable" and any((self.applicable_files, self.checked_files, self.skipped_files)):
+            raise ValueError("not_applicable static results cannot contain files")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +68,12 @@ def _line(text: str, offset: int) -> int:
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _source_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 def _artifact_for(path: str, artifacts: Sequence[TestArtifact]) -> TestArtifact | None:
@@ -84,6 +106,7 @@ def _candidate(
         "column": column,
         "source_kind": source_kind,
         "content_sha256": content_sha256,
+        "message": message,
         "discriminator": discriminator,
     }
     candidate_id = digest_payload(identity, prefix="candidate-")
@@ -102,6 +125,7 @@ def _candidate(
         "column": column,
         "source_layer": source_kind,
         "content_sha256": content_sha256,
+        "rule_discriminator": digest_payload({"message": message, "details": discriminator}),
         "analysis_level": "structural",
         "does_not_prove": ["test failure", "independent oracle", "focal reachability", "unique behavioural value"],
         "oracle_source": {
@@ -118,6 +142,7 @@ def _candidate(
         record["focal_subject"] = subject.qualified_name
     record.update(discriminator)
     candidate["supporting_evidence"] = [record]
+    candidate = redact_payload(candidate)
     errors = validate_candidate(candidate)
     if errors:
         raise ValueError("invalid test-integrity candidate: " + "; ".join(errors))
@@ -129,11 +154,17 @@ def _changed(path: str, changed_paths: set[str] | None) -> bool:
 
 
 def _disabled_matches(text: str, base: str = "") -> Iterable[tuple[int, int, str]]:
+    # Shell, YAML, Terraform, and Python use ``#`` comments. Ignore full
+    # comment lines so a note which mentions a disable marker is not treated as
+    # a runtime bypass.
+    text = re.sub(r"(?m)^[ \t]*#(?!\s*\[)[^\n]*", "", text)
+    base = re.sub(r"(?m)^[ \t]*#(?!\s*\[)[^\n]*", "", base)
     patterns = (
-        (r"\b(?:pytest\.mark\.(?:skip|xfail)|pytest\.skip|unittest\.skip|@(?:skip|ignore|disabled)|\b(?:TODO|todo|xfail|Ignore)\b)", "test was disabled or marked as incomplete"),
+        (r"\b(?:pytest\.mark\.(?:skip|skipif|xfail)|pytest\.skip|unittest\.skip(?:If|Unless)?|(?:test|it|describe)\.(?:skip|todo)|t\.Skip(?:f|Now)?|GTEST_SKIP\s*\(\)|#\s*\[\s*ignore\s*\]|@(?:skip|ignore|disabled|todo)|\[(?:Ignore|IgnoreIf)|Skip\s*=)", "test was disabled or marked as incomplete"),
         (r"continue-on-error\s*:\s*true", "CI test execution was made non-blocking"),
         (r"(?:\|\||&&)\s*true\b", "test failure is explicitly ignored"),
         (r"--passWithNoTests\b|--allow-no-tests\b", "zero collected tests can be accepted"),
+        (r"(?:--ignore(?:[-=]|\s+)|testPathIgnorePatterns\s*[:=])[^\n]*?(?:test|spec|__tests__)", "test discovery was changed to exclude a test path"),
         (r"(?:fail-under|coverageThreshold|minimumCoverage)\s*[:=]\s*0(?:\.0+)?\b", "a test or coverage threshold was reduced to zero"),
     )
     changed_lines = _changed_head_lines(base, text) if base else None
@@ -141,7 +172,17 @@ def _disabled_matches(text: str, base: str = "") -> Iterable[tuple[int, int, str
         for match in re.finditer(pattern, text, re.I):
             if changed_lines is not None and _line(text, match.start()) not in changed_lines:
                 continue
-            yield _line(text, match.start()), match.start(), message
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            yield _line(text, match.start()), match.start() - line_start, message
+    if base:
+        threshold_pattern = re.compile(
+            r"(?im)\b(?:fail-under|coverageThreshold|minimumCoverage)\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)"
+        )
+        old_values = [float(match.group(1)) for match in threshold_pattern.finditer(base)]
+        for match in threshold_pattern.finditer(text):
+            if old_values and float(match.group(1)) < min(old_values):
+                line_start = text.rfind("\n", 0, match.start()) + 1
+                yield _line(text, match.start()), match.start() - line_start, "a test or coverage threshold was reduced"
 
 
 def _test_declarations(path: str, text: str) -> set[str]:
@@ -179,6 +220,74 @@ def _deleted_test_matches(path: str, base: str, head: str) -> Iterable[tuple[int
         yield line, f"test declaration {name!r} was removed from the head source"
 
 
+def _python_parameter_cases(text: str) -> dict[str, tuple[int, int]]:
+    """Return literal pytest parameter counts keyed by test function."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return {}
+    result: dict[str, tuple[int, int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Attribute):
+                continue
+            if decorator.func.attr != "parametrize" or len(decorator.args) < 2:
+                continue
+            values = decorator.args[1]
+            if isinstance(values, (ast.List, ast.Tuple, ast.Set)):
+                result[node.name] = (len(values.elts), decorator.lineno)
+    return result
+
+
+def _reduced_parameter_cases(path: str, base: str, head: str) -> Iterable[tuple[int, str]]:
+    if Path(path).suffix.lower() not in {".py", ".pyi"} or not base or not head:
+        return
+    before = _python_parameter_cases(base)
+    after = _python_parameter_cases(head)
+    for name in sorted(set(before) & set(after)):
+        old_count, _old_line = before[name]
+        new_count, new_line = after[name]
+        if new_count < old_count:
+            yield new_line, f"parameter cases for test {name!r} were reduced"
+
+
+_TEST_COMMAND_RE = re.compile(
+    r"\b(?:pytest|unittest|jest|vitest|mocha|go\s+test|cargo\s+test|dotnet\s+test|"
+    r"npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+test)\b",
+    re.I,
+)
+_TEST_PATH_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?:tests?|specs?|testdata|__tests__)/[A-Za-z0-9_./-]+|"
+    r"(?:[A-Za-z0-9_.-]+_test\.(?:py|go|rs|js|jsx|ts|tsx|java|cs|c|cc|cpp))",
+    re.I,
+)
+
+
+def _test_command_lines(text: str) -> list[tuple[int, str]]:
+    return [
+        (line_number, line)
+        for line_number, line in enumerate(text.splitlines(), 1)
+        if _TEST_COMMAND_RE.search(line) and not line.lstrip().startswith(("#", "//", "/*", "*"))
+    ]
+
+
+def _excluded_test_paths(base: str, head: str) -> Iterable[tuple[int, str]]:
+    """Find changed test commands which no longer select an old test path."""
+    old_commands = _test_command_lines(base)
+    new_commands = _test_command_lines(head)
+    if not old_commands or not new_commands:
+        return
+    old_paths = {token.lower() for _line_number, line in old_commands for token in _TEST_PATH_TOKEN_RE.findall(line)}
+    new_text = "\n".join(line for _line_number, line in new_commands).lower()
+    missing = sorted(path for path in old_paths if path not in new_text)
+    if not missing:
+        return
+    for line_number, _line_text in new_commands:
+        yield line_number, f"test command no longer selects prior test path(s): {', '.join(missing[:3])}"
+
+
 def _invalid_fixture_matches(path: str, text: str) -> Iterable[tuple[int, str]]:
     """Identify explicit parser-only evidence without guessing from names alone."""
     lower_path = path.lower().replace("\\", "/")
@@ -206,7 +315,11 @@ def _changed_head_lines(base: str, head: str) -> set[int]:
         return set()
     # Static checks are candidates, so a very large file is allowed to be
     # incomplete rather than making an unbounded similarity computation.
-    if len(base_lines) > MAX_DIFF_LINES or len(head_lines) > MAX_DIFF_LINES:
+    if (
+        len(base_lines) > MAX_DIFF_LINES
+        or len(head_lines) > MAX_DIFF_LINES
+        or len(base_lines) * len(head_lines) > MAX_DIFF_COMPARISONS
+    ):
         return set(range(1, len(head_lines) + 1))
     changed: set[int] = set()
     matcher = difflib.SequenceMatcher(a=base_lines, b=head_lines, autojunk=False)
@@ -217,14 +330,23 @@ def _changed_head_lines(base: str, head: str) -> set[int]:
 
 
 def _observable_line(line: str) -> bool:
-    return bool(re.search(r"\b(?:assert|expect|raises|snapshot|EXPECT_|ASSERT_|check_call|check_output)\b|\.to(?:Equal|StrictEqual|Be|HaveLength|BeTruthy|BeDefined)\s*\(", line))
+    return bool(re.search(
+        r"\b(?:assert|expect|raises|snapshot|EXPECT_|ASSERT_|check_call|check_output|"
+        r"assert[A-Z][A-Za-z0-9_]*|fail|subTest)\b|"
+        r"\.to(?:Equal|StrictEqual|Be|HaveLength|BeTruthy|BeDefined)\s*\(",
+        line,
+    ))
 
 
 def _assertion_weakening(base: str, head: str) -> Iterable[tuple[int, str]]:
     """Compare changed syntax regions, rather than pairing source line numbers."""
     base_lines = base.splitlines()
     head_lines = head.splitlines()
-    if len(base_lines) > MAX_DIFF_LINES or len(head_lines) > MAX_DIFF_LINES:
+    if (
+        len(base_lines) > MAX_DIFF_LINES
+        or len(head_lines) > MAX_DIFF_LINES
+        or len(base_lines) * len(head_lines) > MAX_DIFF_COMPARISONS
+    ):
         # A full similarity map is quadratic in the worst case. Large files
         # remain eligible for the other bounded checks, but this comparison is
         # deliberately left unverified rather than spending the whole budget.
@@ -252,11 +374,53 @@ def _assertion_weakening(base: str, head: str) -> Iterable[tuple[int, str]]:
             message = "an expected exception was broadened to Exception"
         elif re.search(r"assert\s+[^#]+\bin\s+\{", before_text) and re.search(r"assert\s+[^#]+\bin\s+\(", after_text):
             message = "an accepted value set was broadened"
-        elif tag == "delete" and any(_observable_line(item) for item in before_block):
+        else:
+            tolerance = re.compile(r"(?:<=|abs\s*=|tolerance\s*=|atol\s*=)\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+            old_tolerances = [float(value) for value in tolerance.findall(before_text)]
+            new_tolerances = [float(value) for value in tolerance.findall(after_text)]
+            if old_tolerances and new_tolerances and max(new_tolerances) > max(old_tolerances):
+                message = "numeric assertion tolerance was broadened"
+            else:
+                old_sets = re.findall(r"\bin\s*[\[{]([^\]}]*)[\]}]", before_text)
+                new_sets = re.findall(r"\bin\s*[\[{]([^\]}]*)[\]}]", after_text)
+                if old_sets and new_sets:
+                    old_count = max(len(item.split(",")) for item in old_sets)
+                    new_count = max(len(item.split(",")) for item in new_sets)
+                    if new_count > old_count:
+                        message = "an accepted value set was broadened"
+        if message is None and tag == "delete" and any(_observable_line(item) for item in before_block):
             message = "an observable test check was removed"
         if message is not None and (line, message) not in seen:
             seen.add((line, message))
             yield line, message
+
+
+def _assertion_moved_behind_branch(base: str, head: str) -> Iterable[tuple[int, str]]:
+    """Find an existing assertion which became conditional in the head."""
+    base_lines = base.splitlines()
+    head_lines = head.splitlines()
+    if not base_lines or not head_lines:
+        return
+    base_assertions = {
+        line.strip()
+        for line in base_lines
+        if _observable_line(line) and re.search(r"\b(?:assert|expect)\b", line, re.I)
+    }
+    if not base_assertions:
+        return
+    for index, line in enumerate(head_lines):
+        stripped = line.strip()
+        if stripped not in base_assertions:
+            continue
+        if index == 0:
+            continue
+        indentation = len(line) - len(line.lstrip())
+        previous = next(
+            (head_lines[position].strip() for position in range(index - 1, -1, -1) if head_lines[position].strip()),
+            "",
+        )
+        if indentation > 0 and re.match(r"(?:if|unless|when)\b", previous, re.I):
+            yield index + 1, "an existing assertion was moved behind a conditional branch"
 
 
 def _circular_oracles(text: str) -> Iterable[tuple[int, str, str]]:
@@ -285,6 +449,95 @@ def _derived_oracles(text: str) -> Iterable[tuple[int, str, str]]:
             yield _line(text, match.start()), "the expected value is generated by the focal implementation", subject
 
 
+def _python_circular_oracles(text: str) -> Iterable[tuple[int, str, str]]:
+    """Handle multiline Python call comparisons without textual pairing."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1 or not isinstance(node.ops[0], ast.Eq) or len(node.comparators) != 1:
+            continue
+        left, right = node.left, node.comparators[0]
+        if not isinstance(left, ast.Call) or not isinstance(right, ast.Call):
+            continue
+        if ast.dump(left, include_attributes=False) != ast.dump(right, include_attributes=False):
+            continue
+        function = left.func.id if isinstance(left.func, ast.Name) else left.func.attr if isinstance(left.func, ast.Attribute) else "call"
+        yield node.lineno, "expected and actual values call production code symmetrically", function
+
+
+def _python_derived_oracles(text: str) -> Iterable[tuple[int, str, str]]:
+    """Find expected values assigned from a call and later asserted."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return
+    expected_names = {"expected", "expected_value", "golden", "want"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name) or not isinstance(node.value, ast.Call):
+            continue
+        if node.targets[0].id.lower() not in expected_names:
+            continue
+        function = node.value.func.id if isinstance(node.value.func, ast.Name) else node.value.func.attr if isinstance(node.value.func, ast.Attribute) else "call"
+        if any(
+            isinstance(candidate, ast.Assert)
+            and any(
+                isinstance(name, ast.Name) and name.id == node.targets[0].id
+                for name in ast.walk(candidate)
+            )
+            for candidate in ast.walk(tree)
+        ):
+            yield node.lineno, "the expected value is generated by the focal implementation", function
+
+
+def _implementation_oracle_matches(text: str) -> Iterable[tuple[int, str, str]]:
+    """Find assertions coupled to source text, implementation shape, or test-file existence."""
+    source_read = re.compile(
+        r"\b(?:inspect\.getsource|(?:[A-Za-z_$][\w$]*\.)?toString\s*\(|"
+        r"(?:Path|pathlib\.Path)\s*\([^\)\n]*\)\.read_text\s*\(|"
+        r"(?:fs\.)?readFileSync\s*\([^\)\n]*\))",
+        re.I,
+    )
+    assertion = re.compile(r"\b(?:assert|expect|assertThat)\b|\.to(?:Contain|Match|Include|Equal)\s*\(", re.I)
+    source_names: set[str] = set()
+    lines = text.splitlines()
+    for match in source_read.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        line_end = len(text) if line_end < 0 else line_end
+        line_text = text[line_start:line_end]
+        prefix = text[line_start:match.start()]
+        assignment = re.search(r"\b([A-Za-z_]\w*)\s*=\s*$", prefix)
+        if assignment:
+            source_names.add(assignment.group(1))
+        if assertion.search(line_text):
+            yield _line(text, match.start()), "the test asserts source text or generated implementation shape", "source_string_assertion"
+    if source_names:
+        for line_number, line_text in enumerate(lines, 1):
+            if assertion.search(line_text) and any(re.search(rf"\b{re.escape(name)}\b", line_text) for name in source_names):
+                yield line_number, "the test asserts source text or generated implementation shape", "source_string_assertion"
+    existence = re.compile(
+        r"\.(?:exists|is_file|is_dir)\s*\(|(?:fs\.)?existsSync\s*\(|\btest\s+-[fed]\b",
+        re.I,
+    )
+    for line_number, line_text in enumerate(lines, 1):
+        if line_text.lstrip().startswith(("#", "//", "/*", "*")):
+            continue
+        if assertion.search(line_text) and existence.search(line_text) and re.search(r"\b(?:tests?|specs?)\b", line_text, re.I):
+            yield line_number, "the test asserts that a test or spec file exists", "test_existence_assertion"
+
+
+def _snapshot_derived_oracle(text: str) -> Iterable[tuple[int, str, str]]:
+    """Flag a generated golden update unless it has an external oracle."""
+    header = "\n".join(text.splitlines()[:8])
+    if not re.search(r"(?:generated|regenerated|snapshot\s+update|golden\s+update)", header, re.I):
+        return
+    if re.search(r"(?:independent|reviewed)\s+(?:fixture|oracle|reference)", header, re.I):
+        return
+    yield 1, "snapshot or golden data appears to be generated by the changed implementation", "snapshot"
+
+
 def _mock_matches(text: str, subjects: Sequence[TestSubject]) -> Iterable[tuple[int, TestSubject, str]]:
     for subject in subjects:
         name = re.escape(subject.qualified_name.rsplit(".", 1)[-1])
@@ -293,7 +546,6 @@ def _mock_matches(text: str, subjects: Sequence[TestSubject]) -> Iterable[tuple[
             rf"\bpatch\s*\(\s*['\"][^'\"]*\b{name}\b",
             rf"\bmonkeypatch\.setattr\s*\([^\n;]*\b{name}\b",
             rf"\b(?:jest|vi|sinon)\.(?:spyOn|mock|stub)\s*\([^\n;]*\b{name}\b",
-            rf"\b(?:mock|stub|spy)\s*\([^\n;]*\b{name}\b",
         )
         for pattern in patterns:
             match = re.search(pattern, text, re.I)
@@ -306,12 +558,286 @@ def _tautologies(text: str) -> Iterable[tuple[int, str]]:
     patterns = (
         (r"\bassert\s+(?:True|False)\b", "the test asserts a constant boolean"),
         (r"\bassert\s+([A-Za-z_$][\w$]*)\s*==\s*\1\b", "the test compares a value with itself"),
+        (r"\bassert\s+([-+]?\d+(?:\.\d+)?)\s*={2,3}\s*\1\b", "the test asserts an identical constant expression"),
         (r"\bexpect\s*\(\s*([A-Za-z_$][\w$]*)\s*\)\s*\.to(?:Be|Equal)\s*\(\s*\1\s*\)", "the test compares a value with itself"),
-        (r"except\s+BaseException\s*:\s*(?:\n\s+[^\n]*)*\n\s*(?:pass|return)\b", "the test catches every exception without failing"),
+        (r"\bexpect\s*\(\s*((?:true|false|null|undefined))\s*\)\s*\.to(?:Be|Equal)\s*\(\s*\1\s*\)", "the test asserts an identical constant expression"),
+        (r"\bexpect\s*\(\s*([-+]?\d+(?:\.\d+)?)\s*\)\s*\.to(?:Be|Equal)\s*\(\s*\1\s*\)", "the test asserts an identical constant expression"),
+        (r"except\s+(?:BaseException|Exception)\s*:\s*(?:(?:\n\s+[^\n]*)*\n\s*|\s+)(?:pass|return)\b", "the test catches every exception without failing"),
     )
     for pattern, message in patterns:
         for match in re.finditer(pattern, text, re.I):
             yield _line(text, match.start()), message
+
+
+def _python_tautologies(text: str) -> Iterable[tuple[int, str]]:
+    """Find exact Python self-comparisons without treating call symmetry as tautology."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert) or not isinstance(node.test, ast.Compare):
+            continue
+        if len(node.test.ops) != 1 or len(node.test.comparators) != 1:
+            continue
+        left = node.test.left
+        right = node.test.comparators[0]
+        if not isinstance(left, (ast.Name, ast.Attribute, ast.Constant)) or not isinstance(right, (ast.Name, ast.Attribute, ast.Constant)):
+            continue
+        if ast.dump(left, include_attributes=False) == ast.dump(right, include_attributes=False):
+            yield node.lineno, "the test compares a value with itself"
+        elif isinstance(left, ast.Constant) and isinstance(right, ast.Constant) and left.value == right.value:
+            yield node.lineno, "the test compares identical constants"
+
+
+def _python_early_return_matches(text: str) -> Iterable[tuple[int, str]]:
+    """Find the high-confidence form of a test that exits before checking."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not re.match(r"(?:test|spec)[_$-]?", node.name, re.I) or not node.body:
+            continue
+        first = node.body[0]
+        if isinstance(first, ast.Return):
+            yield first.lineno, "the test returns before performing an observable verification"
+
+
+def _python_catch_all_matches(text: str) -> Iterable[tuple[int, str]]:
+    """Find test handlers which swallow every exception without failing."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not re.match(r"(?:test|spec)[_$-]?", function.name, re.I):
+            continue
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Try):
+                continue
+            for handler in node.handlers:
+                exception_name = (
+                    handler.type.id
+                    if isinstance(handler.type, ast.Name)
+                    else None
+                )
+                if handler.type is not None and exception_name not in {"Exception", "BaseException"}:
+                    continue
+                if not handler.body or any(
+                    isinstance(statement, (ast.Raise, ast.Assert))
+                    for statement in handler.body
+                ):
+                    continue
+                if all(isinstance(statement, (ast.Pass, ast.Return, ast.Expr)) for statement in handler.body):
+                    yield handler.lineno, "the test catches every exception without failing"
+
+
+def _has_quarantine_evidence(text: str, line: int) -> bool:
+    """Recognise a documented quarantine only with an issue and guard."""
+    lines = text.splitlines()
+    start = max(0, line - 3)
+    end = min(len(lines), line + 2)
+    nearby = "\n".join(lines[start:end]).lower()
+    return (
+        "quarantin" in nearby
+        and bool(re.search(r"\b(?:issue|ticket|bug|#\d+)\b", nearby))
+        and bool(re.search(r"\b(?:replacement|guard|regression|tracked)\b", nearby))
+    )
+
+
+def _has_explicit_contract_change(evidence: str | None) -> bool:
+    """Accept a caller-supplied intent only when it states the change."""
+    if not evidence:
+        return False
+    return bool(re.search(
+        r"\b(?:intentional(?:ly)?|approved|documented)\b.{0,80}\b(?:contract|behavio[u]?r|test|api)\b.{0,80}\b(?:change|changed|remove|removed|no longer supported|deprecated)\b|"
+        r"\b(?:contract|behavio[u]?r|api)\s+(?:change|changed)\b|"
+        r"\bno longer (?:support(?:s|ed)?|available|required)\b|\bbreaking\s+(?:api|contract|behavio[u]?r)\s+change\b",
+        evidence,
+        re.I | re.S,
+    ))
+
+
+_NEW_TEST_TARGET = r"(?:unit|integration|end[- ]to[- ]end|e2e|spec(?:ification)?|test(?:[- ]only)?|fixture|helper)(?:\s+test)?"
+_NEW_TEST_APPROVAL_PATTERNS = (
+    re.compile(
+        rf"\b(?:create|write|introduce|author)\s+(?:(?:a|an|one)\s+)?(?:new\s+|additional\s+)?{_NEW_TEST_TARGET}s?(?:\s+(?:file|files|helper|helpers|fixture|fixtures))?\b",
+        re.I,
+    ),
+    re.compile(
+        rf"\badd\s+(?:(?:a|an|one)\s+)?(?:new\s+|additional\s+)?{_NEW_TEST_TARGET}s?(?:\s+(?:file|files|helper|helpers|fixture|fixtures))?\b",
+        re.I,
+    ),
+    re.compile(
+        rf"\b(?:approve|approved|authori[sz]e|authorised|authorise)\b.{{0,80}}\b(?:creation|addition|create|creating|add|adding|write|writing|introduce|introducing)\b.{{0,80}}{_NEW_TEST_TARGET}s?\b",
+        re.I | re.S,
+    ),
+    re.compile(
+        rf"\b(?:request|requested|requests)\b.{{0,40}}\b(?:creation|addition|create|creating|add|adding|write|writing|introduce|introducing)\b.{{0,80}}{_NEW_TEST_TARGET}s?\b",
+        re.I | re.S,
+    ),
+)
+
+
+def _has_explicit_new_test_approval(intent_text: str | None) -> bool:
+    """Recognise only explicit creation or approval, not a generic test task."""
+    if not intent_text:
+        return False
+    for pattern in _NEW_TEST_APPROVAL_PATTERNS:
+        for match in pattern.finditer(intent_text):
+            prefix = intent_text[max(0, match.start() - 80):match.start()]
+            if re.search(r"\b(?:do\s+not|don't|never|avoid|without|no)\b", prefix, re.I):
+                continue
+            return True
+    return False
+
+
+def _approved_new_test_patterns(config: Mapping[str, Any] | None) -> tuple[str, ...]:
+    options = config.get("review_options") if isinstance(config, Mapping) else None
+    if not isinstance(options, Mapping):
+        return ()
+    values = options.get("test_integrity_approved_new_paths", [])
+    if not isinstance(values, list) or not all(isinstance(value, str) and value.strip() for value in values):
+        raise ValueError("review option test_integrity_approved_new_paths must be a non-empty-string array")
+    patterns: list[str] = []
+    for value in values:
+        pattern = value.replace("\\", "/").strip()
+        path = Path(pattern)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("review option test_integrity_approved_new_paths must contain repository-relative patterns")
+        patterns.append(pattern)
+    return tuple(patterns)
+
+
+def _new_test_approval(
+    path: str,
+    config: Mapping[str, Any] | None,
+    intent_text: str | None,
+) -> tuple[bool, str]:
+    patterns = _approved_new_test_patterns(config)
+    if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns):
+        return True, "review_options.test_integrity_approved_new_paths"
+    if _has_explicit_new_test_approval(intent_text):
+        return True, "explicit_creation_request"
+    return False, "none"
+
+
+def _new_test_file_matches(
+    path: str,
+    artifact: TestArtifact,
+    *,
+    is_new: bool,
+    approved: bool,
+) -> Iterable[tuple[int, int, str]]:
+    """Find newly added test-only artefacts which lack explicit approval."""
+    if is_new and artifact.role in NEW_TEST_ARTIFACT_ROLES and not approved:
+        yield 1, 0, "new test file or test-only helper/fixture was added without explicit creation approval"
+
+
+def _brace_end(text: str, opening: int) -> int | None:
+    """Find a bounded test body without treating braces in literals as syntax."""
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    stack: list[str] = []
+    quote = ""
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = opening
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in pairs.values():
+            if not stack or stack.pop() != char:
+                return None
+            if not stack:
+                return index
+        index += 1
+    return None
+
+
+def _non_python_no_observable_test_bodies(path: str, text: str) -> Iterable[tuple[int, str]]:
+    """Find assertion-free test bodies for the supported non-Python styles."""
+    suffix = Path(path).suffix.lower()
+    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
+        declarations = re.finditer(
+            r"\b(?:test|it|specify)\s*\([^,\n]+,\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{|"
+            r"\b(?:test|it|specify)\s*\([^,\n]+,\s*function\s*\([^)]*\)\s*\{",
+            text,
+            re.I,
+        )
+        observable = re.compile(
+            r"\b(?:assert|expect|snapshot|throws|rejects|compile|check|fail|verify)\b|"
+            r"\.to(?:Equal|StrictEqual|Be|HaveLength|Match|Snapshot)\s*\(",
+            re.I,
+        )
+    elif suffix == ".go":
+        declarations = re.finditer(r"\bfunc\s+(Test[A-Za-z0-9_]*)\s*\([^)]*\)\s*\{", text)
+        observable = re.compile(r"\b(?:Assert|Require|Error|Fail|Fatal|Run|Log|Cleanup|Helper|check|compile|typecheck)\s*\w*\s*\(|\b(?:assert|require)\.", re.I)
+    elif suffix == ".rs":
+        declarations = re.finditer(r"#\s*\[(?:tokio::)?test[^\]]*\][\s\S]*?\bfn\s+[A-Za-z_][\w]*\s*\([^)]*\)\s*\{", text, re.I)
+        observable = re.compile(r"\b(?:assert!?|assert_eq!|assert_ne!|panic!|todo!|unimplemented!)\s*\(", re.I)
+    elif suffix == ".java":
+        declarations = re.finditer(r"@(?:Test|ParameterizedTest|TestFactory)\b[\s\S]*?\b[A-Za-z_]\w*\s*\([^)]*\)\s*(?:throws[^\{]+)?\{", text, re.I)
+        observable = re.compile(r"\b(?:assert|fail|verify|expect|Assertions\.)\w*\s*\(|\bthrow\s+", re.I)
+    elif suffix == ".cs":
+        declarations = re.finditer(r"\[(?:Fact|Theory|Test|TestCase|TestMethod)\][\s\S]*?\b[A-Za-z_]\w*\s*\([^)]*\)\s*\{", text, re.I)
+        observable = re.compile(r"\b(?:Assert|Throws|Does|Should|Verify|Fail)\.?\w*\s*\(|\bthrow\s+", re.I)
+    elif suffix in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"}:
+        declarations = re.finditer(r"\b(?:TEST|TEST_F|TEST_P|TEST_CASE)\s*\([^)]*\)\s*\{", text, re.I)
+        observable = re.compile(r"\b(?:ASSERT|EXPECT|REQUIRE|CHECK|FAIL|SUCCEED)_?\w*\s*\(", re.I)
+    else:
+        return
+    for match in declarations:
+        opening = text.find("{", match.start(), match.end())
+        if opening < 0:
+            continue
+        closing = _brace_end(text, opening)
+        if closing is None:
+            continue
+        declaration_name = match.group(0)
+        if suffix == ".go" and re.search(r"\bTest(?:Compile|Build|Typecheck)\b", declaration_name, re.I):
+            continue
+        body = _mask_non_code(text[opening + 1:closing], python=False)
+        if not observable.search(body):
+            yield _line(text, match.start()), "test body contains setup but no observable verification"
 
 
 def _no_observable_test_bodies(text: str) -> Iterable[tuple[int, str]]:
@@ -324,9 +850,17 @@ def _no_observable_test_bodies(text: str) -> Iterable[tuple[int, str]]:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, TypeError):
         return
-    observable = re.compile(r"\b(?:assert|expect|raises|snapshot|check_call|check_output|subprocess\.run|compile|cargo\s+check|go\s+test|property|hypothesis|given|example|mypy|pyright|assert_type|reveal_type)\b|\.to(?:Equal|StrictEqual|Be|HaveLength|Match|Snapshot)\s*\(", re.I)
+    observable = re.compile(
+        r"\b(?:assert|expect|raises|snapshot|check_call|check_output|subprocess\.run|compile|"
+        r"cargo\s+check|go\s+test|property|hypothesis|given|example|mypy|pyright|"
+        r"assert_type|reveal_type|assert[A-Z][A-Za-z0-9_]*|subTest|fail)\b|"
+        r"\.to(?:Equal|StrictEqual|Be|HaveLength|Match|Snapshot)\s*\(",
+        re.I,
+    )
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not re.match(r"(?:test|spec)[_$-]?", node.name, re.I):
+            continue
+        if re.search(r"(?:compile|typecheck|type_check|build)", node.name, re.I):
             continue
         segment = ast.get_source_segment(text, node) or ""
         decorators = " ".join(ast.get_source_segment(text, item) or "" for item in node.decorator_list)
@@ -335,16 +869,28 @@ def _no_observable_test_bodies(text: str) -> Iterable[tuple[int, str]]:
 
 
 def _test_only_production(text: str, *, python: bool = True) -> Iterable[tuple[int, str]]:
+    original = text
     text = _mask_non_code(text, python=python)
     patterns = (
-        r"(?m)^\s*(?:from\s+unittest\.mock\s+import|import\s+(?:pytest|unittest\.mock))\b",
-        r"\btypes\.FunctionType\b|\b(?:Mock|MagicMock|AsyncMock)\s*\(",
+        r"(?m)^\s*(?:from\s+(?:unittest\.mock|pytest|unittest)\s+import|import\s+(?:pytest|unittest(?:\.mock)?))\b",
+        r"\b(?:types\.)?FunctionType\b|\b(?:Mock|MagicMock|AsyncMock)\s*\(",
         r"(?m)^\s*if\b[^\n]*(?:TESTING|PYTEST_CURRENT_TEST)\b",
         r"\b(?:IS_TEST|NODE_ENV)\s*(?:===|==)\s*['\"]test['\"]",
         r"(?m)^\s*(?:import|export)\s+[^\n]*from\s*['\"](?:jest|vitest|mocha)['\"]",
     )
     for pattern in patterns:
         for match in re.finditer(pattern, text, re.I):
+            yield _line(text, match.start()), "production behaviour is conditional on a test-only seam or runtime marker"
+    # The comparison value is a string literal, so the normal code mask hides
+    # the very evidence this rule needs. Use the original source only for this
+    # high-signal form and require the marker itself to remain unmasked. This
+    # avoids matching a comment or a string which merely describes the branch.
+    environment_pattern = re.compile(
+        r"\b(?:process\.env\.)?(?:NODE_ENV|IS_TEST|TEST_MODE)\s*(?:===|!==|==|!=)\s*(['\"])test\1",
+        re.I,
+    )
+    for match in environment_pattern.finditer(original):
+        if match.start() < len(text) and text[match.start()] != " ":
             yield _line(text, match.start()), "production behaviour is conditional on a test-only seam or runtime marker"
 
 
@@ -453,13 +999,61 @@ def analyse_static(
     source_kind: str = "working-tree",
     budget: AnalysisBudget | None = None,
     enabled_rules: Iterable[str] | None = None,
+    intent_text: str | None = None,
+    config: Mapping[str, Any] | None = None,
+    new_paths: Iterable[str] | None = None,
 ) -> StaticAnalysisResult:
     """Analyse only evidence-bearing test files and selected production seams."""
-    selected = sorted(set(paths or [item.logical_path for item in inventory.artifacts]))
-    changed = set(changed_paths) if changed_paths is not None else None
+    if base_contents is not None:
+        base_contents = {path: _source_text(value) for path, value in base_contents.items()}
+    if head_contents is not None:
+        head_contents = {path: _source_text(value) for path, value in head_contents.items()}
+    requested_values = paths or [item.logical_path for item in inventory.artifacts]
+    requested_set: set[str] = set()
+    for value in requested_values:
+        candidate = Path(value)
+        if candidate.is_absolute():
+            try:
+                requested_set.add(candidate.resolve().relative_to(root.resolve()).as_posix())
+            except (OSError, ValueError):
+                continue
+        else:
+            requested_set.add(candidate.as_posix())
+    requested = sorted(requested_set)
+    changed: set[str] | None = None
+    if changed_paths is not None:
+        changed = set()
+        for value in changed_paths:
+            candidate = Path(value)
+            if candidate.is_absolute():
+                try:
+                    changed.add(candidate.resolve().relative_to(root.resolve()).as_posix())
+                except (OSError, ValueError):
+                    continue
+            else:
+                changed.add(candidate.as_posix())
+    added: set[str] = set()
+    if new_paths is not None:
+        for value in new_paths:
+            candidate = Path(value)
+            if candidate.is_absolute():
+                try:
+                    added.add(candidate.resolve().relative_to(root.resolve()).as_posix())
+                except (OSError, ValueError):
+                    continue
+            else:
+                added.add(candidate.as_posix())
     enabled = set(enabled_rules) if enabled_rules is not None else set(DEFAULT_ENABLED_RULES)
     artifacts = inventory.artifacts
     artifact_by_path = {item.logical_path: item for item in artifacts}
+    selected = [
+        path for path in requested
+        if artifact_by_path.get(path) is not None
+        and artifact_by_path[path].role in {
+            "test", "test helper", "fixture", "snapshot or golden file",
+            "test configuration", "CI test command", "production source",
+        }
+    ]
     subjects = inventory.subjects
     subjects_by_id = {item.subject_id: item for item in subjects}
     related_subjects: dict[str, tuple[TestSubject, ...]] = {}
@@ -481,6 +1075,7 @@ def analyse_static(
         MAX_CANDIDATES,
         budget.max_candidates if budget is not None and budget.max_candidates is not None else MAX_CANDIDATES,
     )
+    documented_contract_change = _has_explicit_contract_change(intent_text)
 
     def add_candidate(
         rule_id: str,
@@ -497,12 +1092,6 @@ def analyse_static(
         if candidate_limit <= len(candidates):
             skip_reason = skip_reason or "max_candidates"
             return False
-        if budget is not None:
-            try:
-                budget.claim_candidate()
-            except AnalysisBudgetExceeded as error:
-                skip_reason = skip_reason or error.reason_code
-                return False
         evidence_source_kind = (
             artifact.source_kind if artifact is not None
             else subject.source_kind if subject is not None
@@ -522,22 +1111,30 @@ def analyse_static(
         )
         if candidate["id"] in seen:
             return True
+        if budget is not None:
+            try:
+                budget.claim_candidate()
+            except AnalysisBudgetExceeded as error:
+                skip_reason = skip_reason or error.reason_code
+                return False
         seen.add(candidate["id"])
         candidates.append(candidate)
         evidence.extend(candidate["supporting_evidence"])
         return len(candidates) < candidate_limit
 
-    for path in selected:
+    for index, path in enumerate(selected):
         if budget is not None:
             try:
                 budget.check_deadline()
             except AnalysisBudgetExceeded as error:
-                skipped += 1
+                skipped += len(selected) - index
                 skip_reason = error.reason_code
                 break
         artifact = artifact_by_path.get(path)
         is_test = artifact is not None and artifact.role in {"test", "test helper", "fixture", "snapshot or golden file", "test configuration", "CI test command"}
         production = artifact is not None and artifact.role == "production source"
+        if production and changed is not None and path not in changed:
+            continue
         if production and path.startswith("scripts/dissect_checks/test_integrity/"):
             # Rule implementation strings are not evidence about repository
             # runtime seams. Self-review covers this module separately.
@@ -578,26 +1175,84 @@ def analyse_static(
             linked_subjects = _subjects_for(path, subjects)
         matches: list[tuple[str, int, int, str, TestSubject | None, dict[str, Any]]] = []
         if is_test:
-            if base and _changed(path, changed):
+            is_new = (
+                path in added
+                or (
+                    base_contents is not None
+                    and head_contents is not None
+                    and path in head_contents
+                    and path not in base_contents
+                )
+            )
+            approved, approval_source = _new_test_approval(path, config, intent_text)
+            for line, offset, message in _new_test_file_matches(
+                path,
+                artifact,
+                is_new=is_new,
+                approved=approved,
+            ):
+                matches.append((
+                    "GOV-TESTS-010",
+                    line,
+                    offset,
+                    message,
+                    None,
+                    {
+                        "change_kind": "new_test_file_without_approval",
+                        "approval_required": True,
+                        "approval_source": approval_source,
+                    },
+                ))
+            if base and _changed(path, changed) and not documented_contract_change:
                 compare_head = "" if deleted_source else text
                 for line, message in _deleted_test_matches(path, base, compare_head):
                     matches.append(("GOV-TESTS-001", line, 0, message, None, {"change_kind": "test_removed"}))
             if not deleted_source:
                 for line, offset, message in _disabled_matches(code_text, base_code):
+                    if _has_quarantine_evidence(text, line):
+                        continue
                     matches.append(("GOV-TESTS-001", line, offset, message, None, {"change_kind": "disabled_or_bypassed"}))
-            if base and _changed(path, changed):
+            if base and _changed(path, changed) and not documented_contract_change:
                 for line, message in _assertion_weakening(base_code, code_text):
                     matches.append(("GOV-TESTS-002", line, 0, message, None, {"change_kind": "assertion_weakened"}))
+                for line, message in _assertion_moved_behind_branch(base_code, code_text):
+                    matches.append(("GOV-TESTS-002", line, 0, message, None, {"change_kind": "assertion_moved_behind_branch"}))
+                for line, message in _reduced_parameter_cases(path, base, text):
+                    matches.append(("GOV-TESTS-001", line, 0, message, None, {"change_kind": "parameter_cases_reduced"}))
+                for line, message in _excluded_test_paths(base, text):
+                    matches.append(("GOV-TESTS-001", line, 0, message, None, {"change_kind": "test_path_excluded"}))
             for line, message, subject_name in _circular_oracles(code_text):
                 subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
                 matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "circular_oracle", "called_symbol": subject_name}))
             for line, message, subject_name in _derived_oracles(code_text):
                 subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
                 matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "implementation_derived_oracle", "called_symbol": subject_name}))
+            if python_source:
+                for line, message, subject_name in _python_circular_oracles(text):
+                    subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
+                    matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "circular_oracle", "called_symbol": subject_name}))
+                for line, message, subject_name in _python_derived_oracles(text):
+                    subject = next((item for item in linked_subjects if item.qualified_name.endswith(subject_name)), None)
+                    matches.append(("GOV-TESTS-003", line, 0, message, subject, {"change_kind": "implementation_derived_oracle", "called_symbol": subject_name}))
+            for line, message, subject_name in _implementation_oracle_matches(text):
+                matches.append(("GOV-TESTS-003", line, 0, message, None, {"change_kind": subject_name}))
+            if artifact is not None and artifact.role == "snapshot or golden file":
+                for line, message, subject_name in _snapshot_derived_oracle(text):
+                    matches.append(("GOV-TESTS-003", line, 0, message, None, {"change_kind": "generated_snapshot", "called_symbol": subject_name}))
             for line, subject, message in _mock_matches(text, linked_subjects):
                 matches.append(("GOV-TESTS-004", line, 0, message, subject, {"change_kind": "focal_subject_mocked"}))
             for line, message in _tautologies(code_text):
                 matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"}))
+            if python_source:
+                for line, message in _python_tautologies(text):
+                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"}))
+                for line, message in _python_early_return_matches(text):
+                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "early_return"}))
+                for line, message in _python_catch_all_matches(text):
+                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "tautology_or_catch_all"}))
+            else:
+                for line, message in _non_python_no_observable_test_bodies(path, text):
+                    matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "no_observable_verification"}))
             for line, message in _no_observable_test_bodies(text):
                 matches.append(("GOV-TESTS-005", line, 0, message, None, {"change_kind": "no_observable_verification"}))
             if artifact is not None and artifact.role in {"fixture", "test"}:

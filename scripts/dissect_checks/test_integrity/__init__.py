@@ -9,7 +9,7 @@ from .model import (
 )
 from .inventory import InventoryResult, build_inventory
 from .orchestrator import TestIntegrityResult, analyse
-from .evidence_matrix import EvidenceMatrix, execute_approved_matrix, flakiness_evidence, interpret_matrix
+from .evidence_matrix import EvidenceMatrix, execute_approved_matrix, flakiness_evidence, interpret_matrix, reachability_candidates
 
 __all__ = [
     "MutationResult",
@@ -25,4 +25,5 @@ __all__ = [
     "execute_approved_matrix",
     "flakiness_evidence",
     "interpret_matrix",
+    "reachability_candidates",
 ]

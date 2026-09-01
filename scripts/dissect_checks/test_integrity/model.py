@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -14,6 +15,24 @@ SCENARIO_IDS = (
     "base-code-head-tests",
     "head-code-base-tests",
     "head-code-head-tests",
+)
+REACHABILITY_STATES = frozenset({"confirmed", "not_reached", "unverified"})
+ARTIFACT_ROLES = frozenset({
+    "test", "test helper", "fixture", "snapshot or golden file",
+    "test configuration", "CI test command", "production source",
+    "shared build or manifest file", "documentation",
+})
+USEFULNESS_DIMENSIONS = (
+    "collects_or_compiles",
+    "passes_on_head",
+    "reaches_focal_subject",
+    "distinguishes_base_and_head",
+    "kills_targeted_valid_mutant",
+    "uses_independent_oracle",
+    "has_explicit_contract_source",
+    "stable_across_repeated_runs",
+    "covers_unique_boundary",
+    "has_unique_mutation_kill_set",
 )
 SHA256_LENGTH = 64
 
@@ -32,11 +51,27 @@ def digest_payload(value: Any, *, prefix: str = "") -> str:
 
 
 def _valid_hash(value: str, *, allow_empty: bool = False) -> bool:
-    return allow_empty and value == "" or len(value) == SHA256_LENGTH and all(char in "0123456789abcdef" for char in value)
+    if allow_empty and value == "":
+        return True
+    return isinstance(value, str) and len(value) == SHA256_LENGTH and all(
+        char in "0123456789abcdef" for char in value
+    )
 
 
 def _check_location(path: str, start: int, end: int) -> None:
-    if not path or start < 1 or end < start:
+    path_object = Path(path.replace("\\", "/"))
+    if (
+        not path
+        or path_object.is_absolute()
+        or not path_object.parts
+        or ".." in path_object.parts
+        or isinstance(start, bool)
+        or isinstance(end, bool)
+        or not isinstance(start, int)
+        or not isinstance(end, int)
+        or start < 1
+        or end < start
+    ):
         raise ValueError("test evidence locations must have a path and positive line range")
 
 
@@ -48,12 +83,22 @@ class TestArtifact:
     source_kind: str
     content_sha256: str
     uncertainty: str = ""
+    classification_evidence: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.logical_path or not self.framework_id or not self.role or not self.source_kind:
             raise ValueError("test artefacts require path, framework, role, and source layer")
+        if self.role not in ARTIFACT_ROLES:
+            raise ValueError("test artefact role is not recognised")
+        if not isinstance(self.uncertainty, str) or len(self.uncertainty) > 512:
+            raise ValueError("test artefact uncertainty must be a bounded string")
+        path = Path(self.logical_path.replace("\\", "/"))
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise ValueError("test artefact path must be repository-relative")
         if not _valid_hash(self.content_sha256):
             raise ValueError("test artefact content_sha256 must be a lowercase SHA-256")
+        if any(not isinstance(item, str) or not item for item in self.classification_evidence):
+            raise ValueError("test artefact classification evidence must contain non-empty strings")
 
     @property
     def artifact_id(self) -> str:
@@ -62,6 +107,7 @@ class TestArtifact:
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["id"] = self.artifact_id
+        value["classification_evidence"] = list(self.classification_evidence)
         return value
 
 
@@ -99,10 +145,27 @@ class TestChange:
         "kind": "not_recorded",
         "reference": "No independent contract or oracle was attached to this test change.",
     })
+    usefulness: Mapping[str, Any] = field(default_factory=lambda: {
+        key: None for key in USEFULNESS_DIMENSIONS
+    })
 
     def __post_init__(self) -> None:
         if not self.change_kinds:
             raise ValueError("test changes require at least one change kind")
+        if not isinstance(self.test, TestArtifact):
+            raise ValueError("test changes require a test artefact")
+        if any(not isinstance(item, TestSubject) for item in self.affected_subjects):
+            raise ValueError("test changes require test subject records")
+        if any(not isinstance(item, Mapping) for item in self.evidence):
+            raise ValueError("test change evidence must contain mappings")
+        if (
+            not isinstance(self.oracle_source, Mapping)
+            or not isinstance(self.oracle_source.get("kind"), str)
+            or not self.oracle_source.get("kind")
+            or not isinstance(self.oracle_source.get("reference"), str)
+            or not self.oracle_source.get("reference")
+        ):
+            raise ValueError("test changes require an oracle source record")
 
     @property
     def change_id(self) -> str:
@@ -120,6 +183,7 @@ class TestChange:
             "affected_subjects": [subject.as_dict() for subject in self.affected_subjects],
             "evidence": [dict(item) for item in self.evidence],
             "oracle_source": dict(self.oracle_source),
+            "usefulness": {key: self.usefulness.get(key) for key in USEFULNESS_DIMENSIONS},
         }
 
 
@@ -137,20 +201,48 @@ class TestRunResult:
     production_patch_sha256: str = ""
     test_patch_sha256: str = ""
     shared_config_patch_sha256: str = ""
+    reachability: str = "unverified"
+    reached_subjects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scenario_id not in SCENARIO_IDS:
             raise ValueError(f"unknown test evidence scenario: {self.scenario_id}")
+        if self.reachability not in REACHABILITY_STATES:
+            raise ValueError("test run reachability state is invalid")
+        if any(not isinstance(item, str) or not item for item in self.reached_subjects):
+            raise ValueError("reached subject IDs must be non-empty strings")
+        if not self.completed and self.reachability != "unverified":
+            raise ValueError("incomplete test runs cannot claim reachability")
+        if self.reachability == "confirmed" and not self.reached_subjects:
+            raise ValueError("confirmed reachability requires reached subject IDs")
+        if self.reachability == "not_reached" and self.reached_subjects:
+            raise ValueError("not_reached results cannot contain reached subject IDs")
+        if any(not isinstance(item, str) or not item for item in self.selected_tests):
+            raise ValueError("selected test identifiers must be non-empty strings")
         if self.command_plan_digest and not _valid_hash(self.command_plan_digest):
             raise ValueError("command_plan_digest must be a lowercase SHA-256")
-        if self.collected_tests is not None and self.collected_tests < 0:
-            raise ValueError("collected_tests must not be negative")
+        if self.collected_tests is not None and (
+            isinstance(self.collected_tests, bool)
+            or not isinstance(self.collected_tests, int)
+            or self.collected_tests < 0
+        ):
+            raise ValueError("collected_tests must be a non-negative integer")
         if not isinstance(self.completed, bool):
             raise ValueError("completed must be a boolean")
         if self.passed is not None and not isinstance(self.passed, bool):
             raise ValueError("passed must be a boolean or null")
         if self.completed and self.exit_code is None:
             raise ValueError("completed test runs require an exit code")
+        if self.completed and not isinstance(self.passed, bool):
+            raise ValueError("completed test runs require a boolean passed result")
+        if self.completed and not _valid_hash(self.command_plan_digest):
+            raise ValueError("completed test runs require an approval plan digest")
+        if self.completed and not _valid_hash(self.output_fingerprint):
+            raise ValueError("completed test runs require an output fingerprint")
+        if not self.completed and self.passed is not None:
+            raise ValueError("incomplete test runs must not have a passed result")
+        if self.exit_code is not None and (isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)):
+            raise ValueError("test run exit_code must be an integer or null")
         if self.output_fingerprint and not _valid_hash(self.output_fingerprint):
             raise ValueError("output_fingerprint must be a lowercase SHA-256")
         for name, value in (
@@ -164,6 +256,7 @@ class TestRunResult:
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["selected_tests"] = list(self.selected_tests)
+        value["reached_subjects"] = list(self.reached_subjects)
         return value
 
 
@@ -178,12 +271,29 @@ class MutationResult:
     killing_tests: tuple[str, ...]
     reason_code: str | None = None
     command_plan_digest: str = ""
+    build_command_plan_digest: str = ""
 
     def __post_init__(self) -> None:
         if not self.mutation_id or not self.mutation_kind or not _valid_hash(self.patch_sha256):
             raise ValueError("mutation results require an ID, kind, and SHA-256 patch")
+        if not isinstance(self.subject, TestSubject):
+            raise ValueError("mutation results require a test subject record")
+        if any(not isinstance(item, str) or not item for item in self.killing_tests):
+            raise ValueError("mutation killing tests must contain non-empty strings")
         if self.command_plan_digest and not _valid_hash(self.command_plan_digest):
             raise ValueError("command_plan_digest must be a lowercase SHA-256")
+        if self.build_command_plan_digest and not _valid_hash(self.build_command_plan_digest):
+            raise ValueError("build_command_plan_digest must be a lowercase SHA-256")
+        if self.build_valid is not None and not isinstance(self.build_valid, bool):
+            raise ValueError("mutation build_valid must be boolean or null")
+        if self.killed is not None and not isinstance(self.killed, bool):
+            raise ValueError("mutation killed must be boolean or null")
+        if self.build_valid is not True and self.killed is not None:
+            raise ValueError("an unbuilt or invalid mutant cannot have a killed result")
+        if self.killed is not True and self.killing_tests:
+            raise ValueError("killing tests require a killed mutant")
+        if self.killed is not None and not _valid_hash(self.command_plan_digest):
+            raise ValueError("executed mutation results require a command plan digest")
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)

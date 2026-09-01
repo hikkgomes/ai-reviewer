@@ -99,6 +99,21 @@ and temp directories, exact command-plan digests, hard timeouts, and bounded
 redacted output. Targeted hunk reversion and proof tests are optional
 verification evidence and never modify the real checkout.
 
+New unit, integration, end-to-end, and spec files, including test-only helpers
+and fixtures, are opt-in. Require an explicit creation request or approval, or
+an exact approved path pattern in
+`review_options.test_integrity_approved_new_paths`. A generic request to
+implement, fix, test, or verify does not authorise a new test file. Prefer
+existing tests and direct browser/runtime checks, and make test changes exercise
+observable behaviour rather than source strings, implementation shapes, or the
+existence of tests.
+
+Static evidence never recommends test removal by itself. Removal requires a
+unique-contract review, confirmed reachability, base/head evidence, a valid
+mutation kill-set comparison, stable execution, and confirmation that the test
+is not the only structural or integration check. Missing execution or oracle
+evidence remains `Not verified`.
+
 > A passing test is evidence only for the exact behaviour it can distinguish. It
 > is not proof that the implementation or oracle is correct.
 

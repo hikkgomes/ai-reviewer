@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -145,6 +148,27 @@ def provision_complexity(skill_root: Path) -> bool:
         raise RuntimeError("Lizard requirement is not exact-pinned with its distribution hash")
     if f'LIZARD_VERSION = "{LIZARD_VERSION}"' not in backend.read_text(encoding="utf-8"):
         raise RuntimeError("complexity backend does not declare the pinned Lizard version")
+    for distribution, expected_version in (
+        ("lizard-1.24.0.dist-info", "1.24.0"),
+        ("pathspec-1.1.1.dist-info", "1.1.1"),
+        ("pygments-2.21.0.dist-info", "2.21.0"),
+    ):
+        metadata_path = vendor / "site-packages" / distribution / "METADATA"
+        record_path = vendor / "site-packages" / distribution / "RECORD"
+        if not metadata_path.is_file() or not record_path.is_file():
+            raise RuntimeError(f"vendored distribution metadata is missing: {distribution}")
+        metadata = metadata_path.read_text(encoding="utf-8")
+        if f"\nVersion: {expected_version}\n" not in f"\n{metadata}\n":
+            raise RuntimeError(f"vendored distribution version is unexpected: {distribution}")
+        for row in csv.reader(record_path.read_text(encoding="utf-8").splitlines()):
+            if len(row) < 3 or not row[1].startswith("sha256="):
+                continue
+            file_path = vendor / "site-packages" / row[0]
+            if not file_path.is_file():
+                raise RuntimeError(f"vendored distribution file is missing: {row[0]}")
+            digest = base64.urlsafe_b64encode(hashlib.sha256(file_path.read_bytes()).digest()).decode().rstrip("=")
+            if digest != row[1].split("=", 1)[1] or str(file_path.stat().st_size) != row[2]:
+                raise RuntimeError(f"vendored distribution file hash mismatch: {row[0]}")
     print(f"Verified skill-local complexity runtime: Lizard {LIZARD_VERSION} ({LIZARD_WHEEL_SHA256})")
     return True
 

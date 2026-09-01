@@ -1,4 +1,5 @@
 import pytest
+import inspect
 from unittest.mock import patch
 
 from service import load
@@ -14,6 +15,10 @@ def test_weakened_case():
 
 def test_circular_oracle():
     assert load() == load()
+
+
+def test_source_shape_oracle():
+    assert "return {'value': 1}" in inspect.getsource(load)
 
 
 def test_focal_subject_mocked():

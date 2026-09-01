@@ -15,9 +15,9 @@
       "required": ["reviewed_cases", "true_positive", "false_positive", "true_negative", "false_negative", "precision", "decisions"],
       "properties": {
         "reviewed_cases": {"type": "integer", "minimum": 1},
-        "true_positive": {"type": "integer", "minimum": 0},
+        "true_positive": {"type": "integer", "minimum": 3},
         "false_positive": {"type": "integer", "minimum": 0},
-        "true_negative": {"type": "integer", "minimum": 0},
+        "true_negative": {"type": "integer", "minimum": 8},
         "false_negative": {"type": "integer", "minimum": 0},
         "precision": {"type": "number", "minimum": 0, "maximum": 1},
         "decisions": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["case_id", "classification"]}}

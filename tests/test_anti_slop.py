@@ -106,6 +106,30 @@ class AntiSlopTests(unittest.TestCase):
                 self.assertEqual(target.manifest_source_layer, "index")
                 self.assertTrue(target.manifest_sha256)
 
+    def test_effect_variant_reads_an_unchanged_manifest_from_each_snapshot(self) -> None:
+        def git(root: Path, *arguments: str) -> None:
+            subprocess.run(["git", *arguments], cwd=root, capture_output=True, check=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git(root, "init", "-q")
+            git(root, "config", "user.email", "test@example.com")
+            git(root, "config", "user.name", "Test")
+            git(root, "config", "commit.gpgsign", "false")
+            (root / "package.json").write_text(json.dumps({"dependencies": {"effect": "^3"}}))
+            source = root / "consumer.ts"
+            source.write_text("export const value = 1;\n")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "base")
+            source.write_text("export const value = 2;\n")
+            git(root, "add", "consumer.ts")
+            entries = build_review_context.changed_entries(root, "diff", None, "")
+            with build_review_context._diff_optional_targets(root, ["consumer.ts"], entries, "", {}) as snapshot:
+                target = next(item for item in snapshot.anti_targets if item.source_kind == "index")
+                self.assertEqual(target.config_variant, "effect")
+                self.assertEqual(target.manifest_path, "package.json")
+                self.assertEqual(target.manifest_source_layer, "index")
+
     def test_candidate_mapping_filters_default_rule_and_validates_ledger_shape(self) -> None:
         fixture = ROOT / "tests" / "fixtures" / "anti-slop" / "oxlint-diagnostics.json"
         diagnostics, parser_errors = oxlint_backend.parse_diagnostics_with_errors(fixture.read_text())

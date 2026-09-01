@@ -33,8 +33,9 @@ add a `Not run` state.
 
 ## Test integrity findings
 
-List only verified test bypasses, weakened contracts, circular oracles, or
-unprotected changed behaviour. Static candidates alone do not support removal.
+List only verified test bypasses, weakened contracts, circular oracles,
+unapproved new test artefacts, or unprotected changed behaviour. Static
+candidates alone do not support removal.
 
 ## Proof tests performed
 
@@ -57,6 +58,11 @@ finding.
 
 State missing commands, unapproved execution, incomplete matrices, invalid
 fixtures, parser failures, or unavailable toolchains that limit confidence.
+
+`Checked` means that the selected analysis completed. It does not mean that the
+implementation or test oracle is correct. Do not report one mutation score as a
+quality result. Mutation survival is evidence about one fault only, and static
+test smells never justify test removal without behavioural evidence.
 
 ## Scope and Residual Risk
 

@@ -11,6 +11,7 @@ from analysis_budget import AnalysisBudget, AnalysisBudgetExceeded, analysis_lim
 from file_paths import is_generated_path, is_ignored_path
 from language_registry import ambiguous_header_paths, language_for_path, paths_for_anti_slop
 from review_ledger import blank_candidate, validate_candidate
+from dissect_checks.redaction import redact_payload
 from . import ast_grep_backend, oxlint_backend, python_ast_backend
 from .model import AnalysisTarget, BackendDiagnostic, BackendResult, LoadedAnalysisTarget, canonical_diagnostic_identity, load_target
 
@@ -70,6 +71,11 @@ class TargetLoadSkip:
     target: AnalysisTarget
     reason_code: str
     detail: str = ""
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 1:
+            raise ValueError("target load skip count must be positive")
 
 
 def load_targets(
@@ -84,11 +90,13 @@ def load_targets(
     skipped: list[TargetLoadSkip] = []
     root = root.resolve()
     terminal_reasons = {"total_timeout", "max_files", "max_total_bytes"}
-    for target in targets:
+    for index, target in enumerate(targets):
         try:
             loaded.append(load_target(root, target, budget, max_file_bytes=max_file_bytes))
         except AnalysisBudgetExceeded as error:
-            skipped.append(TargetLoadSkip(target, error.reason_code, error.detail))
+            remaining = len(targets) - index
+            count = remaining if error.reason_code in terminal_reasons else 1
+            skipped.append(TargetLoadSkip(target, error.reason_code, error.detail, count))
             if error.reason_code in terminal_reasons:
                 break
         except (OSError, ValueError, TypeError) as error:
@@ -101,8 +109,12 @@ def _backend_for_language(language_id: str) -> str:
 
 
 def _candidate(diagnostics: Sequence[BackendDiagnostic]) -> dict[str, Any]:
+    exact = {
+        canonical_diagnostic_identity(item): item
+        for item in diagnostics
+    }
     ordered = tuple(sorted(
-        diagnostics,
+        exact.values(),
         key=lambda item: (
             item.path,
             str(item.metadata.get("source_layer", "working-tree")),
@@ -127,6 +139,14 @@ def _candidate(diagnostics: Sequence[BackendDiagnostic]) -> dict[str, Any]:
         contract="Confirm the concrete harmful behaviour and its semantic impact before reporting.",
     )
     candidate["trigger_path"] = [f"{diagnostic.path}:{diagnostic.line}"]
+
+    def metadata_value(item: BackendDiagnostic, key: str, default: Any = "") -> Any:
+        metadata = dict(item.metadata)
+        nested = metadata.get("metadata")
+        if not isinstance(nested, Mapping):
+            nested = {}
+        return metadata.get(key) or nested.get(key) or default
+
     candidate["supporting_evidence"] = [
         {
             "kind": "structural_diagnostic",
@@ -137,9 +157,19 @@ def _candidate(diagnostics: Sequence[BackendDiagnostic]) -> dict[str, Any]:
             "line": item.line,
             "column": item.column,
             "message": item.message,
-            "source_layer": str(item.metadata.get("source_layer", "working-tree")),
+            "source_layer": str(metadata_value(item, "source_layer", "working-tree")),
+            "content_sha256": str(metadata_value(item, "content_sha256", "")),
+            "rule_discriminator": str(
+                metadata_value(item, "rule_discriminator")
+                or metadata_value(item, "discriminator")
+                or ""
+            ),
+            "config_variant": str(metadata_value(item, "config_variant", "")),
+            "manifest_path": str(metadata_value(item, "manifest_path", "")),
+            "manifest_source_layer": str(metadata_value(item, "manifest_source_layer", "")),
+            "manifest_sha256": str(metadata_value(item, "manifest_sha256", "")),
             "analysis_level": "structural",
-            "metadata": dict(item.metadata),
+            "metadata": redact_payload(dict(item.metadata)),
         }
         for item in ordered
     ]
@@ -224,6 +254,27 @@ def _run_backends(
         if not raw_targets:
             results.append(_empty_result(backend_id))
             continue
+        # The source loader is shared by all backend packs. If a terminal
+        # budget claim stops loading, calculate the missing targets for this
+        # backend instead of attaching the aggregate remainder to the first
+        # backend which encountered the limit.
+        unmatched_loaded = list(backend_targets)
+        missing_targets: list[AnalysisTarget] = []
+        for raw_target in raw_targets:
+            match_index = next(
+                (
+                    index for index, loaded in enumerate(unmatched_loaded)
+                    if loaded.logical_path == raw_target.logical_path
+                    and loaded.source_kind == raw_target.source_kind
+                    and loaded.revision == raw_target.revision
+                    and (not raw_target.content_sha256 or loaded.content_sha256 == raw_target.content_sha256)
+                ),
+                None,
+            )
+            if match_index is None:
+                missing_targets.append(raw_target)
+            else:
+                unmatched_loaded.pop(match_index)
         if not backend_targets:
             skip = skips_by_backend[backend_id][0] if skips_by_backend[backend_id] else None
             results.append(BackendResult(
@@ -231,19 +282,56 @@ def _run_backends(
                 len(raw_targets), 0, len(raw_targets), [],
                 skip.reason_code if skip else "source_unavailable",
                 skip.detail if skip else "No source file completed structural analysis.",
+                {
+                    target.target_id: "failed" if skip is not None and (
+                        target.logical_path,
+                        target.source_kind,
+                        target.revision,
+                    ) == (
+                        skip.target.logical_path,
+                        skip.target.source_kind,
+                        skip.target.revision,
+                    ) else "not_verified"
+                    for target in raw_targets
+                },
+                [
+                    {
+                        "path": item.target.logical_path,
+                        "reason_code": item.reason_code,
+                        "detail": item.detail[:240],
+                    }
+                    for item in skips_by_backend[backend_id][:3]
+                ],
             ))
             continue
         result = _run_backend(backend_id, root, backend_targets, budget, limits, config, vendor_dir)
         raw_applicable = len(raw_targets)
-        load_skipped = len(skips_by_backend[backend_id])
+        load_skipped = len(missing_targets)
         result.applicable_files = raw_applicable
-        result.skipped_files = min(raw_applicable, result.skipped_files + load_skipped)
+        result.skipped_files = min(
+            raw_applicable,
+            result.skipped_files + load_skipped,
+        )
         if load_skipped:
-            first_skip = skips_by_backend[backend_id][0]
-            result.reason_code = result.reason_code or first_skip.reason_code
-            result.reason = result.reason or first_skip.detail
+            first_skip = skips_by_backend[backend_id][0] if skips_by_backend[backend_id] else None
+            if first_skip is not None:
+                result.reason_code = result.reason_code or first_skip.reason_code
+                result.reason = result.reason or first_skip.detail
             if result.status == "complete":
                 result.status = "partial" if result.checked_files else "unavailable"
+            skip_by_location = {
+                (item.target.logical_path, item.target.source_kind, item.target.revision): item
+                for item in skips_by_backend[backend_id]
+            }
+            for target in missing_targets:
+                skip = skip_by_location.get((target.logical_path, target.source_kind, target.revision))
+                result.parse_states[target.target_id] = "failed" if skip is not None else "not_verified"
+                if skip is not None:
+                    result.parse_errors.append({
+                        "path": target.logical_path,
+                        "reason_code": skip.reason_code,
+                        "detail": skip.detail[:240],
+                    })
         results.append(result)
     return results, budget
 
@@ -309,22 +397,25 @@ def _candidate_ledger(
         item["source"],
         item["claim"],
     ))
-    for index, candidate in enumerate(candidates):
+    location_to_ids: dict[tuple[Any, Any, Any], set[str]] = {}
+    for candidate in candidates:
+        for item in candidate.get("supporting_evidence", []):
+            if isinstance(item, dict):
+                location = (item.get("file"), item.get("line"), item.get("source_layer", "working-tree"))
+                location_to_ids.setdefault(location, set()).add(candidate["id"])
+    for candidate in candidates:
         locations = {
             (item.get("file"), item.get("line"), item.get("source_layer", "working-tree"))
             for item in candidate.get("supporting_evidence", []) if isinstance(item, dict)
         }
-        related = [
-            other["id"]
-            for other_index, other in enumerate(candidates)
-            if other_index != index
-            and locations & {
-                (item.get("file"), item.get("line"), item.get("source_layer", "working-tree"))
-                for item in other.get("supporting_evidence", []) if isinstance(item, dict)
-            }
-        ]
+        related = sorted({
+            related_id
+            for location in locations
+            for related_id in location_to_ids.get(location, set())
+            if related_id != candidate["id"]
+        })
         if related:
-            candidate["related_candidate_ids"] = sorted(set(related))
+            candidate["related_candidate_ids"] = related
     return candidates
 
 
@@ -352,8 +443,7 @@ def _validated_targets(root: Path, targets: Iterable[AnalysisTarget], config: di
             inside_root = resolved.is_relative_to(root_resolved)
         except (OSError, ValueError):
             continue
-        source_layers = set(target.source_kind.split("+"))
-        if not inside_root and not source_layers <= {"commit", "index"}:
+        if not inside_root and target.data is None and not target.physical_snapshot:
             continue
         # Do not hash supplied source bytes before the shared budget claims
         # them. The loader calculates the SHA-256 after the claim.

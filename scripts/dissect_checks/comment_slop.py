@@ -119,12 +119,15 @@ def _python_comments_detailed(value: str | bytes, deadline: float | None = None)
     data = _source_bytes(value)
     comments: list[Comment] = []
     parse_error: BaseException | None = None
+    _check_file_deadline(deadline)
     try:
         tree = ast.parse(data)
     except (SyntaxError, ValueError, TypeError, UnicodeDecodeError, LookupError) as error:
         tree = None
         parse_error = error
-    doc_ranges = _python_docstring_ranges(data, tree)
+    _check_file_deadline(deadline)
+    doc_ranges = _python_docstring_ranges(data, tree) if tree is not None else set()
+    _check_file_deadline(deadline)
     try:
         # The byte tokenizer honours an encoding declaration and decodes only
         # Python source, unlike a blanket UTF-8 replacement read.
@@ -146,6 +149,7 @@ def _python_comments_detailed(value: str | bytes, deadline: float | None = None)
                 comments.append(Comment(token.start[0], token.end[0], _comment_text(body[3:-3]), True, token.start[1]))
     except (tokenize.TokenError, IndentationError, SyntaxError, UnicodeDecodeError, LookupError) as error:
         parse_error = parse_error or error
+    _check_file_deadline(deadline)
     if parse_error is None:
         return comments, None
     return comments, f"Python source could not be parsed: {parse_error}"
@@ -171,9 +175,11 @@ def _check_file_deadline(deadline: float | None) -> None:
 def _consume_quoted(data: bytes, start: int, quote: bytes, deadline: float | None = None) -> tuple[int, int]:
     index = start + len(quote)
     work = len(quote)
+    iterations = 0
     while index < len(data):
-        if deadline is not None and work % 1024 == 0 and time.monotonic() >= deadline:
-            raise AnalysisBudgetExceeded("file_timeout", "comment file deadline exceeded")
+        iterations += 1
+        if iterations % 1024 == 0:
+            _check_file_deadline(deadline)
         if data.startswith(quote, index):
             return index + len(quote), work + len(quote)
         if data[index:index + 1] == b"\\":
@@ -201,9 +207,11 @@ def _consume_regex(data: bytes, start: int, deadline: float | None = None) -> tu
     index = start + 1
     work = 1
     in_class = False
+    iterations = 0
     while index < len(data):
-        if deadline is not None and work % 1024 == 0 and time.monotonic() >= deadline:
-            raise AnalysisBudgetExceeded("file_timeout", "comment file deadline exceeded")
+        iterations += 1
+        if iterations % 1024 == 0:
+            _check_file_deadline(deadline)
         char = data[index:index + 1]
         if char == b"\\":
             index += min(2, len(data) - index)
@@ -226,9 +234,25 @@ def _consume_regex(data: bytes, start: int, deadline: float | None = None) -> tu
     return len(data), work
 
 
+def _find_bounded(data: bytes, marker: bytes, start: int, deadline: float | None = None) -> int:
+    """Find a marker in bounded chunks so file deadlines remain observable."""
+    cursor = max(0, start)
+    overlap = max(0, len(marker) - 1)
+    chunk_size = 64 * 1024
+    while cursor < len(data):
+        _check_file_deadline(deadline)
+        end = min(len(data), cursor + chunk_size + overlap)
+        found = data.find(marker, cursor, end)
+        _check_file_deadline(deadline)
+        if found >= 0:
+            return found
+        cursor += chunk_size
+    return -1
+
+
 def _heredoc_end(data: bytes, start: int, deadline: float | None = None) -> int | None:
     """Return the first offset after a shell/Terraform heredoc."""
-    line_end = data.find(b"\n", start)
+    line_end = _find_bounded(data, b"\n", start, deadline)
     if line_end < 0:
         line_end = len(data)
     match = re.search(rb"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", data[start:line_end])
@@ -240,7 +264,7 @@ def _heredoc_end(data: bytes, start: int, deadline: float | None = None) -> int 
     while cursor < len(data):
         if lines % 256 == 0:
             _check_file_deadline(deadline)
-        end = data.find(b"\n", cursor)
+        end = _find_bounded(data, b"\n", cursor, deadline)
         if end < 0:
             end = len(data)
         if data[cursor:end].strip(b"\r") == delimiter:
@@ -260,7 +284,7 @@ def _rust_raw_string_end(data: bytes, start: int, deadline: float | None = None)
         return None
     hashes = cursor - start - 1
     close = b'"' + (b"#" * hashes)
-    end = data.find(close, cursor + 1)
+    end = _find_bounded(data, close, cursor + 1, deadline)
     if end < 0:
         return len(data)
     return end + len(close)
@@ -284,6 +308,7 @@ def _generic_comments_detailed(
     line = 1
     column = 0
     work = 0
+    iterations = 0
 
     def advance(end: int) -> None:
         nonlocal index, line, column, work
@@ -300,8 +325,9 @@ def _generic_comments_detailed(
         index = end
 
     while index < length:
-        if deadline is not None and work % 1024 == 0 and time.monotonic() >= deadline:
-            raise AnalysisBudgetExceeded("file_timeout", "comment file deadline exceeded")
+        iterations += 1
+        if iterations % 1024 == 0:
+            _check_file_deadline(deadline)
         start_line = line
         if suffix in {".sh", ".bash", ".zsh", ".tf", ".tfvars"} and data.startswith(b"<<", index):
             heredoc_end = _heredoc_end(data, index, deadline)
@@ -316,7 +342,7 @@ def _generic_comments_detailed(
         if html_comments and data.startswith(b"<!--", index):
             comment_start = index
             start_column = column
-            end = data.find(b"-->", index + 4)
+            end = _find_bounded(data, b"-->", index + 4, deadline)
             end = length if end < 0 else end
             closing_end = length if end == length else end + 3
             advance(closing_end)
@@ -329,9 +355,11 @@ def _generic_comments_detailed(
             cursor = index + 2
             depth = 1
             nested = suffix == ".rs"
+            block_iterations = 0
             while cursor < length:
-                if deadline is not None and work % 1024 == 0 and time.monotonic() >= deadline:
-                    raise AnalysisBudgetExceeded("file_timeout", "comment file deadline exceeded")
+                block_iterations += 1
+                if block_iterations % 1024 == 0:
+                    _check_file_deadline(deadline)
                 if nested and data.startswith(b"/*", cursor):
                     depth += 1
                     cursor += 2
@@ -357,7 +385,7 @@ def _generic_comments_detailed(
             if prefix.endswith((b"http:", b"https:")):
                 advance(index + 2)
                 continue
-            end = data.find(b"\n", index + 2)
+            end = _find_bounded(data, b"\n", index + 2, deadline)
             end = length if end < 0 else end
             advance(end)
             comments.append(Comment(start_line, start_line, _comment_text(data[comment_start + 2:end]), column=start_column))
@@ -369,7 +397,7 @@ def _generic_comments_detailed(
         ):
             comment_start = index
             start_column = column
-            end = data.find(b"\n", index + len(line_marker))
+            end = _find_bounded(data, b"\n", index + len(line_marker), deadline)
             end = length if end < 0 else end
             advance(end)
             comments.append(Comment(start_line, start_line, _comment_text(data[comment_start + len(line_marker):end]), column=start_column))
@@ -412,7 +440,10 @@ def extract_comments_with_work(
 ) -> tuple[list[Comment], int]:
     """Extract comments and report the production cursor work performed."""
     if _is_python_path(path):
-        return _python_comments(text), len(_source_bytes(text))
+        work = len(_source_bytes(text))
+        if observer is not None and work:
+            observer(work)
+        return _python_comments(text), work
     return _generic_comments_detailed(path, text, observer=observer)
 
 
@@ -434,8 +465,16 @@ def _group_comments(comments: list[Comment], lines: list[str | bytes], deadline:
     for index, comment in enumerate(comments[1:], 1):
         if index % 256 == 0:
             _check_file_deadline(deadline)
-        between = lines[current.end_line:comment.line - 1]
-        if comment.line <= current.end_line + 1 and all(not item.strip() for item in between):
+        empty_between = True
+        if comment.line <= current.end_line + 1:
+            for line_index in range(current.end_line, max(current.end_line, comment.line - 1)):
+                if line_index % 256 == 0:
+                    _check_file_deadline(deadline)
+                if lines[line_index].strip():
+                    empty_between = False
+                    break
+            _check_file_deadline(deadline)
+        if comment.line <= current.end_line + 1 and empty_between:
             current = Comment(
                 current.line,
                 comment.end_line,
@@ -508,16 +547,21 @@ def _following_code(path: str, lines: list[str | bytes], end_line: int, deadline
     for raw_value in lines[end_line:end_line + 3]:
         _check_file_deadline(deadline)
         value = (
-            raw_value.decode("utf-8", errors="replace")
-            if isinstance(raw_value, bytes) else raw_value
+            raw_value[:MAX_FOLLOWING_CODE_CHARS].decode("utf-8", errors="replace")
+            if isinstance(raw_value, bytes) else raw_value[:MAX_FOLLOWING_CODE_CHARS]
         )
+        _check_file_deadline(deadline)
+        # Bound the line before scanning for inline markers. A generated line
+        # must not make the per-file deadline depend on its unbounded tail.
+        value = value[:MAX_FOLLOWING_CODE_CHARS]
         if not value.strip():
             continue
         if value.lstrip().startswith(("//", "#", "--", "/*", "*", "<!--")):
             continue
         value = _strip_inline_comment(path, value)
+        _check_file_deadline(deadline)
         if value:
-            code.append(value[:MAX_FOLLOWING_CODE_CHARS])
+            code.append(value)
     return code[:3]
 
 
@@ -580,6 +624,8 @@ def _is_behavioural_claim(text: str) -> bool:
 def _bounded_similarity(left: list[str], right: list[str], deadline: float | None = None) -> bool:
     """Return a bounded token similarity without arbitrary text matching."""
     _check_file_deadline(deadline)
+    left = left[:MAX_SCORE_TOKENS]
+    right = right[:MAX_SCORE_TOKENS]
     if not left or not right:
         return False
     left_set = set(left)
@@ -620,6 +666,7 @@ def _score(text: str, code: list[str], diff_density: float, deadline: float | No
     _check_file_deadline(deadline)
     if _is_heading(bounded_text):
         score += 2.0
+    _check_file_deadline(deadline)
     if diff_density >= 0.5:
         score += 1.0
     if NEGATIVE_RE.search(bounded_text):
@@ -634,6 +681,7 @@ def _score(text: str, code: list[str], diff_density: float, deadline: float | No
         score -= 1.5
     if _is_behavioural_claim(bounded_text):
         score += 2.0
+    _check_file_deadline(deadline)
     if re.search(r"\bNOTE\b", bounded_text):
         score += 0.5
     if URL_RE.search(bounded_text):
@@ -679,6 +727,25 @@ class FileSkip:
     reason_code: str
     detail: str = ""
     target_id: str = ""
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        path = Path(self.path.replace("\\", "/"))
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise ValueError("comment skip path must be repository-relative")
+        if not isinstance(self.reason_code, str) or not self.reason_code:
+            raise ValueError("comment skip reason_code is required")
+        if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 1:
+            raise ValueError("comment skip count must be positive")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "reason_code": self.reason_code,
+            "detail": self.detail[:240],
+            "target_id": self.target_id,
+            "count": self.count,
+        }
 
 
 @dataclass
@@ -698,14 +765,56 @@ class CommentAnalysisResult:
     def __post_init__(self) -> None:
         if self.status not in {"complete", "not_applicable", "partial", "failed"}:
             raise ValueError(f"invalid comment analysis status: {self.status}")
-        if self.applicable_files < 0 or self.checked_files < 0:
-            raise ValueError("comment analysis file counts must not be negative")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (self.applicable_files, self.checked_files)
+        ):
+            raise ValueError("comment analysis file counts must be non-negative integers")
+        if any(not isinstance(item, FileSkip) for item in self.skipped_files):
+            raise ValueError("comment skipped_files must contain FileSkip records")
         if self.skipped_file_count is None:
-            self.skipped_file_count = len(self.skipped_files)
-        if self.skipped_file_count < 0:
-            raise ValueError("comment skipped file count must not be negative")
+            self.skipped_file_count = sum(item.count for item in self.skipped_files)
+        if (
+            isinstance(self.skipped_file_count, bool)
+            or not isinstance(self.skipped_file_count, int)
+            or self.skipped_file_count < 0
+            or self.skipped_file_count > self.applicable_files
+        ):
+            raise ValueError("comment skipped file count must be a valid non-negative integer")
         if self.checked_files + self.skipped_file_count > self.applicable_files:
             raise ValueError("comment analysis counts exceed applicable files")
+        if self.status == "complete" and (
+            self.checked_files != self.applicable_files or self.skipped_file_count != 0
+        ):
+            raise ValueError("complete comment analysis requires every file to be checked")
+        if self.status == "not_applicable" and any((self.applicable_files, self.checked_files, self.skipped_file_count)):
+            raise ValueError("not_applicable comment analysis cannot contain files")
+        if isinstance(self.bytes_scanned, bool) or not isinstance(self.bytes_scanned, int) or self.bytes_scanned < 0:
+            raise ValueError("comment analysis bytes must be a non-negative integer")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (self.changed_line_count, self.changed_comment_count)
+        ):
+            raise ValueError("comment density counts must be non-negative integers")
+        if self.changed_comment_count > self.changed_line_count:
+            raise ValueError("changed comment count cannot exceed changed line count")
+        if not 0 <= self.comment_density <= 1:
+            raise ValueError("comment density must be between zero and one")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "applicable_files": self.applicable_files,
+            "checked_files": self.checked_files,
+            "skipped_files": [item.as_dict() for item in self.skipped_files],
+            "skipped_file_count": self.skipped_file_count,
+            "bytes_scanned": self.bytes_scanned,
+            "changed_line_count": self.changed_line_count,
+            "changed_comment_count": self.changed_comment_count,
+            "comment_density": self.comment_density,
+            "reason_code": self.reason_code,
+            "candidates": list(self.candidates),
+        }
 
 
 @dataclass(frozen=True)
@@ -762,7 +871,9 @@ def _extract_comment_groups(
     *,
     strict_python: bool,
 ) -> tuple[list[str | bytes], list[Comment]]:
+    _check_file_deadline(deadline)
     lines: list[str | bytes] = text.splitlines()
+    _check_file_deadline(deadline)
     if _is_python_path(path):
         comments, parse_error = _python_comments_detailed(text, deadline)
         if parse_error is not None and strict_python:
@@ -770,7 +881,9 @@ def _extract_comment_groups(
     else:
         comments = _generic_comments_detailed(path, text, deadline)[0]
     _check_file_deadline(deadline)
-    return lines, _group_comments(comments, lines, deadline)
+    groups = _group_comments(comments, lines, deadline)
+    _check_file_deadline(deadline)
+    return lines, groups
 
 
 def _candidate_from_comment(
@@ -784,7 +897,10 @@ def _candidate_from_comment(
     deadline: float | None = None,
 ) -> dict:
     _check_file_deadline(deadline)
-    subtype = _subtype(comment.text, list(code))
+    bounded_comment = comment.text[:MAX_NORMALISED_COMMENT_CHARS]
+    _check_file_deadline(deadline)
+    subtype = _subtype(bounded_comment, list(code))
+    _check_file_deadline(deadline)
     identity = json.dumps({
         "analyser": "comment-slop",
         "rule": f"comment-slop/{subtype}",
@@ -815,13 +931,14 @@ def _candidate_from_comment(
         "file": Path(path).as_posix(),
         "line": comment.line,
         "column": comment.column,
-        "message": comment.text[:MAX_NORMALISED_COMMENT_CHARS],
+        "message": bounded_comment,
         "source_layer": source_layer,
         "content_sha256": content_sha256,
         "target_id": target_id,
         "score": score,
     }]
     candidate = redact_payload(candidate)
+    _check_file_deadline(deadline)
     errors = validate_candidate(candidate)
     if errors:
         raise ValueError("invalid comment-slop candidate: " + "; ".join(errors))
@@ -907,6 +1024,8 @@ def scan_comments(
     """Return ledger candidates for one already-loaded source value."""
     if mode == "diff" and changed_line_ranges is None:
         return []
+    if not content_sha256:
+        content_sha256 = hashlib.sha256(_source_bytes(text)).hexdigest()
     lines, groups = _extract_comment_groups(path, text, deadline, strict_python=strict_python)
     ranges = _normalise_ranges(changed_line_ranges)
     target_id = _target_id(path, source_layer, content_sha256)
@@ -948,15 +1067,17 @@ def _select_comment_targets(
             physical = target.physical_path if target.physical_path.is_absolute() else root / target.physical_path
             provided = target.data
             if target_contents is not None:
-                snapshot_value = target_contents.get(target.physical_path.as_posix())
+                snapshot_value = target_contents.get(relative)
+                if snapshot_value is None:
+                    snapshot_value = target_contents.get(target.physical_path.as_posix())
                 if snapshot_value is None:
                     snapshot_value = target_contents.get(physical.as_posix())
                 if snapshot_value is not None:
                     provided = snapshot_value
-            if provided is None:
-                try:
-                    physical.resolve().relative_to(root.resolve())
-                except (OSError, ValueError):
+            try:
+                physical.resolve().relative_to(root.resolve())
+            except (OSError, ValueError):
+                if target.data is None and not target.physical_snapshot:
                     continue
             # The bounded scan claims bytes before calculating the source
             # digest. Raw supplied bytes are only a pre-read deduplication key.
@@ -1030,6 +1151,7 @@ def _scan_comment_target(
     bytes_scanned = 0
     try:
         result_budget.claim_file()
+        deadline = result_budget.child_deadline(per_file_timeout)
         remaining = (
             result_budget.max_total_bytes - result_budget.bytes_claimed
             if result_budget.max_total_bytes is not None else max_file_bytes
@@ -1041,7 +1163,9 @@ def _scan_comment_target(
         if provided is None:
             try:
                 size = path.stat().st_size
-            except OSError:
+            except OSError as error:
+                if source_reader is None:
+                    raise SourceReadError(f"read_failure: {error}") from error
                 size = None
             if size is not None:
                 if size > max_file_bytes:
@@ -1052,7 +1176,13 @@ def _scan_comment_target(
                     raise AnalysisBudgetExceeded("max_total_bytes", "source file exceeds aggregate byte limit")
                 result_budget.claim_bytes(size)
                 claimed_before_read = True
-        read_limit = size if claimed_before_read and size is not None else min(max_file_bytes, remaining)
+        read_limit = size if claimed_before_read and size is not None else min(max_file_bytes + 1, remaining)
+        if provided is None and not claimed_before_read:
+            # A custom reader may hide its stat operation. Reserve the full
+            # bounded read before invoking it so a reader cannot bypass the
+            # aggregate byte quota when the size is unavailable.
+            result_budget.claim_bytes(read_limit)
+            claimed_before_read = True
         reader_error: str | None = None
         if provided is None and source_reader is not None:
             provided, reader_error = source_reader(relative, read_limit)
@@ -1092,24 +1222,30 @@ def _scan_comment_target(
                 bytes_scanned=bytes_scanned,
                 skip=FileSkip(relative, "binary_source", "NUL byte in bounded source prefix", declared_id),
             )
+        _check_file_deadline(deadline)
         digest = hashlib.sha256(data).hexdigest()
+        _check_file_deadline(deadline)
         if declared_hash and declared_hash != digest:
             return _TargetScanOutcome(
                 bytes_scanned=bytes_scanned,
                 skip=FileSkip(relative, "content_hash_mismatch", "loaded source differs from its declared snapshot hash", declared_id),
             )
         target_id = _target_id(relative, source_layer, digest)
-        deadline = result_budget.child_deadline(per_file_timeout)
         lines, groups = _extract_comment_groups(relative, data, deadline, strict_python=True)
         drafts = _drafts_for_groups(
             relative, lines, groups, ranges, mode, source_layer, digest,
             target_id, deadline, 0.0 if mode == "diff" else diff_density,
         )
         _check_file_deadline(deadline)
-        changed_comment_count = sum(
-            1 for comment in groups
-            if mode == "diff" and _overlaps(comment.line, comment.end_line, list(ranges))
-        )
+        changed_comment_lines: set[int] = set()
+        if mode == "diff":
+            for comment in groups:
+                for start, end in ranges:
+                    overlap_start = max(comment.line, start)
+                    overlap_end = min(comment.end_line, end)
+                    if overlap_start <= overlap_end:
+                        changed_comment_lines.update(range(overlap_start, overlap_end + 1))
+        changed_comment_count = len(changed_comment_lines)
         changed_line_count = _range_line_count(ranges) if mode == "diff" else 0
         local_density = (
             changed_comment_count / changed_line_count
@@ -1192,9 +1328,20 @@ def scan_comment_targets(
     result_budget = budget or AnalysisBudget(timeout_seconds=300)
     pre_skips = tuple(pre_skipped)
     pre_skip_by_id = {item.target_id: item for item in pre_skips if item.target_id}
-    pre_skip_by_path = {item.path: item for item in pre_skips if not item.target_id}
+    selected_layer_counts: dict[str, int] = {}
+    for item in selected:
+        selected_layer_counts[item[0]] = selected_layer_counts.get(item[0], 0) + 1
+    # A path-only skip is safe only when that path has one selected source
+    # layer. With staged and worktree copies, applying it by logical path
+    # would hide the other snapshot's evidence.
+    pre_skip_by_path = {
+        item.path: item
+        for item in pre_skips
+        if not item.target_id and selected_layer_counts.get(item.path, 0) <= 1
+    }
     skipped: list[FileSkip] = []
     skipped_file_count = 0
+    external_pre_skipped = 0
     candidates: list[dict] = []
     checked = 0
     bytes_scanned = 0
@@ -1209,6 +1356,33 @@ def scan_comment_targets(
         skipped_file_count += max(0, count)
         if len(skipped) < 3:
             skipped.append(skip)
+
+    selected_ids = {
+        _target_id(item[0], item[3].source_kind, item[3].content_sha256)
+        if item[3] is not None else _target_id(item[0], "working-tree", "")
+        for item in selected
+    }
+    selected_layer_keys = {
+        (item[0], item[3].source_kind if item[3] is not None else "working-tree")
+        for item in selected
+    }
+    selected_paths = {item[0] for item in selected}
+    represented_pre_skipped = 0
+    represented_pre_skip_units = 0
+    for skip in pre_skips:
+        skip_parts = skip.target_id.split("|", 2) if skip.target_id else []
+        represented = (
+            skip.target_id in selected_ids
+            or len(skip_parts) > 1 and (skip.path, skip_parts[1]) in selected_layer_keys
+            if skip_parts
+            else skip.path in selected_paths
+        )
+        if not represented:
+            record_skip(skip, skip.count)
+            external_pre_skipped += skip.count
+        else:
+            represented_pre_skipped += skip.count
+            represented_pre_skip_units += 1
 
     for index, item in enumerate(selected):
         outcome = _scan_comment_target(
@@ -1230,7 +1404,7 @@ def scan_comment_targets(
         changed_comment_count += outcome.changed_comment_count
         candidates.extend(outcome.candidates)
         if outcome.skip is not None:
-            record_skip(outcome.skip)
+            record_skip(outcome.skip, outcome.skip.count)
         if outcome.internal_failure:
             internal_failure = True
         if outcome.terminal_reason is not None:
@@ -1254,7 +1428,7 @@ def scan_comment_targets(
     )
     candidate_limit = terminal_reason == "max_candidates"
 
-    if not selected:
+    if not selected and external_pre_skipped == 0:
         status = "not_applicable"
         reason_code = "no_applicable_files"
     elif internal_failure:
@@ -1268,7 +1442,9 @@ def scan_comment_targets(
         reason_code = None
     return CommentAnalysisResult(
         status=status,
-        applicable_files=len(selected),
+        applicable_files=len(selected) + external_pre_skipped + max(
+            0, represented_pre_skipped - represented_pre_skip_units,
+        ),
         checked_files=checked,
         skipped_files=skipped,
         bytes_scanned=bytes_scanned,

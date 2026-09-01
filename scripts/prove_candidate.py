@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any
 
@@ -13,33 +13,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from dissect_checks.redaction import redact_payload, redact_sensitive_text  # noqa: E402
-from dissect_checks.test_integrity.proof_test import build_proof_test_plan  # noqa: E402
+from analysis_budget import analysis_limits  # noqa: E402
+from dissect_checks.test_integrity.evidence_matrix import _command_from_config  # noqa: E402
+from dissect_checks.test_integrity.proof_test import MAX_PROOF_PATCH_BYTES, build_proof_test_plan  # noqa: E402
+from validate_review_context import validate as validate_context  # noqa: E402
 
 
 def _config(root: Path) -> dict[str, Any]:
     try:
         value = json.loads((root / ".ai-review" / "local.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
-    return value if isinstance(value, dict) else {}
+    except OSError as error:
+        raise ValueError(f"could not read review configuration: {error}") from error
+    except ValueError as error:
+        raise ValueError(f"review configuration is not valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("review configuration must be a JSON object")
+    return value
 
 
 def _command(root: Path, config: dict[str, Any]) -> str | None:
-    commands = config.get("commands") if isinstance(config.get("commands"), dict) else {}
-    options = config.get("review_options") if isinstance(config.get("review_options"), dict) else {}
-    value = commands.get("test") or options.get("test_command")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    try:
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "detect_commands.py")],
-            cwd=root, capture_output=True, text=True, check=False, timeout=5,
-        )
-        payload = json.loads(result.stdout) if result.returncode == 0 else {}
-        detected = payload.get("commands", {}).get("test") if isinstance(payload, dict) else None
-        return detected.strip() if isinstance(detected, str) and detected.strip() else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+    selected = _command_from_config(root, config)
+    return selected[0] if selected is not None else None
 
 
 def _find_candidate(context: dict[str, Any], candidate_id: str) -> dict[str, Any] | None:
@@ -76,6 +72,9 @@ def main(argv: list[str] | None = None) -> int:
         context = json.loads(args.context.read_text(encoding="utf-8"))
         if not isinstance(context, dict):
             raise ValueError("context must be a JSON object")
+        context_errors = validate_context(context)
+        if context_errors:
+            raise ValueError(f"context is invalid: {context_errors[0]}")
         candidate = _find_candidate(context, args.candidate_id)
         if candidate is None:
             raise ValueError(f"candidate was not found: {args.candidate_id}")
@@ -95,9 +94,29 @@ def main(argv: list[str] | None = None) -> int:
             candidate["focal_subjects"] = args.focal_subject
         root_value = context.get("scope", {}).get("root") if isinstance(context.get("scope"), dict) else None
         root = Path(root_value) if isinstance(root_value, str) and root_value else args.context.parent
+        if args.test_patch.stat().st_size > MAX_PROOF_PATCH_BYTES:
+            raise ValueError("test patch exceeds the configured size limit")
         patch = args.test_patch.read_text(encoding="utf-8")
         config = _config(root)
-        plan = build_proof_test_plan(root, patch, candidate, command=_command(root, config))
+        limits = analysis_limits(config)
+        options = config.get("review_options") if isinstance(config.get("review_options"), dict) else {}
+        if options.get("proof_tests", True) is False:
+            plan = build_proof_test_plan(
+                root,
+                patch,
+                candidate,
+                command=None,
+                timeout_seconds=float(limits["proof_test_timeout_seconds"]),
+            )
+            plan = replace(plan, status="planned", reason_code="disabled")
+        else:
+            plan = build_proof_test_plan(
+                root,
+                patch,
+                candidate,
+                command=_command(root, config),
+                timeout_seconds=float(limits["proof_test_timeout_seconds"]),
+            )
         print(json.dumps(redact_payload(plan.as_dict()), indent=2, sort_keys=True))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:

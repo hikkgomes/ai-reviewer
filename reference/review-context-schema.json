@@ -14,7 +14,7 @@
     "candidates": {"type": "array", "items": {"$ref": "#/$defs/candidate"}},
     "test_evidence": {
       "type": "object",
-      "required": ["status", "state", "artifacts", "subjects", "relations", "changes", "static_candidates", "matrix", "mutations", "proof_tests"],
+      "required": ["status", "state", "artifacts", "subjects", "relations", "changes", "static_candidates", "dynamic_candidates", "matrix", "mutations", "proof_tests"],
       "properties": {
         "status": {"enum": ["complete", "partial", "not_applicable", "planned", "unavailable", "failed"]},
         "state": {"enum": ["Finding", "Checked", "Not applicable", "Not verified"]},
@@ -23,6 +23,7 @@
         "relations": {"type": "array", "items": {"type": "object"}},
         "changes": {"type": "array", "items": {"type": "object"}},
         "static_candidates": {"type": "array", "items": {"type": "object"}},
+        "dynamic_candidates": {"type": "array", "items": {"type": "object"}},
         "matrix": {"type": "array", "items": {"$ref": "#/$defs/matrix_scenario"}},
         "mutations": {"type": "array", "items": {"type": "object"}},
         "targeted_mutation": {"type": "object"},
@@ -96,6 +97,7 @@
       "required": ["status", "backend_id", "functions", "candidates", "policy"],
       "properties": {
         "status": {"enum": ["complete", "partial", "not_applicable", "unavailable", "failed"]},
+        "state": {"enum": ["Finding", "Checked", "Not applicable", "Not verified"]},
         "backend_id": {"type": "string"},
         "applicable_files": {"type": "integer", "minimum": 0},
         "checked_files": {"type": "integer", "minimum": 0},
@@ -103,7 +105,9 @@
         "reason_code": {"type": ["string", "null"]},
         "functions": {"type": "array", "items": {"$ref": "#/$defs/complexity_function"}},
         "candidates": {"type": "array", "items": {"$ref": "#/$defs/complexity_candidate"}},
-        "policy": {"type": "object"}
+        "policy": {"type": "object"},
+        "parse_states": {"type": "object", "additionalProperties": {"enum": ["complete", "failed", "not_verified", "not_run"]}},
+        "parse_errors": {"type": "array", "items": {"type": "object"}}
       },
       "additionalProperties": true
     },
@@ -118,7 +122,7 @@
         "token_count": {"type": "integer", "minimum": 0}, "parameter_count": {"type": "integer", "minimum": 0},
         "is_test": {"type": "boolean"},
         "threshold": {"type": ["integer", "null"], "minimum": 1},
-        "threshold_source": {"type": "string"}
+        "threshold_source": {"type": "string", "minLength": 1}
       },
       "additionalProperties": true
     },
@@ -128,7 +132,7 @@
       "properties": {
         "candidate_id": {"type": "string"}, "function": {"$ref": "#/$defs/complexity_function"},
         "reason_code": {"type": "string"}, "threshold": {"type": "integer", "minimum": 1},
-        "threshold_source": {"type": "string"}, "base_complexity": {"type": ["integer", "null"]},
+        "threshold_source": {"type": "string", "minLength": 1}, "base_complexity": {"type": ["integer", "null"]},
         "head_complexity": {"type": "integer", "minimum": 1}, "delta": {"type": ["integer", "null"]},
         "changed_lines": {"type": "array", "items": {"type": "integer", "minimum": 1}}
       },
@@ -142,9 +146,28 @@
         "scenario_id": {"enum": ["base-code-base-tests", "base-code-head-tests", "head-code-base-tests", "head-code-head-tests"]},
         "production_state": {"enum": ["base", "head"]},
         "test_state": {"enum": ["base", "head"]},
-        "source_hashes": {"type": "object"},
+        "source_hashes": {
+          "type": "object",
+          "required": ["source_files_sha256", "source_files_present", "source_files_absent"],
+          "properties": {
+            "source_files_sha256": {"type": "object", "additionalProperties": {"$ref": "#/$defs/hash"}},
+            "source_files_present": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "source_files_absent": {"type": "array", "items": {"type": "string", "minLength": 1}}
+          }
+        },
         "selected_tests": {"type": "array", "items": {"type": "string"}},
-        "result": {"type": "object"}
+        "reachability": {"enum": ["confirmed", "not_reached", "unverified"]},
+        "reached_subjects": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "focal_subjects": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "result": {
+          "type": "object",
+          "allOf": [
+            {
+              "if": {"properties": {"completed": {"const": true}}},
+              "then": {"required": ["command_plan_digest", "output_fingerprint", "exit_code"]}
+            }
+          ]
+        }
       },
       "additionalProperties": true
     },

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -239,6 +240,14 @@ class ExecutionPlan:
         payload["interpreter_arguments"] = [redact_sensitive_text(value) for value in self.interpreter_arguments]
         payload["interpreter_resolver"] = redact_sensitive_text(self.interpreter_resolver)
         payload["interpreter_environment_options"] = [redact_sensitive_text(value) for value in self.interpreter_environment_options]
+        # Bindings are part of the approval digest, but they are also retained
+        # in context and evidence artefacts.  Candidate contracts and source
+        # metadata can contain caller-provided credentials or URLs, so render
+        # only their redacted form outside the canonical in-memory plan.
+        payload["bindings"] = [
+            {"name": key, "value": redact_sensitive_text(value)}
+            for key, value in self.bindings
+        ]
         payload["approval_digest"] = self.approval_digest
         return payload
 
@@ -246,7 +255,11 @@ class ExecutionPlan:
 def build_execution_plan(*, kind: str, name: str, argv: list[str] | tuple[str, ...], working_directory: Path, finding_exit_codes: set[int] | tuple[int, ...] = (), environment: Mapping[str, str] | None = None, timeout_seconds: float = 300.0, output_limit: int = 64 * 1024, bindings: Mapping[str, str] | tuple[tuple[str, str], ...] | None = None) -> tuple[ExecutionPlan | None, str | None]:
     if not argv or not all(isinstance(value, str) and value for value in argv):
         return None, "execution plan requires a non-empty string argv array"
-    if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
+    if not isinstance(kind, str) or not kind or not isinstance(name, str) or not name:
+        return None, "execution plan requires a kind and name"
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in finding_exit_codes):
+        return None, "execution plan finding exit codes must be integers"
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
         return None, "execution plan timeout must be greater than zero"
     if isinstance(output_limit, bool) or not isinstance(output_limit, int) or output_limit <= 0:
         return None, "execution plan output limit must be greater than zero"
@@ -292,7 +305,9 @@ def build_execution_plan(*, kind: str, name: str, argv: list[str] | tuple[str, .
 
 
 def valid_approval_digest(value: str) -> bool:
-    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+    return isinstance(value, str) and len(value) == 64 and all(
+        char in "0123456789abcdef" for char in value
+    )
 
 
 def _open_verified(path: str, expected: str) -> int:
@@ -388,7 +403,11 @@ def _run_snapshot(plan: ExecutionPlan, executable_snapshot: Path, interpreter_sn
         stdout, stderr = process.communicate(timeout=plan.timeout_seconds)
     except subprocess.TimeoutExpired as error:
         _terminate_process_group(process)
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(process)
+            stdout, stderr = process.communicate()
         return subprocess.CompletedProcess(
             command,
             124,
@@ -413,6 +432,9 @@ def execute_approved_plan(plan: ExecutionPlan, approval_digest: str, *, runner: 
         resolved = _resolve_executable(plan.argv[0], plan.environment_dict)
         if resolved is None or str(resolved) != plan.executable_path:
             return None, "executable path identity changed after planning"
+        working_directory = Path(plan.working_directory).resolve(strict=True)
+        if str(working_directory) != plan.working_directory:
+            return None, "execution working directory changed after planning"
         source_fd = _open_verified(plan.executable_path, plan.executable_sha256)
     except (OSError, ValueError):
         return None, "executable bytes changed after planning"
@@ -449,6 +471,19 @@ def execute_approved_plan(plan: ExecutionPlan, approval_digest: str, *, runner: 
                     # the mutable original path: a failed snapshot is a failed plan.
                     if completed.returncode < 0:
                         return None, "approved executable snapshot could not be executed safely"
+                if not isinstance(completed, subprocess.CompletedProcess):
+                    return None, "execution runner returned an invalid result"
+                if isinstance(completed.returncode, bool) or not isinstance(completed.returncode, int):
+                    return None, "execution runner returned an invalid exit code"
+                # A test double or custom runner is still part of the trusted
+                # execution boundary. Keep its retained output bounded just
+                # like the real snapshot runner.
+                completed = subprocess.CompletedProcess(
+                    completed.args,
+                    completed.returncode,
+                    (completed.stdout or "")[:plan.output_limit],
+                    (completed.stderr or "")[:plan.output_limit],
+                )
                 return completed, None
             finally:
                 if 'interpreter_fd' in locals() and interpreter_fd is not None:

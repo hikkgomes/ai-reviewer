@@ -103,6 +103,8 @@ def redact_payload(value: Any) -> Any:
         return redact_sensitive_text(value)
     if isinstance(value, list):
         return [redact_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_payload(item) for item in value]
     if isinstance(value, dict):
         return {key: redact_payload(item) for key, item in value.items()}
     return value

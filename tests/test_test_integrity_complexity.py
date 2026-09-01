@@ -18,8 +18,8 @@ from dissect_checks.complexity.configuration import repository_policy, resolve_p
 from dissect_checks.complexity.lizard_backend import extract_functions
 from dissect_checks.complexity.orchestrator import analyse as analyse_complexity
 from dissect_checks.test_integrity.change_analysis import ChangePartition
-from diff_file_list import DiffEntry
-from dissect_checks.test_integrity.evidence_matrix import MatrixScenario, build_matrix, execute_approved_matrix, flakiness_evidence, interpret_matrix
+from diff_file_list import DiffEntry, changed_entries
+from dissect_checks.test_integrity.evidence_matrix import MatrixScenario, _matrix_candidates, build_matrix, execute_approved_matrix, flakiness_evidence, interpret_matrix
 from dissect_checks.test_integrity.model import TestRunResult, SCENARIO_IDS
 from dissect_checks.test_integrity.mutation import removal_decision
 from dissect_checks.test_integrity.proof_test import ProofCandidate, proof_outcome, validate_test_patch
@@ -104,6 +104,29 @@ class TestIntegrityComplexityTests(unittest.TestCase):
             self.assertIn("tests/test_removed.py", base)
             self.assertNotIn("tests/test_removed.py", head)
 
+    def test_staged_head_uses_index_while_unstaged_head_uses_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
+            source = root / "app.py"
+            source.write_text("value = 'base'\n")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            source.write_text("value = 'staged'\n")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            entries = changed_entries(root)
+            base, head = source_maps(root, entries, ["app.py"])
+            self.assertEqual(base["app.py"], "value = 'base'\n")
+            self.assertEqual(head["app.py"], "value = 'staged'\n")
+            source.write_text("value = 'worktree'\n")
+            entries = changed_entries(root)
+            base, head = source_maps(root, entries, ["app.py"])
+            self.assertEqual(base["app.py"], "value = 'staged'\n")
+            self.assertEqual(head["app.py"], "value = 'worktree'\n")
+
     def test_parser_only_fixture_rule_is_experimental_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -119,6 +142,111 @@ class TestIntegrityComplexityTests(unittest.TestCase):
             experimental = analyse_static(root, inventory, paths=[relative], head_contents={relative: text}, enabled_rules={"GOV-TESTS-007"})
             self.assertFalse(any(item["source"] == "GOV-TESTS-007" for item in default.candidates))
             self.assertTrue(any(item["source"] == "GOV-TESTS-007" for item in experimental.candidates))
+
+    def test_static_integrity_includes_production_seams_in_full_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = {
+                "src/runtime.py": "import types\n\ndef dispatch(function):\n    if isinstance(function, types.FunctionType):\n        return function()\n    return function\n",
+            }
+            inventory = build_inventory(root, values, content_by_path=values)
+            result = analyse_static(
+                root,
+                inventory,
+                paths=list(values),
+                base_contents=values,
+                head_contents=values,
+                enabled_rules={"GOV-TESTS-006"},
+            )
+            self.assertEqual([item["source"] for item in result.candidates], ["GOV-TESTS-006"])
+
+    def test_new_test_files_require_explicit_creation_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relative = "tests/test_new.py"
+            values = {relative: "def test_new():\n    assert 1 == 1\n"}
+            inventory = build_inventory(root, values, content_by_path=values)
+
+            def analyse_with(**kwargs: object):
+                return analyse_static(
+                    root,
+                    inventory,
+                    paths=[relative],
+                    base_contents={},
+                    head_contents=values,
+                    changed_paths=[relative],
+                    enabled_rules={"GOV-TESTS-010"},
+                    **kwargs,
+                )
+
+            blocked = analyse_with(intent_text="Implement and verify the parser with tests.")
+            self.assertEqual([item["source"] for item in blocked.candidates], ["GOV-TESTS-010"])
+            self.assertEqual(
+                blocked.candidates[0]["supporting_evidence"][0]["approval_source"],
+                "none",
+            )
+            requested = analyse_with(intent_text="Create a new test file for the parser.")
+            self.assertFalse(requested.candidates)
+            approved = analyse_with(intent_text="Approve adding a new test file for the parser.")
+            self.assertFalse(approved.candidates)
+            configured = analyse_with(
+                config={"review_options": {"test_integrity_approved_new_paths": [relative]}}
+            )
+            self.assertFalse(configured.candidates)
+
+    def test_static_integrity_ignores_todo_comments_and_detects_js_test_seams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = {
+                "tests/test_case.js": "test('loads', () => {\n  load();\n});\n// TODO: add an assertion later\n",
+                "src/runtime.js": "if (process.env.NODE_ENV === 'test') { return bypass(); }\n",
+            }
+            inventory = build_inventory(root, values, content_by_path=values)
+            result = analyse_static(
+                root,
+                inventory,
+                paths=list(values),
+                base_contents=values,
+                head_contents=values,
+                enabled_rules={"GOV-TESTS-005", "GOV-TESTS-006"},
+            )
+            self.assertEqual(
+                {
+                    (item["source"], item["supporting_evidence"][0]["file"])
+                    for item in result.candidates
+                },
+                {("GOV-TESTS-005", "tests/test_case.js"), ("GOV-TESTS-006", "src/runtime.js")},
+            )
+
+    def test_static_integrity_rejects_source_shape_and_test_existence_oracles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = {
+                "tests/test_oracle.py": (
+                    "import inspect\n"
+                    "from pathlib import Path\n"
+                    "from service import load\n\n"
+                    "def test_source_shape():\n"
+                    "    source = inspect.getsource(load)\n"
+                    "    assert \"return\" in source\n"
+                    "    assert Path(\"tests/test_other.py\").exists()\n"
+                ),
+            }
+            inventory = build_inventory(root, values, content_by_path=values)
+            result = analyse_static(
+                root,
+                inventory,
+                paths=list(values),
+                base_contents=values,
+                head_contents=values,
+                changed_paths=list(values),
+                enabled_rules={"GOV-TESTS-003"},
+            )
+            details = {
+                item["supporting_evidence"][0]["change_kind"]
+                for item in result.candidates
+            }
+            self.assertEqual(details, {"source_string_assertion", "test_existence_assertion"})
 
     def test_static_test_integrity_cases_keep_exact_rule_and_location(self) -> None:
         expected_lines = {
@@ -262,9 +390,66 @@ class TestIntegrityComplexityTests(unittest.TestCase):
             self.assertEqual(executed.status, "complete")
             self.assertTrue(all(item.result.completed and item.result.passed for item in executed.scenarios))
 
+    def test_git_matrix_uses_exact_private_archives_and_cleans_them_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            service = b"def load():\n    return 1\n"
+            test = b"def test_load():\n    assert True\n"
+            (root / "service.py").write_bytes(service)
+            (root / "tests" / "test_service.py").write_bytes(test)
+            for command in (
+                ["git", "init", "-q"],
+                ["git", "config", "user.email", "test@example.com"],
+                ["git", "config", "user.name", "Test"],
+                ["git", "config", "commit.gpgsign", "false"],
+            ):
+                subprocess.run(command, cwd=root, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            base = {"service.py": service, "tests/test_service.py": test}
+            head = {**base, "service.py": b"def load():\n    return 2\n"}
+            matrix = build_matrix(
+                root,
+                ChangePartition(("service.py",), ("tests/test_service.py",), (), (), ()),
+                config={"commands": {"test": "python3 -c 'import sys; sys.exit(0)'"}},
+                base_contents=base,
+                head_contents=head,
+            )
+            try:
+                directories = [Path(item.plan.working_directory) for item in matrix.scenarios if item.plan is not None]
+                self.assertEqual(matrix.status, "planned")
+                self.assertEqual(len(directories), 4)
+                self.assertTrue(all((path / "service.py").is_file() for path in directories))
+                self.assertTrue(all((path / "tests" / "test_service.py").is_file() for path in directories))
+            finally:
+                matrix.close()
+            self.assertTrue(all(not path.exists() for path in directories))
+
+    def test_approved_matrix_repeats_each_run_for_flakiness_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            partition = ChangePartition(("service.py",), ("tests/test_service.py",), (), (), ())
+            base = {"service.py": "def load():\n    return 1\n", "tests/test_service.py": "def test_load():\n    assert True\n"}
+            matrix = build_matrix(
+                root,
+                partition,
+                config={"commands": {"test": "python3 -c 'import sys; sys.exit(0)'"}},
+                base_contents=base,
+                head_contents=base,
+            )
+            approvals = {item.scenario_id: item.plan.approval_digest for item in matrix.scenarios if item.plan is not None}
+            with patch(
+                "dissect_checks.test_integrity.evidence_matrix.execute_approved_plan",
+                return_value=(subprocess.CompletedProcess([], 0, "", ""), None),
+            ):
+                executed = execute_approved_matrix(matrix, approvals, flaky_repetitions=3)
+            self.assertTrue(all(len(item.repeated_runs) == 3 for item in executed.scenarios))
+            matrix.close()
+
     def test_matrix_interpretation_keeps_the_four_questions_separate(self) -> None:
         results = {
-            scenario: TestRunResult(scenario, "", 0 if scenario != "base-code-head-tests" else 1, True, scenario != "base-code-head-tests", 1, (), "")
+            scenario: TestRunResult(scenario, "a" * 64, 0 if scenario != "base-code-head-tests" else 1, True, scenario != "base-code-head-tests", 1, (), "b" * 64)
             for scenario in SCENARIO_IDS
         }
         scenarios = tuple(
@@ -272,6 +457,36 @@ class TestIntegrityComplexityTests(unittest.TestCase):
             for scenario in SCENARIO_IDS
         )
         self.assertEqual(interpret_matrix(scenarios)["outcome"], "distinguishes_base_and_head")
+
+    def test_matrix_regression_pattern_becomes_a_candidate_not_a_score(self) -> None:
+        results = {
+            scenario: TestRunResult(
+                scenario,
+                "a" * 64,
+                0,
+                True,
+                scenario != "head-code-base-tests",
+                1,
+                ("tests/test_service.py",),
+                "b" * 64,
+            )
+            for scenario in SCENARIO_IDS
+        }
+        scenarios = tuple(
+            MatrixScenario(
+                scenario,
+                "base" if scenario.startswith("base-") else "head",
+                "base" if scenario.endswith("base-tests") else "head",
+                {"source_files_sha256": {}, "source_files_present": [], "source_files_absent": []},
+                ("tests/test_service.py",),
+                None,
+                results[scenario],
+            )
+            for scenario in SCENARIO_IDS
+        )
+        candidates = _matrix_candidates(scenarios)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["source"], "GOV-TESTS")
 
     def test_unverified_repeated_runs_are_not_called_stable(self) -> None:
         result = TestRunResult(SCENARIO_IDS[0], "", None, False, None, None, (), "")
@@ -326,6 +541,20 @@ class TestIntegrityComplexityTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertTrue(any("non-test path" in error for error in errors))
         self.assertEqual(proof_outcome(candidate, current_passed=True, control_passed=False, reachability="confirmed"), "disproved")
+
+    def test_proof_patch_cannot_delete_a_test_declaration(self) -> None:
+        candidate = ProofCandidate("candidate-1", "The service rejects the request.", "public_contract", "ISSUE-1", ("service.load",), "fail", "known_good")
+        patch_text = (
+            "--- a/tests/test_service.py\n"
+            "+++ b/tests/test_service.py\n"
+            "@@ -1,2 +1,1 @@\n"
+            "-def test_service_load():\n"
+            "-    assert service.load()\n"
+            "+def test_service_load():\n"
+        )
+        valid, errors = validate_test_patch(Path.cwd(), patch_text, candidate)
+        self.assertFalse(valid)
+        self.assertTrue(any("test declaration" in error for error in errors))
 
     def test_removal_needs_execution_and_unique_protection_evidence(self) -> None:
         self.assertEqual(

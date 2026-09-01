@@ -23,13 +23,20 @@ The initial high-signal rules are:
 
 - `GOV-TESTS-001`: disabled, deleted, or bypassed test discovery.
 - `GOV-TESTS-002`: weakened assertion or exception contract.
-- `GOV-TESTS-003`: implementation-derived or circular oracle.
+- `GOV-TESTS-003`: implementation-derived, source-text, or circular oracle.
 - `GOV-TESTS-004`: focal behaviour mocked or bypassed.
 - `GOV-TESTS-005`: tautological or non-failing test.
 - `GOV-TESTS-006`: test-only behaviour in production code.
 - `GOV-TESTS-007`: invalid fixture presented as behavioural proof.
 - `GOV-TESTS-008`: subject reachability concern, only with dynamic evidence.
 - `GOV-TESTS-009`: flakiness, only after repeated identical approved runs.
+- `GOV-TESTS-010`: new test file or test-only helper/fixture added without explicit creation approval.
+
+`GOV-TESTS-010` treats a file as approved only when the review intent explicitly
+requests or approves its creation, or when its repository-relative path matches
+`review_options.test_integrity_approved_new_paths`. Generic requests to
+implement, fix, test, or verify do not satisfy this requirement. Existing test
+files may be changed; this rule is limited to newly added test artefacts.
 
 The four evidence scenarios are `base-code-base-tests`, `base-code-head-tests`,
 `head-code-base-tests`, and `head-code-head-tests`. A passing test proves only

@@ -141,11 +141,6 @@ class CommentSlopTests(unittest.TestCase):
                 bad = root / "bad.ts"
                 good.write_text("// This function saves the account owner\nsaveUser(user);\n")
                 bad.write_text("// This function saves the account owner\nsaveUser(user);\n")
-                original = Path.read_text
-
-                def read_text(path: Path, *args: object, **kwargs: object) -> str:
-                    return original(path, *args, **kwargs)
-
                 original_bounded = build_review_context._bounded_file_bytes
 
                 def bounded_file_bytes(path: Path, limit: int) -> tuple[bytes | None, str | None]:
@@ -157,7 +152,7 @@ class CommentSlopTests(unittest.TestCase):
                     DiffEntry("??", name, name, True, "untracked")
                     for name in ("good.ts", "bad.ts")
                 ]
-                with patch.object(Path, "read_text", autospec=True, side_effect=read_text), patch(
+                with patch(
                     "build_review_context._bounded_file_bytes", side_effect=bounded_file_bytes,
                 ):
                     values, limitations, coverage, commands = build_review_context.optional_analyser_evidence(
@@ -379,7 +374,7 @@ class CommentSlopTests(unittest.TestCase):
             (root / ".ai-review").mkdir()
             (root / ".ai-review/local.json").write_text(json.dumps({"review_options": {"comment_slop": False}}))
             (root / "app.py").write_text("# Perform the required operation.\nsave_user(user)\n")
-            with patch("dissect_checks.comment_slop.scan_comments", side_effect=AssertionError("comment-slop should be disabled")):
+            with patch("dissect_checks.comment_slop.scan_comment_targets", side_effect=AssertionError("comment-slop should be disabled")):
                 context = build_review_context.build(root, "full", "", None)
             self.assertIn("comment-slop disabled by review_options", context["limitations"])
             self.assertFalse(any(item.get("source", "").startswith("comment-slop/") for item in context["candidates"]))
