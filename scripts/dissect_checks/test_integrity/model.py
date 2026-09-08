@@ -313,15 +313,3 @@ def public_state(internal_state: str, *, applicable: bool = True) -> str:
 def bounded_fingerprint(output: str | bytes, *, limit: int = 64 * 1024) -> str:
     data = output if isinstance(output, bytes) else output.encode("utf-8", errors="replace")
     return hashlib.sha256(data[:limit]).hexdigest()
-
-
-def as_json_value(value: Any) -> Any:
-    if hasattr(value, "as_dict"):
-        return value.as_dict()
-    if isinstance(value, Mapping):
-        return {str(key): as_json_value(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [as_json_value(item) for item in value]
-    if isinstance(value, list):
-        return [as_json_value(item) for item in value]
-    return value

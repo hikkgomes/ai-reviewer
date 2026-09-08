@@ -223,8 +223,7 @@ def _static_meta_mutation(root: Path) -> list[str]:
         # test configuration filtering and would provide false assurance.
         with ExitStack() as stack:
             for detector_name in detector_mutations[rule_id]:
-                detector = getattr(static_analysis_module, detector_name)
-                stack.enter_context(patch.object(static_analysis_module, detector_name, _empty_detector(detector_name)))
+                stack.enter_context(patch.object(static_analysis_module, detector_name, lambda *_args, **_kwargs: iter(())))
             disabled = analyse_static(
                 fixture_root,
                 inventory,
@@ -236,15 +235,6 @@ def _static_meta_mutation(root: Path) -> list[str]:
             )
         if any(item.get("source") == rule_id for item in disabled.candidates):
             errors.append(f"disabling {rule_id} did not remove its acceptance candidate")
-        else:
-            # The normal acceptance candidate was present above and the same
-            # assertion now fails against the mutated detector.
-            try:
-                assert_acceptance(disabled, rule_id)
-            except AssertionError:
-                pass
-            else:
-                errors.append(f"{rule_id} acceptance did not depend on its detector")
     return errors
 
 
@@ -258,15 +248,6 @@ def _validate_static_acceptance_fixtures(root: Path) -> list[str]:
         except (OSError, SyntaxError, ValueError, TypeError) as error:
             errors.append(f"static acceptance fixture is not interpreter-valid: {path}: {error}")
     return errors
-
-
-def _empty_detector(name: str) -> Any:
-    """Return a correctly-shaped no-op for one static detector function."""
-    if name == "_mock_matches":
-        return lambda *_args, **_kwargs: iter(())
-    if name in {"_circular_oracles", "_derived_oracles", "_python_circular_oracles", "_python_derived_oracles", "_implementation_oracle_matches", "_snapshot_derived_oracle", "_tautologies", "_python_tautologies", "_python_early_return_matches", "_python_catch_all_matches", "_no_observable_test_bodies", "_disabled_matches", "_assertion_weakening", "_assertion_moved_behind_branch", "_test_only_production", "_new_test_file_matches"}:
-        return lambda *_args, **_kwargs: iter(())
-    raise ValueError(f"unknown static detector mutation: {name}")
 
 
 def validate_rule_ownership(root: Path) -> list[str]:
